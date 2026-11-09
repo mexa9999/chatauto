@@ -1,0 +1,13 @@
+[project]
+name = "chatauto"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numba>=0.68.1",
+    "numpy>=2.5.4",
+    "pandas>=3.1.1",
+    "pygame>=2.6.1",
+]
