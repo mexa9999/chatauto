@@ -46,7 +46,8 @@ def _apply_winner_actions(
             if env.agents[agent_id].bankrupt:
                 break
             success = env.apply_action(agent_id, action)
-            slots[agent_id] -= 1
+            if success:
+                slots[agent_id] -= 1
             if on_action is not None:
                 on_action(agent_id, action, success, env)
 

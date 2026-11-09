@@ -926,7 +926,7 @@ def e8_districts(
 ) -> dict:
     out = ensure_dir(out_dir)
     eval_seeds = _eval_seeds(9_500_000, eval_seed_count)
-    cfg_base = replace(evolution_config, track_spatial=True, spatial_every=5)
+    cfg_base = replace(evolution_config, track_spatial=True, spatial_every=20)
     layout = layout_from_config(cfg_base)
     rows: list[dict] = []
     histories: list[list[dict]] = []

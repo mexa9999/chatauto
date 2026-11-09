@@ -337,7 +337,11 @@ class NeuralPolicy:
             (n_districts, layout.n_cell_features + layout.n_global_features),
             dtype=np.float64,
         )
-        np.add.at(district_sum, labels_flat, x_grid.reshape(n_cells, -1))
+        n_features = x_grid.shape[-1]
+        district_sum = np.stack([
+            np.bincount(labels_flat, weights=x_grid[..., k].ravel(), minlength=n_districts)
+            for k in range(n_features)
+        ], axis=1)
         district_input = district_sum / np.maximum(1.0, counts)[:, None]
         district_hidden = np.maximum(
             district_input @ self.Wd + self.bd, 0.0
@@ -428,6 +432,8 @@ class NeuralPolicy:
         budget = max(0.0, float(obs.budget))
         bid_cap = max(0.0, min(BID_MAX * budget, budget / 10.0))
         bid = float(np.clip(forward["bid_fraction"][row, col] * budget, BID_MIN, bid_cap))
+        if cost + bid > budget + 1e-9:
+            return None
         return Action(
             cell=int(cell),
             type_id=int(type_id),

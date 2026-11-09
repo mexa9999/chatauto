@@ -608,6 +608,7 @@ class CityEnvironment:
 
     def _process_bankruptcies(self) -> None:
         threshold = BANKRUPTCY_THRESHOLD
+        any_bankrupt = False
         for agent in self.agents:
             if agent.bankrupt:
                 continue
@@ -623,7 +624,9 @@ class CityEnvironment:
                 self.owner_grid[mask] = -1
                 self.cost_grid[mask] = 0.0
                 agent.budget = 0.0
-                self._refresh_layers(advance_population=False)
+                any_bankrupt = True
+        if any_bankrupt:
+            self._refresh_layers(advance_population=False)
 
     # ------------------------------------------------------------------
     # Dynamic layers
