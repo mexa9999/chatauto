@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover - exercised only without numba
             return args[0]
         return decorator
 
+_window_sums_cache = {}
 
 @njit(cache=True)
 def _box_sum_numba(a, radius):
@@ -47,11 +48,13 @@ def box_sum(values: np.ndarray, radius: int) -> np.ndarray:
     a = np.ascontiguousarray(values, dtype=np.float64)
     return _box_sum_numba(a, int(radius))
 
-
 def box_mean(values: np.ndarray, radius: int) -> np.ndarray:
     a = np.ascontiguousarray(values, dtype=np.float64)
-    ones = np.ones_like(a)
-    return box_sum(a, radius) / np.maximum(1.0, box_sum(ones, radius))
+    key = (a.shape, radius)
+    if key not in _window_sums_cache:
+        ones = np.ones_like(a)
+        _window_sums_cache[key] = np.maximum(1.0, box_sum(ones, radius))
+    return box_sum(a, radius) / _window_sums_cache[key]
 
 
 def smooth(values: np.ndarray, radius: int = 1) -> np.ndarray:

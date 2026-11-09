@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Sequence
-
+from contextlib import contextmanager
 import numpy as np
 
 from .config import (
@@ -204,8 +204,13 @@ def _metric_row(metrics: dict, keys: Sequence[str]) -> dict:
     }
 
 
-def _shared_executor() -> ProcessPoolExecutor:
-    return ProcessPoolExecutor(max_workers=_max_workers())
+@contextmanager
+def _shared_executor():
+    executor = ProcessPoolExecutor(max_workers=_max_workers())
+    try:
+        yield executor
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +225,11 @@ def e1_learning_curve(
     out_dir: str | Path,
     eval_seed_count: int = 5,
 ) -> dict:
+    import time
+
+    
+
+    t0 = time.perf_counter()
     del eval_seed_count
     out = ensure_dir(out_dir)
     histories: list[list[dict]] = []
@@ -276,6 +286,10 @@ def e1_learning_curve(
         "generation_to_90pct": _stats([r["generation_to_90pct"] for r in runs]),
     }
     write_json(out / "e1_summary.json", summary)
+    print(f"  [E1] done in {time.perf_counter()-t0:.2f}s")
+    t0 = time.perf_counter()
+    plot_learning_curve([result.history], out / f"e1_learning_curve.png")
+    print(f"[TIMING] plot_learning_curve: {time.perf_counter() - t0:.2f}s")
     return summary
 
 
@@ -1254,3 +1268,5 @@ def e11_shocks(
     }
     write_json(out / "e11_summary.json", summary)
     return summary
+
+_GLOBAL_EXECUTOR: ProcessPoolExecutor | None = None

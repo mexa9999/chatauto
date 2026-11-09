@@ -192,7 +192,7 @@ class EvolutionEngine:
                 self.best_ever_generation = self.generation
         finally:
             if self._own_executor and self.executor is not None:
-                self.executor.shutdown(wait=True)
+                self.executor.shutdown(wait=False, cancel_futures=True)
                 self.executor = None
 
         return EvolutionResult(

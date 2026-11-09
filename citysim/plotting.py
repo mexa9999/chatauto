@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import matplotlib
-
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # use non-interactive backend for file output
 import matplotlib.pyplot as plt
+from matplotlib import font_manager  # noqa: F401  (kept for API compat)
 import numpy as np
 
 from .config import TYPE_NAMES
@@ -44,7 +44,7 @@ def plot_city(env: CityEnvironment, path: str | Path, title: str = "City") -> Pa
         pad=0.04,
     )
     cbar.ax.set_yticklabels(TYPE_NAMES)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -66,7 +66,7 @@ def plot_compare_grids(
         ax.set_title(label)
         ax.set_xticks([])
         ax.set_yticks([])
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -125,7 +125,7 @@ def plot_learning_curve(
     axes[1].set_title("Behavioural diversity")
     axes[1].grid(alpha=0.25)
     fig.suptitle(title)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -161,7 +161,7 @@ def plot_satisfaction_curve(
     ax.grid(alpha=0.25)
     if plotted:
         ax.legend()
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -185,7 +185,7 @@ def plot_history_panels(history: Sequence[dict], path: str | Path, title: str = 
         ax.set_ylabel(label)
         ax.grid(alpha=0.25)
     fig.suptitle(title)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -213,7 +213,7 @@ def plot_metric_vs_x(
     ax.set_title(title)
     ax.grid(alpha=0.25)
     ax.legend()
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -237,7 +237,7 @@ def plot_bars(
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -268,7 +268,7 @@ def plot_profit_quality(
     ax.set_title(title)
     ax.grid(alpha=0.25)
     ax.legend()
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -293,7 +293,7 @@ def plot_profit_satisfaction(
     ax.set_ylabel("mean citizen satisfaction")
     ax.set_title(title)
     ax.grid(alpha=0.25)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -315,7 +315,7 @@ def plot_distribution_matrix(
     ax.set_yticklabels(labels)
     fig.colorbar(im, ax=ax, label="type share")
     ax.set_title(title)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path

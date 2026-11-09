@@ -232,7 +232,7 @@ def strategic_bid(expected_surplus: float, cost: float, budget: float) -> float:
     if budget <= 0.0 or expected_surplus <= 0.0 or cost <= 0.0:
         return 0.0
     fraction = min(BID_MAX, 0.08 * expected_surplus / cost)
-    cap = min(BID_MAX * budget, budget / 10.0)
+    cap = min(BID_MAX * budget, budget / 20.0)
     return float(np.clip(fraction * budget, BID_MIN, cap))
 
 
@@ -282,6 +282,11 @@ class NeuralPolicy:
     @staticmethod
     def _neighbour_validity(h: int, w: int) -> np.ndarray:
         """Boolean (H, W, 8) mask: the neighbour lies inside the grid."""
+        if not hasattr(NeuralPolicy, "_validity_cache"):
+            NeuralPolicy._validity_cache = {}
+        if (h, w) in NeuralPolicy._validity_cache:
+            return NeuralPolicy._validity_cache[(h, w)]
+            
         ones = np.ones((h, w), dtype=np.float64)
         padded = np.pad(ones, 1)
         valid = []
@@ -289,10 +294,10 @@ class NeuralPolicy:
             for dx in (-1, 0, 1):
                 if dy == 0 and dx == 0:
                     continue
-                valid.append(
-                    padded[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w]
-                )
-        return np.stack(valid, axis=2) > 0.5
+                valid.append(padded[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w])
+        res = np.stack(valid, axis=2) > 0.5
+        NeuralPolicy._validity_cache[(h, w)] = res
+        return res
 
     def _forward(self, obs: "Observation") -> dict[str, np.ndarray]:
         layout = self.layout
@@ -322,7 +327,7 @@ class NeuralPolicy:
             max(1, layout.attention_dim)
         )
         valid = self._neighbour_validity(h, w)
-        att_logits = np.where(valid, att_logits, -1e9)
+        att_logits[~valid] = -1e9
         att_logits -= att_logits.max(axis=2, keepdims=True)
         att = np.exp(att_logits)
         att /= np.maximum(1e-9, att.sum(axis=2, keepdims=True))
@@ -410,7 +415,6 @@ class NeuralPolicy:
         for action_type in allowed:
             joint[action_type, :] += 0.40
         mask = action_mask[cell]
-        joint = joint.copy()
         joint[~mask] = -np.inf
         return joint
 

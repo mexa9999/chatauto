@@ -267,6 +267,8 @@ class CityEnvironment:
         self.dist_to_industry = np.ones((self.h, self.w), dtype=np.float64)
         self._cluster_labels: dict[int, np.ndarray] = {}
         self.citizens = CitizenPool(seed=self.seed + 7919)
+        self._cached_compat = None
+        self._income_cache = None
         self._refresh_layers(advance_population=False)
 
     # ------------------------------------------------------------------
@@ -302,12 +304,10 @@ class CityEnvironment:
 
         own = (self.owner_grid == agent_id).astype(np.float64)
         own_count = box_sum(own, 2) - own
-        competition = np.clip(
-            (self._built_count_r2 - own_count) / self._neighbor_n2, 0.0, 1.0
-        )
+        competition = competition = (self._built_count_r2 - own_count) / self._neighbor_n2
 
         f = np.empty((self.h, self.w, N_CELL_FEATURES), dtype=np.float64)
-        f[..., 0] = np.clip(self.price / MAX_PRICE, 0.0, 1.0)
+        f[..., 0] = self.price / MAX_PRICE
         f[..., 1] = self.static["soil"]
         f[..., 2] = self.static["water"]
         f[..., 3] = self.static["road"]
@@ -318,7 +318,7 @@ class CityEnvironment:
         f[..., 8] = self.share_industry
         f[..., 9] = self.mean_quality
         f[..., 10] = self.load
-        f[..., 11] = np.clip(self.demand / MAX_DEMAND, 0.0, 1.0)
+        f[..., 11] = self.demand / MAX_DEMAND
         f[..., 12] = self.buildable.astype(np.float64)
         f[..., 13] = free.astype(np.float64)
         f[..., 14] = competition
@@ -633,12 +633,14 @@ class CityEnvironment:
     # ------------------------------------------------------------------
 
     def _refresh_layers(self, advance_population: bool = False) -> None:
+        self._cached_compat = None  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
+        self._income_cache = None   # <--- ДОБАВИТЬ ЭТУ СТРОКУ
         built = (self.type_grid > 0).astype(np.float64)
         built_bool = built > 0.0
 
         self._built_count_r1 = box_sum(built, 1) - built
         self._built_count_r2 = box_sum(built, 2) - built
-        self.density = np.clip(self._built_count_r1 / self._neighbor_n1, 0.0, 1.0)
+        self.density = self._built_count_r1 / self._neighbor_n1
 
         counts: dict[int, np.ndarray] = {}
         for world_type in range(1, 6):
@@ -646,11 +648,11 @@ class CityEnvironment:
             counts[world_type] = box_sum(mask, 2) - mask
         self._type_counts_r2 = counts
 
-        self.share_housing = np.clip(counts[1] / self._neighbor_n2, 0.0, 1.0)
-        self.share_commercial = np.clip(counts[2] / self._neighbor_n2, 0.0, 1.0)
-        self.share_mixed = np.clip(counts[3] / self._neighbor_n2, 0.0, 1.0)
-        self.share_industry = np.clip(counts[4] / self._neighbor_n2, 0.0, 1.0)
-        self.share_green = np.clip(counts[5] / self._neighbor_n2, 0.0, 1.0)
+        self.share_housing = counts[1] / self._neighbor_n2
+        self.share_commercial = counts[2] / self._neighbor_n2
+        self.share_mixed = counts[3] / self._neighbor_n2
+        self.share_industry = counts[4] / self._neighbor_n2
+        self.share_green = counts[5] / self._neighbor_n2
         max_share = np.maximum.reduce(
             [
                 self.share_housing,
@@ -660,13 +662,11 @@ class CityEnvironment:
                 self.share_green,
             ]
         )
-        self.load = np.clip(0.5 * self.density + 0.5 * max_share, 0.0, 1.0)
+        self.load = 0.5 * self.density + 0.5 * max_share
 
         quality = np.where(built_bool, self.quality_grid.astype(np.float64), 0.0)
         quality_sum = box_sum(quality, 2) - quality
-        self.mean_quality = np.clip(
-            quality_sum / np.maximum(1.0, self._built_count_r2) / 2.0, 0.0, 1.0
-        )
+        self.mean_quality = quality_sum / np.maximum(1.0, self._built_count_r2) / 2.0
 
         # Local saturation around every cell.
         for world_type in range(1, 6):
@@ -841,6 +841,8 @@ class CityEnvironment:
 
     def _compatibility_fields(self) -> np.ndarray:
         """Compatibility multiplier for each action type, shape (5, H, W)."""
+        if self._cached_compat is not None:
+            return self._cached_compat
         counts = self._type_counts_r2
         housing = counts[1]
         commercial = counts[2]
@@ -876,6 +878,7 @@ class CityEnvironment:
                 0.35,
                 1.55,
             )
+        self._cached_compat = fields
         return fields
 
     def _sector_quality_penalty(self, action_type: int) -> np.ndarray:
@@ -890,6 +893,8 @@ class CityEnvironment:
         return np.ones((self.h, self.w), dtype=np.float64)
 
     def _income_grid(self) -> np.ndarray:
+        if self._income_cache is not None:
+            return self._income_cache
         built = self.type_grid > 0
         if not built.any():
             return np.zeros((self.h, self.w), dtype=np.float64)
@@ -905,7 +910,7 @@ class CityEnvironment:
         access_fit = 1.0 - np.abs(
             self.static["dist_center"] - OPTIMAL_DISTANCE[world_type]
         )
-        access_factor = 0.6 + 0.8 * np.clip(access_fit, 0.0, 1.0)
+        access_factor = 0.6 + 0.8 * access_fit
         soil_factor = 0.9 + 0.2 * self.static["soil"]
 
         if self.config.enable_externalities:
@@ -948,7 +953,8 @@ class CityEnvironment:
             * soil_factor
         )
         income[~built] = 0.0
-        return np.maximum(income, 0.0)
+        self._income_cache = np.maximum(income, 0.0)
+        return self._income_cache
 
     def projected_income_table(self, agent_id: int) -> np.ndarray:
         """Expected one-round income for building in every empty cell.

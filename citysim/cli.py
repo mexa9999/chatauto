@@ -546,7 +546,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    finally:
+        # Close any executor that survived the experiment runner.
+        # wait=False avoids the multi-second join on Windows spawn.
+        from . import experiments
+        if getattr(experiments, "_GLOBAL_EXECUTOR", None) is not None:
+            experiments._GLOBAL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            experiments._GLOBAL_EXECUTOR = None
 
 
 if __name__ == "__main__":

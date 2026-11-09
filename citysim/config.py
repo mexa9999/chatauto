@@ -23,7 +23,7 @@ QUALITY_NAMES = ("low", "medium", "high")
 
 # Arrays are indexed by world type id (0 = empty).
 BUILD_COST = np.array([0.0, 80.0, 110.0, 100.0, 85.0, 25.0], dtype=np.float64)
-INCOME_BASE = np.array([0.0, 30.0, 42.0, 36.0, 33.0, 7.5], dtype=np.float64)
+INCOME_BASE = np.array([0.0, 30.0, 48.0, 36.0, 33.0, 7.5], dtype=np.float64)
 OPTIMAL_DISTANCE = np.array([0.0, 0.40, 0.10, 0.30, 0.75, 0.50], dtype=np.float64)
 QUALITY_COST_MULT = np.array([0.70, 1.00, 1.40], dtype=np.float64)
 QUALITY_INCOME_MULT = np.array([0.65, 1.00, 1.35], dtype=np.float64)
@@ -43,16 +43,16 @@ SATURATION_RADIUS = 2
 # Global stocks (economy level 2)
 # ---------------------------------------------------------------------------
 
-HOUSING_CAPACITY = 8.0
-MIXED_CAPACITY = 5.0
-COMMERCIAL_JOBS = 6.0
+HOUSING_CAPACITY = 4.0
+MIXED_CAPACITY = 3.0
+COMMERCIAL_JOBS = 8.0
 INDUSTRY_JOBS = 10.0
 MIXED_JOBS = 4.0
-COMMERCIAL_CUSTOMERS = 20.0
-COMMERCIAL_GOODS_DEMAND = 4.0
-INDUSTRY_GOODS_SUPPLY = 10.0
+COMMERCIAL_CUSTOMERS = 30.0
+COMMERCIAL_GOODS_DEMAND = 15.0
+INDUSTRY_GOODS_SUPPLY = 5.0
 POPULATION_INERTIA = 0.35
-CITIZEN_GOODS_DEMAND = 0.05
+CITIZEN_GOODS_DEMAND = 0.5
 
 # ---------------------------------------------------------------------------
 # Land value, pollution and noise (economy level 3)
@@ -70,8 +70,8 @@ BANKRUPTCY_FITNESS_PENALTY = 0.35
 # Regulation: taxes and subsidies are city parameters, not agents
 # ---------------------------------------------------------------------------
 
-PROPERTY_TAX_RATE = 0.03
-INDUSTRY_TAX_RATE = 0.05
+PROPERTY_TAX_RATE = 0.02
+INDUSTRY_TAX_RATE = 0.03
 GREEN_SUBSIDY = 4.0
 AFFORDABLE_HOUSING_QUOTA = 0.20
 
@@ -88,7 +88,7 @@ CITIZEN_RICH_FRACTION = 0.30
 
 BIDS_PER_AGENT = 3
 BID_MIN = 0.0
-BID_MAX = 0.25          # maximal fraction of the current budget
+BID_MAX = 0.05          # maximal fraction of the current budget
 DISTRICT_SIZE = 3
 
 # ---------------------------------------------------------------------------

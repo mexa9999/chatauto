@@ -1,30 +1,23 @@
-from numba import njit
-from time import perf_counter as pf
+from collections import defaultdict
 
-MOD = (1 << 31) - 1
+def parse_raw_profile(filepath):
+    samples = defaultdict(int)
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            # Формат: "func1;func2;func3 123"
+            stack_part, count_str = line.rsplit(' ', 1)
+            count = int(count_str)
+            # Берем только последнюю функцию в стеке (где реально было время)
+            leaf_func = stack_part.split(';')[-1]
+            samples[leaf_func] += count
+    return samples
 
-@njit(cache=True)
-def tick(x):
-    for _ in range(9):
-        x = (x * x) % MOD
-    return x
-
-@njit(cache=True)
-def main(n=100_000):
-    y = 1
-    for x in range(1, n):
-        y = (y * tick(x)) % MOD
-    return y
-
-def bench(fn, n=100_0000, runs=5):
-    fn(n)                           # прогрев JIT
-    times = []
-    for _ in range(runs):
-        st = pf()
-        res = fn(n)
-        times.append(pf() - st)
-    return res, min(times), sum(times) / runs
-
-if __name__ == "__main__":
-    res, best, avg = bench(main)
-    print(f"result = {res}, best = {best*1000:.2f} ms, avg = {avg*1000:.2f} ms")
+# Использование:
+profile_data = parse_raw_profile('profile.raw')
+total = sum(profile_data.values())
+print(f"{'Function':<50} | {'Samples':>8} | {'%':>6}")
+print("-" * 70)
+for func, count in sorted(profile_data.items(), key=lambda x: x[1], reverse=True)[:20]:
+    print(f"{func[:50]:<50} | {count:>8} | {(count/total)*100:>5.1f}%")
