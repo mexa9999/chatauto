@@ -28,3 +28,4 @@ pip install -r requirements.txt
 - `runs/` — сгенерированные артефакты (не коммитятся).
 
 Подробности: `docs/MODEL.md`.
+Масштабирование CPU и запуск бенчмарков: [docs/SCALING_BENCHMARK.md](docs/SCALING_BENCHMARK.md).

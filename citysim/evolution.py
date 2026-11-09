@@ -10,7 +10,14 @@ from typing import Callable
 import numpy as np
 
 from .config import BEHAVIOR_DIM, CityConfig, EvolutionConfig
-from .episode import EpisodeResult, run_episode, score_episode
+from .episode import EpisodeResult, run_episode
+from .execution import (
+    CitySummary,
+    EpisodeExecutor,
+    EpisodeTask,
+    _run_episode_worker,
+    _worker_init,
+)
 from .metrics import spatial_metrics
 from .policy import (
     GenomeLayout,
@@ -23,6 +30,12 @@ from .policy import (
     random_genome,
 )
 
+def _max_workers(config: EvolutionConfig, task_count: int) -> int:
+    cpu_count = getattr(os, "process_cpu_count", os.cpu_count)()
+    available = max(1, cpu_count or 1)
+    requested = config.max_workers or available
+    return max(1, min(int(requested), int(task_count)))
+
 
 def layout_from_config(config: EvolutionConfig) -> GenomeLayout:
     return GenomeLayout(
@@ -31,15 +44,6 @@ def layout_from_config(config: EvolutionConfig) -> GenomeLayout:
         district_hidden=config.district_hidden,
         global_hidden=config.global_hidden,
     )
-
-
-def _run_episode_worker(genomes, city_config, seed, layout):
-    """Top-level worker used by the process pool."""
-    policies = [NeuralPolicy(g, layout) for g in genomes]
-    result = run_episode(city_config, policies, seed)
-    scores = score_episode(result, city_config.fitness)
-    behaviors = [a.behavior for a in result.agents]
-    return scores, behaviors, result.city
 
 
 @dataclass
@@ -138,13 +142,15 @@ class EvolutionEngine:
         self.best_ever_generation = -1
         self.hall_of_fame: list[tuple[int, float, np.ndarray]] = []
 
-        self._own_executor = False
-        self.executor = executor
-        if self.executor is None and config.use_parallel:
-            self.executor = ProcessPoolExecutor(
-                max_workers=min(8, os.cpu_count() or 1)
-            )
-            self._own_executor = True
+        self.episode_executor = EpisodeExecutor(
+            city_config,
+            self.layout,
+            parallel=config.use_parallel,
+            max_workers=_max_workers(config, config.episodes_per_generation),
+            executor=executor,
+            process_pool_factory=ProcessPoolExecutor,
+        )
+        self.executor = self.episode_executor.executor
 
     # ------------------------------------------------------------------
     # Main loop
@@ -191,8 +197,8 @@ class EvolutionEngine:
                 self.best_ever_behavior = best.behavior.copy()
                 self.best_ever_generation = self.generation
         finally:
-            if self._own_executor and self.executor is not None:
-                self.executor.shutdown(wait=False, cancel_futures=True)
+            self.episode_executor.shutdown()
+            if self.episode_executor.owns_executor:
                 self.executor = None
 
         return EvolutionResult(
@@ -242,36 +248,19 @@ class EvolutionEngine:
         for episode_idx, devs in enumerate(episodes):
             seed = cfg.train_seed_base + gen * cfg.episodes_per_generation + episode_idx
             genomes = [self.population[int(idx)].genome for idx in devs]
-            tasks.append((genomes, seed))
+            tasks.append(EpisodeTask(genomes, seed))
+        results = self.episode_executor.map(tasks)
 
-        if self.executor is not None:
-            futures = [
-                self.executor.submit(
-                    _run_episode_worker,
-                    genomes,
-                    self.city_config,
-                    seed,
-                    self.layout,
-                )
-                for genomes, seed in tasks
-            ]
-            results = [future.result() for future in futures]
-        else:
-            results = [
-                _run_episode_worker(
-                    genomes, self.city_config, seed, self.layout
-                )
-                for genomes, seed in tasks
-            ]
-
-        for (scores, behaviors, city), devs in zip(results, episodes):
+        for result, devs in zip(results, episodes):
             city_episodes += 1
-            for key in city_keys:
-                city_sum[key] += float(getattr(city, key))
+            for key, value in zip(city_keys, result.city):
+                city_sum[key] += value
             for slot, idx in enumerate(devs):
                 idx = int(idx)
-                fitness_sum[idx] += float(scores[slot])
-                behavior_sum[idx] += np.asarray(behaviors[slot], dtype=np.float64)
+                fitness_sum[idx] += float(result.scores[slot])
+                behavior_sum[idx] += np.asarray(
+                    result.behaviors[slot], dtype=np.float64
+                )
                 appearances[idx] += 1
 
         if city_episodes:
@@ -554,34 +543,62 @@ def evaluate_population(
     appearance = np.zeros(k, dtype=np.int64)
     per_seed: list[dict] = []
 
+    tasks: list[EpisodeTask] = []
+    seed_groups: list[tuple[int, list[np.ndarray], int]] = []
     for seed in seeds:
         rng = np.random.default_rng((int(seed) * 6_364_136_223 + 0x1234) % (2**63))
         assignments = balanced_episode_indices(rng, k, n, episodes)
-        seed_scores: list[float] = []
-        seed_cities = []
+        task_start = len(tasks)
         for ep, devs in enumerate(assignments):
             episode_seed = int(seed) * 1000 + ep
-            policies = [
-                NeuralPolicy(population[int(idx)].genome, layout) for idx in devs
-            ]
-            result = run_episode(city_config, policies, episode_seed)
-            scores = score_episode(result)
-            seed_scores.extend(float(x) for x in scores)
+            genomes = [population[int(idx)].genome for idx in devs]
+            tasks.append(EpisodeTask(genomes, episode_seed))
+        seed_groups.append((int(seed), assignments, task_start))
+
+    if tasks:
+        executor = EpisodeExecutor(
+            city_config,
+            layout,
+            parallel=evolution_config.use_parallel,
+            max_workers=_max_workers(evolution_config, len(tasks)),
+            process_pool_factory=ProcessPoolExecutor,
+        )
+        try:
+            results = executor.map(tasks)
+        finally:
+            executor.shutdown()
+    else:
+        results = []
+
+    for seed, assignments, task_start in seed_groups:
+        seed_results = results[task_start : task_start + len(assignments)]
+        seed_scores: list[float] = []
+        seed_cities: list[CitySummary] = []
+        for result, devs in zip(seed_results, assignments):
+            seed_scores.extend(float(value) for value in result.scores)
             seed_cities.append(result.city)
             for slot, idx in enumerate(devs):
                 idx = int(idx)
-                fitness_sum[idx] += float(scores[slot])
-                behavior_sum[idx] += result.agents[slot].behavior
+                fitness_sum[idx] += float(result.scores[slot])
+                behavior_sum[idx] += np.asarray(
+                    result.behaviors[slot], dtype=np.float64
+                )
                 appearance[idx] += 1
         per_seed.append(
             {
-                "seed": int(seed),
+                "seed": seed,
                 "fitness_mean": float(np.mean(seed_scores)),
                 "fitness_std": float(np.std(seed_scores, ddof=1)) if len(seed_scores) > 1 else 0.0,
-                "city_quality": float(np.mean([c.city_quality for c in seed_cities])),
-                "mean_satisfaction": float(np.mean([c.mean_satisfaction for c in seed_cities])),
-                "green_share": float(np.mean([c.green_share for c in seed_cities])),
-                "damage_total": float(np.mean([c.externality_damage_total for c in seed_cities])),
+                "city_quality": float(
+                    np.mean([city.city_quality for city in seed_cities])
+                ),
+                "mean_satisfaction": float(
+                    np.mean([city.mean_satisfaction for city in seed_cities])
+                ),
+                "green_share": float(np.mean([city.green_share for city in seed_cities])),
+                "damage_total": float(
+                    np.mean([city.externality_damage_total for city in seed_cities])
+                ),
             }
         )
 

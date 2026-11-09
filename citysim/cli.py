@@ -5,6 +5,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 from pathlib import Path
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import numpy as np
 
@@ -67,6 +73,12 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generations", type=int, default=None)
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--population", type=int, default=None)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="maximum CPU worker processes (default: all available CPUs)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seeds", type=str, default=None, help="e.g. 0-9 or 0,1,2")
     parser.add_argument("--n-agents", type=int, default=None)
@@ -140,6 +152,8 @@ def build_configs(args) -> tuple[CityConfig, EvolutionConfig, list[int]]:
         evo = replace(evo, episodes_per_generation=args.episodes)
     if args.population is not None:
         evo = replace(evo, population_size=args.population)
+    if args.workers is not None:
+        evo = replace(evo, max_workers=args.workers)
     if getattr(args, "hidden", None) is not None:
         evo = replace(evo, hidden_size=args.hidden)
     if getattr(args, "map_elites", False):

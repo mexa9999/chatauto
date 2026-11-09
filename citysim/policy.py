@@ -51,6 +51,14 @@ DISTRICT_ALLOWED: tuple[tuple[int, ...], ...] = (
     (0, 1, 2, 3, 4),
 )
 
+_DISTRICT_ACTION_BIAS = np.zeros(
+    (len(DISTRICT_ALLOWED), len(DISTRICT_ALLOWED), 3), dtype=np.float64
+)
+for _district_id, _allowed_types in enumerate(DISTRICT_ALLOWED):
+    for _type_id in _allowed_types:
+        _DISTRICT_ACTION_BIAS[_district_id, _type_id, :] = 0.40
+_DISTRICT_ACTION_BIAS.setflags(write=False)
+
 
 # ---------------------------------------------------------------------------
 # Genome layout and mutation
@@ -233,7 +241,7 @@ def strategic_bid(expected_surplus: float, cost: float, budget: float) -> float:
         return 0.0
     fraction = min(BID_MAX, 0.08 * expected_surplus / cost)
     cap = min(BID_MAX * budget, budget / 20.0)
-    return float(np.clip(fraction * budget, BID_MIN, cap))
+    return float(min(max(fraction * budget, BID_MIN), cap))
 
 
 # ---------------------------------------------------------------------------
@@ -303,93 +311,107 @@ class NeuralPolicy:
         layout = self.layout
         f = obs.cell_features.reshape(-1, layout.n_cell_features)
         n_cells = f.shape[0]
-        # Reconstruct the grid shape from the observation metadata.
         grid_side = int(round(np.sqrt(n_cells)))
-        # Observations are flattened in row-major order; the environment uses
-        # rectangular grids, so infer the shape from the cost table is not
-        # possible.  The caller attaches shape through _shape_hint.
         h, w = getattr(obs, "_shape_hint", (grid_side, grid_side))
         f_grid = f.reshape(h, w, layout.n_cell_features)
         global_vec = obs.global_features
-        x_grid = np.concatenate(
-            [
-                f_grid,
-                np.broadcast_to(global_vec, (h, w, global_vec.size)),
-            ],
-            axis=-1,
-        )
 
-        neighbours = self._neighbour_stack(f_grid)
+        # --- Ускоренный Attention (без np.stack) ---
+        padded = np.pad(f_grid, ((1, 1), (1, 1), (0, 0)))
         q = f_grid @ self.Wq + self.b_att
-        keys = neighbours @ self.Wk
-        values = neighbours @ self.Wv
-        att_logits = np.einsum("hwka,hwa->hwk", keys, q) / np.sqrt(
-            max(1, layout.attention_dim)
-        )
+        padded_keys = padded @ self.Wk
+        padded_vals = padded @ self.Wv
+
+        att_logits = np.zeros((h, w, 8), dtype=np.float64)
+        idx = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0: continue
+                keys_slice = padded_keys[1+dy:1+dy+h, 1+dx:1+dx+w, :]
+                att_logits[:, :, idx] = np.einsum('hwa,hwa->hw', keys_slice, q)
+                idx += 1
+        
+        att_logits /= np.sqrt(max(1, layout.attention_dim))
         valid = self._neighbour_validity(h, w)
         att_logits[~valid] = -1e9
         att_logits -= att_logits.max(axis=2, keepdims=True)
         att = np.exp(att_logits)
         att /= np.maximum(1e-9, att.sum(axis=2, keepdims=True))
-        context = np.einsum("hwk,hwka->hwa", att, values)
 
-        # District encoder.
+        context = np.zeros((h, w, layout.attention_dim))
+        idx = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0: continue
+                vals_slice = padded_vals[1+dy:1+dy+h, 1+dx:1+dx+w, :]
+                context += att[:, :, idx, None] * vals_slice
+                idx += 1
+
+        # --- District encoder ---
         labels = getattr(obs, "_district_labels")
         n_districts = int(getattr(obs, "_n_districts"))
         labels_flat = labels.ravel()
         counts = np.bincount(labels_flat, minlength=n_districts).astype(np.float64)
-        district_sum = np.zeros(
-            (n_districts, layout.n_cell_features + layout.n_global_features),
-            dtype=np.float64,
-        )
-        n_features = x_grid.shape[-1]
-        district_sum = np.stack([
-            np.bincount(labels_flat, weights=x_grid[..., k].ravel(), minlength=n_districts)
-            for k in range(n_features)
-        ], axis=1)
+
+        district_sum_f = np.array([
+            np.bincount(labels_flat, weights=f_grid[..., k].ravel(), minlength=n_districts)
+            for k in range(layout.n_cell_features)
+        ]).T
+        district_sum_g = global_vec[None, :] * counts[:, None]
+        district_sum = np.concatenate([district_sum_f, district_sum_g], axis=1)
+
         district_input = district_sum / np.maximum(1.0, counts)[:, None]
-        district_hidden = np.maximum(
-            district_input @ self.Wd + self.bd, 0.0
-        )
+        district_hidden = np.maximum(district_input @ self.Wd + self.bd, 0.0)
         district_logits = district_hidden @ self.Wd_type + self.bd_type
         district_choice = np.argmax(district_logits, axis=1)
-        one_hot = np.eye(layout.n_district_types)[district_choice]
-        district_onehot_cells = one_hot[labels_flat].reshape(
-            h, w, layout.n_district_types
-        )
+        
         district_type_cells = district_choice[labels_flat].reshape(h, w)
         district_logits_cells = district_logits[labels_flat].reshape(
             h, w, layout.n_district_types
         )
 
-        # Global summary.
-        summary = np.concatenate(
-            [f_grid.mean(axis=(0, 1)), f_grid.max(axis=(0, 1)), global_vec]
-        )
+        # --- Global summary ---
+        summary = np.concatenate([
+            f_grid.mean(axis=(0, 1)), 
+            f_grid.max(axis=(0, 1)), 
+            global_vec
+        ])
         global_embedding = np.maximum(summary @ self.Wg + self.bg, 0.0)
-        global_cells = np.broadcast_to(
-            global_embedding, (h, w, layout.global_hidden)
-        )
 
-        cell_input = np.concatenate(
-            [f_grid, context, global_cells, district_onehot_cells], axis=-1
-        ).reshape(n_cells, layout.cell_mlp_input)
-        h1 = np.maximum(cell_input @ self.W1 + self.b1, 0.0)
-        h2 = np.maximum(h1 @ self.W2 + self.b2, 0.0)
+        # --- Блочное умножение ---
+        f_dim = layout.n_cell_features
+        a_dim = layout.attention_dim
+        g_dim = layout.global_hidden
+        
+        W1_f = self.W1[:f_dim, :]
+        W1_c = self.W1[f_dim:f_dim+a_dim, :]
+        W1_g = self.W1[f_dim+a_dim:f_dim+a_dim+g_dim, :]
+        W1_d = self.W1[f_dim+a_dim+g_dim:, :]
+
+        h1 = (
+            f_grid @ W1_f
+            + context @ W1_c
+            + (global_embedding @ W1_g)[None, None, :]
+            + W1_d[district_choice][labels_flat].reshape(h, w, -1)
+            + self.b1
+        )
+        h1 = np.maximum(h1, 0.0)
+
+        h2 = np.maximum(h1.reshape(n_cells, -1) @ self.W2 + self.b2, 0.0)
         scores = h2 @ self.w3 + float(self.b3[0])
-        type_logits = (h2 @ self.W_type + self.b_type).reshape(
-            h, w, layout.n_types
-        )
-        quality_logits = (h2 @ self.W_quality + self.b_quality).reshape(
-            h, w, layout.n_qualities
-        )
-        bid_fraction = 1.0 / (
-            1.0 + np.exp(-(h2 @ self.w_bid + float(self.b_bid[0])))
-        )
+        
+        type_logits = (h2 @ self.W_type + self.b_type).reshape(h, w, layout.n_types)
+        quality_logits = (h2 @ self.W_quality + self.b_quality).reshape(h, w, layout.n_qualities)
+        bid_fraction = 1.0 / (1.0 + np.exp(-(h2 @ self.w_bid + float(self.b_bid[0]))))
+
+        # --- ПРЕДВЫЧИСЛЕНИЕ JOINT LOGITS ---
+        joint_all = type_logits[:, :, :, None] + quality_logits[:, :, None, :]
+        
+        joint_all += _DISTRICT_ACTION_BIAS[district_type_cells]
+
         return {
             "scores": scores,
-            "type_logits": type_logits,
-            "quality_logits": quality_logits,
+            "joint_all": joint_all,  # <--- НОВОЕ ПОЛЕ
             "bid_fraction": bid_fraction.reshape(h, w),
             "district_type": district_type_cells,
             "district_logits": district_logits_cells,
@@ -407,13 +429,7 @@ class NeuralPolicy:
     ) -> np.ndarray:
         h, w = (int(x) for x in forward["shape"])
         row, col = divmod(int(cell), w)
-        type_logits = forward["type_logits"][row, col]
-        quality_logits = forward["quality_logits"][row, col]
-        joint = type_logits[:, None] + quality_logits[None, :]
-        district_type = int(forward["district_type"][row, col])
-        allowed = DISTRICT_ALLOWED[district_type]
-        for action_type in allowed:
-            joint[action_type, :] += 0.40
+        joint = forward["joint_all"][row, col].copy()
         mask = action_mask[cell]
         joint[~mask] = -np.inf
         return joint
@@ -435,7 +451,7 @@ class NeuralPolicy:
         row, col = divmod(int(cell), w)
         budget = max(0.0, float(obs.budget))
         bid_cap = max(0.0, min(BID_MAX * budget, budget / 10.0))
-        bid = float(np.clip(forward["bid_fraction"][row, col] * budget, BID_MIN, bid_cap))
+        bid = float(min(max(forward["bid_fraction"][row, col] * budget, BID_MIN), bid_cap))
         if cost + bid > budget + 1e-9:
             return None
         return Action(
@@ -479,9 +495,20 @@ class NeuralPolicy:
                 if 0 <= int(cell) < scores.size:
                     scores[int(cell)] = -np.inf
         # Rank cells by cell score plus the best conditioned type/quality.
-        h, w = (int(x) for x in forward["shape"])
+        #h, w = (int(x) for x in forward["shape"])
         candidates: list[tuple[float, int]] = []
-        for cell in np.argsort(scores)[::-1]:
+        valid_mask = np.isfinite(scores)
+        valid_indices = np.flatnonzero(valid_mask)
+        if valid_indices.size == 0:
+            return []
+        
+        # Находим top-N быстро
+        k = min(count * 2, valid_indices.size)
+        top_idx = np.argpartition(scores[valid_indices], -k)[-k:]
+        top_cells = valid_indices[top_idx]
+        top_cells = top_cells[np.argsort(scores[top_cells])[::-1]]
+
+        for cell in top_cells:
             cell = int(cell)
             if not np.isfinite(scores[cell]):
                 break

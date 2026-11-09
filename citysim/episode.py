@@ -148,6 +148,7 @@ def run_round(
     on_action: ActionCallback | None = None,
 ) -> None:
     """Run one full bidding/building round without ending it."""
+    env._current_income = env._income_grid()
     if config.use_auction:
         _run_auction_round(env, policies, rng, config, on_action)
     else:
@@ -222,10 +223,10 @@ def score_breakdown(
     # Smooth, scale-aware normalisation.  tanh does not saturate at the very
     # short horizons used by the quick experiments and keeps the sign.
     profit_norm = np.tanh(profits / 1000.0)
-    build_norm = np.clip(builds / actions, 0.0, 1.0)
+    build_norm = np.minimum(np.maximum(builds / actions, 0.0), 1.0)
     violation_norm = violations / (violations + 10.0)
     damage_norm = damage / (damage + 50.0)
-    skip_norm = np.clip(skips / actions, 0.0, 1.0)
+    skip_norm = np.minimum(np.maximum(skips / actions, 0.0), 1.0)
 
     scores = (
         weights.profit * profit_norm

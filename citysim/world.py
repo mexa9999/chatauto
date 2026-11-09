@@ -269,6 +269,7 @@ class CityEnvironment:
         self.citizens = CitizenPool(seed=self.seed + 7919)
         self._cached_compat = None
         self._income_cache = None
+        self._current_income = None
         self._refresh_layers(advance_population=False)
 
     # ------------------------------------------------------------------
@@ -304,7 +305,7 @@ class CityEnvironment:
 
         own = (self.owner_grid == agent_id).astype(np.float64)
         own_count = box_sum(own, 2) - own
-        competition = competition = (self._built_count_r2 - own_count) / self._neighbor_n2
+        competition = (self._built_count_r2 - own_count) / self._neighbor_n2
 
         f = np.empty((self.h, self.w, N_CELL_FEATURES), dtype=np.float64)
         f[..., 0] = self.price / MAX_PRICE
@@ -487,6 +488,7 @@ class CityEnvironment:
 
         self._refresh_layers(advance_population=False)
         post_income = self._income_grid()
+        self._current_income = post_income  # <--- СОХРАНЯЕМ ДЛЯ СЛЕДУЮЩЕГО ДЕЙСТВИЯ
         loss = np.maximum(0.0, pre_income - post_income)
         loss[~pre_built] = 0.0
         total_damage = float(loss.sum())
@@ -674,12 +676,8 @@ class CityEnvironment:
             self.local_same[world_type] = (
                 box_sum(mask, SATURATION_RADIUS) - mask
             ).astype(np.float64)
-        self.local_saturation = np.clip(
-            box_sum(built, SATURATION_RADIUS) / np.maximum(1.0, box_sum(
-                np.ones((self.h, self.w), dtype=np.float64), SATURATION_RADIUS
-            )),
-            0.0,
-            1.0,
+        self.local_saturation = box_sum(built, SATURATION_RADIUS) / np.maximum(
+            1.0, box_sum(np.ones((self.h, self.w), dtype=np.float64), SATURATION_RADIUS)
         )
 
         industry_mask = (self.type_grid == 4).astype(np.float64)
@@ -693,30 +691,24 @@ class CityEnvironment:
             if industry_count
             else np.ones((self.h, self.w), dtype=np.float64)
         )
-        self.pollution = np.clip(
+        self.pollution = (
             0.80 * np.exp(-6.0 * industry_dist)
-            + 0.15 * box_mean(road_mask, POLLUTION_RADIUS),
-            0.0,
-            1.0,
+            + 0.15 * box_mean(road_mask, POLLUTION_RADIUS)
         )
         commercial_mask = (self.type_grid == 2).astype(np.float64)
-        self.noise = np.clip(
+        self.noise = (
             0.45 * box_mean(industry_mask + commercial_mask, NOISE_RADIUS)
             + 0.45 * box_mean(road_mask, NOISE_RADIUS)
-            + 0.10 * self.density,
-            0.0,
-            1.0,
+            + 0.10 * self.density
         )
-        self.attractiveness = np.clip(
+        self.attractiveness = (
             0.32 * box_mean((self.type_grid == 5).astype(np.float64), 1)
             + 0.20 * self.static["water"]
             + 0.20 * (1.0 - self.static["dist_center"])
             + 0.15 * self.static["road"]
             + 0.13 * (1.0 - self.density)
             - 0.30 * self.pollution
-            - 0.15 * self.noise,
-            0.0,
-            1.0,
+            - 0.15 * self.noise
         )
 
         raw_land = (
@@ -728,13 +720,13 @@ class CityEnvironment:
             - 0.20 * self.pollution
             - 0.12 * self.noise
         )
-        raw_land = np.clip(raw_land, LAND_VALUE_MIN, LAND_VALUE_MAX)
+        raw_land = np.minimum(np.maximum(raw_land, LAND_VALUE_MIN), LAND_VALUE_MAX)
         self.land_value = (raw_land - LAND_VALUE_MIN) / max(
             1e-9, LAND_VALUE_MAX - LAND_VALUE_MIN
         )
 
         if self.config.enable_externalities:
-            self.demand = np.clip(
+            self.demand =np.minimum(np.maximum(
                 self.static["base_demand"]
                 + 0.25 * (1.0 - self.density)
                 + 0.10 * self.static["road"]
@@ -742,16 +734,16 @@ class CityEnvironment:
                 - 0.15 * self.share_industry
                 + 0.15 * self.attractiveness
                 - 0.10 * self.local_saturation,
-                0.10,
+                0.10),
                 MAX_DEMAND,
             )
-            self.price = np.clip(
+            self.price = np.minimum(np.maximum(
                 0.55 * self.static["land_price"]
                 + 0.35 * (self.demand / MAX_DEMAND)
                 + 0.10 * (1.0 - self.density)
                 + 0.10 * self.land_value
                 - 0.10 * self.pollution,
-                0.0,
+                0.0),
                 MAX_PRICE,
             )
         else:
@@ -869,27 +861,21 @@ class CityEnvironment:
             else:
                 incompatible = np.zeros_like(housing)
                 complementary = housing + commercial + mixed
-            fields[action_type] = np.clip(
-                1.0
-                + 0.05 * complementary
-                - 0.10 * incompatible
-                - 0.03 * same
-                + 0.04 * green,
-                0.35,
-                1.55,
-            )
+            fields[action_type] = np.minimum(np.maximum(
+                1.0 + 0.05 * complementary - 0.10 * incompatible - 0.03 * same + 0.04 * green,
+                0.35), 1.55)
         self._cached_compat = fields
         return fields
 
     def _sector_quality_penalty(self, action_type: int) -> np.ndarray:
         if action_type == 0:      # housing
-            return np.clip(1.0 - 0.30 * self.pollution - 0.15 * self.noise, 0.25, 1.0)
+            return 1.0 - 0.30 * self.pollution - 0.15 * self.noise
         if action_type == 1:      # commercial
-            return np.clip(1.0 - 0.15 * self.noise - 0.10 * self.pollution, 0.30, 1.0)
+            return 1.0 - 0.15 * self.noise - 0.10 * self.pollution
         if action_type == 2:      # mixed
-            return np.clip(1.0 - 0.20 * self.pollution - 0.12 * self.noise, 0.30, 1.0)
+            return 1.0 - 0.20 * self.pollution - 0.12 * self.noise
         if action_type == 3:      # industry
-            return np.clip(1.0 - 0.05 * self.noise, 0.50, 1.0)
+            return 1.0 - 0.05 * self.noise
         return np.ones((self.h, self.w), dtype=np.float64)
 
     def _income_grid(self) -> np.ndarray:
@@ -981,7 +967,7 @@ class CityEnvironment:
             access_fit = 1.0 - np.abs(
                 self.static["dist_center"] - OPTIMAL_DISTANCE[world_type]
             )
-            access_factor = 0.6 + 0.8 * np.clip(access_fit, 0.0, 1.0)
+            access_factor = 0.6 + 0.8 * access_fit
             base = INCOME_BASE[world_type] * (
                 demand_factor * road_factor * access_factor * soil_factor
             )

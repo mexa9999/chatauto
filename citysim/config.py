@@ -339,6 +339,7 @@ class EvolutionConfig:
     track_spatial: bool = False
     spatial_every: int = 10
     use_parallel: bool = True
+    max_workers: int | None = None
     seed: int = 0
     train_seed_base: int = 1_000_000
     validation_seed_base: int = 2_000_000
@@ -377,6 +378,8 @@ class EvolutionConfig:
             raise ValueError("district_size must be >= 1")
         if self.map_elites_bins < 1:
             raise ValueError("map_elites_bins must be >= 1")
+        if self.max_workers is not None and self.max_workers < 1:
+            raise ValueError("max_workers must be >= 1 when set")
 
     def as_dict(self) -> dict:
         return {
@@ -402,6 +405,7 @@ class EvolutionConfig:
             "global_hidden": self.global_hidden,
             "district_size": self.district_size,
             "use_map_elites": self.use_map_elites,
+            "max_workers": self.max_workers,
             "seed": self.seed,
             "train_seed_base": self.train_seed_base,
             "validation_seed_base": self.validation_seed_base,
