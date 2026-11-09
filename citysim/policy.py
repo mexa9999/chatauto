@@ -1,4 +1,9 @@
-"""Policies: NumPy neuroevolution genome, plus random/manual/greedy baselines."""
+"""Policies: NumPy neuroevolution genome, plus random/manual/greedy baselines.
+
+The learned policy is a small district-aware network with local attention over
+the eight neighbouring cells.  Everything is evaluated with NumPy; no automatic
+differentiation and no deep-learning framework is used.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,12 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
-from .config import N_CELL_FEATURES, N_GLOBAL_FEATURES
+from .config import (
+    BID_MAX,
+    BID_MIN,
+    N_CELL_FEATURES,
+    N_GLOBAL_FEATURES,
+)
 from .world import Action
 
 if TYPE_CHECKING:
@@ -21,6 +31,26 @@ class Policy(Protocol):
         self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator
     ) -> Action: ...
 
+    def propose_bids(
+        self,
+        env: "CityEnvironment",
+        agent_id: int,
+        rng: np.random.Generator,
+        count: int,
+        exclude_cells: set[int] | None = None,
+    ) -> list[Action]: ...
+
+
+# A soft district-level prior: which action types are natural in a district
+# whose learned type is housing / commercial / industry / green / mixed.
+DISTRICT_ALLOWED: tuple[tuple[int, ...], ...] = (
+    (0, 2, 4),
+    (1, 2, 4),
+    (3, 4),
+    (4, 0),
+    (0, 1, 2, 3, 4),
+)
+
 
 # ---------------------------------------------------------------------------
 # Genome layout and mutation
@@ -31,24 +61,46 @@ class Policy(Protocol):
 class GenomeLayout:
     n_cell_features: int = N_CELL_FEATURES
     n_global_features: int = N_GLOBAL_FEATURES
-    hidden_size: int = 64
+    hidden_size: int = 48
+    attention_dim: int = 8
+    district_hidden: int = 12
+    global_hidden: int = 8
     n_types: int = 5
     n_qualities: int = 3
+    n_district_types: int = 5
 
     @property
     def input_size(self) -> int:
         return self.n_cell_features + self.n_global_features
 
     @property
+    def cell_mlp_input(self) -> int:
+        return (
+            self.n_cell_features
+            + self.attention_dim
+            + self.global_hidden
+            + self.n_district_types
+        )
+
+    @property
     def parameter_count(self) -> int:
-        inp = self.input_size
+        f = self.n_cell_features
+        g = self.n_global_features
+        a = self.attention_dim
+        dh = self.district_hidden
+        gh = self.global_hidden
         h = self.hidden_size
         return (
-            inp * h + h          # W1, b1
-            + h * h + h          # W2, b2
-            + h + 1              # score head
+            3 * f * a + a               # attention query/key/value + bias
+            + (f + g) * dh + dh          # district encoder
+            + dh * self.n_district_types + self.n_district_types
+            + (2 * f + g) * gh + gh      # global summary
+            + self.cell_mlp_input * h + h
+            + h * h + h
+            + h + 1                      # cell score head
             + h * self.n_types + self.n_types
             + h * self.n_qualities + self.n_qualities
+            + h + 1                      # bid head
         )
 
     def unpack(self, vector: np.ndarray):
@@ -56,7 +108,11 @@ class GenomeLayout:
             raise ValueError(
                 f"genome has shape {vector.shape}, expected ({self.parameter_count},)"
             )
-        inp = self.input_size
+        f = self.n_cell_features
+        g = self.n_global_features
+        a = self.attention_dim
+        dh = self.district_hidden
+        gh = self.global_hidden
         h = self.hidden_size
         pos = 0
 
@@ -67,7 +123,17 @@ class GenomeLayout:
             pos += size
             return out
 
-        W1 = take((inp, h))
+        Wq = take((f, a))
+        Wk = take((f, a))
+        Wv = take((f, a))
+        b_att = take((a,))
+        Wd = take((f + g, dh))
+        bd = take((dh,))
+        Wd_type = take((dh, self.n_district_types))
+        bd_type = take((self.n_district_types,))
+        Wg = take((2 * f + g, gh))
+        bg = take((gh,))
+        W1 = take((self.cell_mlp_input, h))
         b1 = take((h,))
         W2 = take((h, h))
         b2 = take((h,))
@@ -77,14 +143,29 @@ class GenomeLayout:
         b_type = take((self.n_types,))
         W_quality = take((h, self.n_qualities))
         b_quality = take((self.n_qualities,))
-        return W1, b1, W2, b2, w3, b3, W_type, b_type, W_quality, b_quality
+        w_bid = take((h,))
+        b_bid = take((1,))
+        return (
+            Wq, Wk, Wv, b_att,
+            Wd, bd, Wd_type, bd_type,
+            Wg, bg,
+            W1, b1, W2, b2,
+            w3, b3,
+            W_type, b_type,
+            W_quality, b_quality,
+            w_bid, b_bid,
+        )
 
 
 DEFAULT_LAYOUT = GenomeLayout()
 
 
 def random_genome(rng: np.random.Generator, layout: GenomeLayout = DEFAULT_LAYOUT) -> np.ndarray:
-    inp = layout.input_size
+    f = layout.n_cell_features
+    g = layout.n_global_features
+    a = layout.attention_dim
+    dh = layout.district_hidden
+    gh = layout.global_hidden
     h = layout.hidden_size
     vector = np.empty(layout.parameter_count, dtype=np.float64)
     pos = 0
@@ -95,16 +176,31 @@ def random_genome(rng: np.random.Generator, layout: GenomeLayout = DEFAULT_LAYOU
         vector[pos : pos + flat.size] = flat
         pos += flat.size
 
-    put(rng.normal(0.0, np.sqrt(2.0 / inp), size=(inp, h)))
+    def normal(shape, scale):
+        put(rng.normal(0.0, scale, size=shape))
+
+    normal((f, a), np.sqrt(2.0 / f))
+    normal((f, a), np.sqrt(2.0 / f))
+    normal((f, a), np.sqrt(2.0 / f))
+    put(np.zeros(a))
+    normal((f + g, dh), np.sqrt(2.0 / (f + g)))
+    put(np.zeros(dh))
+    normal((dh, layout.n_district_types), 0.02)
+    put(np.zeros(layout.n_district_types))
+    normal((2 * f + g, gh), np.sqrt(2.0 / (2 * f + g)))
+    put(np.zeros(gh))
+    normal((layout.cell_mlp_input, h), np.sqrt(2.0 / layout.cell_mlp_input))
     put(np.zeros(h))
-    put(rng.normal(0.0, np.sqrt(2.0 / h), size=(h, h)))
+    normal((h, h), np.sqrt(2.0 / h))
     put(np.zeros(h))
-    put(rng.normal(0.0, 0.02, size=h))
+    normal((h,), 0.02)
     put(np.zeros(1))
-    put(rng.normal(0.0, 0.02, size=(h, layout.n_types)))
+    normal((h, layout.n_types), 0.02)
     put(np.zeros(layout.n_types))
-    put(rng.normal(0.0, 0.02, size=(h, layout.n_qualities)))
+    normal((h, layout.n_qualities), 0.02)
     put(np.zeros(layout.n_qualities))
+    normal((h,), 0.02)
+    put(np.zeros(1))
     return vector
 
 
@@ -127,6 +223,19 @@ def genome_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean(np.abs(a - b)))
 
 
+def strategic_bid(expected_surplus: float, cost: float, budget: float) -> float:
+    """Small value-proportional sealed bid, capped by the current budget.
+
+    Baselines use the same cap as the learned policy, so the auction is not
+    automatically won by the neural agent just because it is the only bidder.
+    """
+    if budget <= 0.0 or expected_surplus <= 0.0 or cost <= 0.0:
+        return 0.0
+    fraction = min(BID_MAX, 0.08 * expected_surplus / cost)
+    cap = min(BID_MAX * budget, budget / 10.0)
+    return float(np.clip(fraction * budget, BID_MIN, cap))
+
+
 # ---------------------------------------------------------------------------
 # Neural policy
 # ---------------------------------------------------------------------------
@@ -143,54 +252,241 @@ class NeuralPolicy:
         self.genome = np.asarray(genome, dtype=np.float64)
         self.layout = layout
         (
-            self.W1,
-            self.b1,
-            self.W2,
-            self.b2,
-            self.w3,
-            self.b3,
-            self.W_type,
-            self.b_type,
-            self.W_quality,
-            self.b_quality,
+            self.Wq, self.Wk, self.Wv, self.b_att,
+            self.Wd, self.bd, self.Wd_type, self.bd_type,
+            self.Wg, self.bg,
+            self.W1, self.b1, self.W2, self.b2,
+            self.w3, self.b3,
+            self.W_type, self.b_type,
+            self.W_quality, self.b_quality,
+            self.w_bid, self.b_bid,
         ) = layout.unpack(self.genome)
 
-    def _scores(self, obs: "Observation") -> tuple[np.ndarray, np.ndarray]:
-        x = np.concatenate(
+    # -- low-level forward -------------------------------------------------
+
+    @staticmethod
+    def _neighbour_stack(f: np.ndarray) -> np.ndarray:
+        """Return (H, W, 8, F) neighbour features with zero padding."""
+        h, w, features = f.shape
+        padded = np.pad(f, ((1, 1), (1, 1), (0, 0)))
+        neighbours = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                neighbours.append(
+                    padded[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w, :]
+                )
+        return np.stack(neighbours, axis=2)
+
+    @staticmethod
+    def _neighbour_validity(h: int, w: int) -> np.ndarray:
+        """Boolean (H, W, 8) mask: the neighbour lies inside the grid."""
+        ones = np.ones((h, w), dtype=np.float64)
+        padded = np.pad(ones, 1)
+        valid = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                valid.append(
+                    padded[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w]
+                )
+        return np.stack(valid, axis=2) > 0.5
+
+    def _forward(self, obs: "Observation") -> dict[str, np.ndarray]:
+        layout = self.layout
+        f = obs.cell_features.reshape(-1, layout.n_cell_features)
+        n_cells = f.shape[0]
+        # Reconstruct the grid shape from the observation metadata.
+        grid_side = int(round(np.sqrt(n_cells)))
+        # Observations are flattened in row-major order; the environment uses
+        # rectangular grids, so infer the shape from the cost table is not
+        # possible.  The caller attaches shape through _shape_hint.
+        h, w = getattr(obs, "_shape_hint", (grid_side, grid_side))
+        f_grid = f.reshape(h, w, layout.n_cell_features)
+        global_vec = obs.global_features
+        x_grid = np.concatenate(
             [
-                obs.cell_features,
-                np.broadcast_to(obs.global_features, (obs.cell_features.shape[0], obs.global_features.size)),
+                f_grid,
+                np.broadcast_to(global_vec, (h, w, global_vec.size)),
             ],
-            axis=1,
+            axis=-1,
         )
-        h1 = np.maximum(x @ self.W1 + self.b1, 0.0)
+
+        neighbours = self._neighbour_stack(f_grid)
+        q = f_grid @ self.Wq + self.b_att
+        keys = neighbours @ self.Wk
+        values = neighbours @ self.Wv
+        att_logits = np.einsum("hwka,hwa->hwk", keys, q) / np.sqrt(
+            max(1, layout.attention_dim)
+        )
+        valid = self._neighbour_validity(h, w)
+        att_logits = np.where(valid, att_logits, -1e9)
+        att_logits -= att_logits.max(axis=2, keepdims=True)
+        att = np.exp(att_logits)
+        att /= np.maximum(1e-9, att.sum(axis=2, keepdims=True))
+        context = np.einsum("hwk,hwka->hwa", att, values)
+
+        # District encoder.
+        labels = getattr(obs, "_district_labels")
+        n_districts = int(getattr(obs, "_n_districts"))
+        labels_flat = labels.ravel()
+        counts = np.bincount(labels_flat, minlength=n_districts).astype(np.float64)
+        district_sum = np.zeros(
+            (n_districts, layout.n_cell_features + layout.n_global_features),
+            dtype=np.float64,
+        )
+        np.add.at(district_sum, labels_flat, x_grid.reshape(n_cells, -1))
+        district_input = district_sum / np.maximum(1.0, counts)[:, None]
+        district_hidden = np.maximum(
+            district_input @ self.Wd + self.bd, 0.0
+        )
+        district_logits = district_hidden @ self.Wd_type + self.bd_type
+        district_choice = np.argmax(district_logits, axis=1)
+        one_hot = np.eye(layout.n_district_types)[district_choice]
+        district_onehot_cells = one_hot[labels_flat].reshape(
+            h, w, layout.n_district_types
+        )
+        district_type_cells = district_choice[labels_flat].reshape(h, w)
+        district_logits_cells = district_logits[labels_flat].reshape(
+            h, w, layout.n_district_types
+        )
+
+        # Global summary.
+        summary = np.concatenate(
+            [f_grid.mean(axis=(0, 1)), f_grid.max(axis=(0, 1)), global_vec]
+        )
+        global_embedding = np.maximum(summary @ self.Wg + self.bg, 0.0)
+        global_cells = np.broadcast_to(
+            global_embedding, (h, w, layout.global_hidden)
+        )
+
+        cell_input = np.concatenate(
+            [f_grid, context, global_cells, district_onehot_cells], axis=-1
+        ).reshape(n_cells, layout.cell_mlp_input)
+        h1 = np.maximum(cell_input @ self.W1 + self.b1, 0.0)
         h2 = np.maximum(h1 @ self.W2 + self.b2, 0.0)
         scores = h2 @ self.w3 + float(self.b3[0])
-        return scores, h2
+        type_logits = (h2 @ self.W_type + self.b_type).reshape(
+            h, w, layout.n_types
+        )
+        quality_logits = (h2 @ self.W_quality + self.b_quality).reshape(
+            h, w, layout.n_qualities
+        )
+        bid_fraction = 1.0 / (
+            1.0 + np.exp(-(h2 @ self.w_bid + float(self.b_bid[0])))
+        )
+        return {
+            "scores": scores,
+            "type_logits": type_logits,
+            "quality_logits": quality_logits,
+            "bid_fraction": bid_fraction.reshape(h, w),
+            "district_type": district_type_cells,
+            "district_logits": district_logits_cells,
+            "h2": h2,
+            "shape": np.array([h, w], dtype=np.int64),
+        }
+
+    # -- action selection --------------------------------------------------
+
+    def _joint_logits(
+        self,
+        forward: dict[str, np.ndarray],
+        cell: int,
+        action_mask: np.ndarray,
+    ) -> np.ndarray:
+        h, w = (int(x) for x in forward["shape"])
+        row, col = divmod(int(cell), w)
+        type_logits = forward["type_logits"][row, col]
+        quality_logits = forward["quality_logits"][row, col]
+        joint = type_logits[:, None] + quality_logits[None, :]
+        district_type = int(forward["district_type"][row, col])
+        allowed = DISTRICT_ALLOWED[district_type]
+        for action_type in allowed:
+            joint[action_type, :] += 0.40
+        mask = action_mask[cell]
+        joint = joint.copy()
+        joint[~mask] = -np.inf
+        return joint
+
+    def _action_at(
+        self,
+        obs: "Observation",
+        forward: dict[str, np.ndarray],
+        cell: int,
+        priority: int = 0,
+    ) -> Action | None:
+        joint = self._joint_logits(forward, cell, obs.action_mask)
+        if not np.isfinite(joint).any():
+            return None
+        flat = int(np.argmax(joint))
+        type_id, quality = divmod(flat, self.layout.n_qualities)
+        cost = float(obs.cost_table[cell, type_id, quality])
+        h, w = (int(x) for x in forward["shape"])
+        row, col = divmod(int(cell), w)
+        budget = max(0.0, float(obs.budget))
+        bid_cap = max(0.0, min(BID_MAX * budget, budget / 10.0))
+        bid = float(np.clip(forward["bid_fraction"][row, col] * budget, BID_MIN, bid_cap))
+        return Action(
+            cell=int(cell),
+            type_id=int(type_id),
+            quality=int(quality),
+            cost=cost,
+            bid=bid,
+            priority=int(priority),
+        )
 
     def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
+        del rng
         obs = env.observe(agent_id)
         if not obs.valid_cells.any():
             return Action.pass_action()
-
-        scores, hidden = self._scores(obs)
-        scores = scores.copy()
+        forward = self._forward(obs)
+        scores = forward["scores"].copy()
         scores[~obs.valid_cells] = -np.inf
-        best_cell = int(np.argmax(scores))
+        cell = int(np.argmax(scores))
+        action = self._action_at(obs, forward, cell)
+        return action if action is not None else Action.pass_action()
 
-        embedding = hidden[best_cell]
-        type_logits = embedding @ self.W_type + self.b_type
-        quality_logits = embedding @ self.W_quality + self.b_quality
-        joint = type_logits[:, None] + quality_logits[None, :]
-        mask = obs.action_mask[best_cell]
-        if not mask.any():
-            return Action.pass_action()
-        joint = joint.copy()
-        joint[~mask] = -np.inf
-        flat = int(np.argmax(joint))
-        type_id, quality = divmod(flat, self.layout.n_qualities)
-        cost = float(obs.cost_table[best_cell, type_id, quality])
-        return Action(cell=best_cell, type_id=type_id, quality=quality, cost=cost)
+    def propose_bids(
+        self,
+        env: "CityEnvironment",
+        agent_id: int,
+        rng: np.random.Generator,
+        count: int,
+        exclude_cells: set[int] | None = None,
+    ) -> list[Action]:
+        del rng
+        obs = env.observe(agent_id)
+        if not obs.valid_cells.any():
+            return []
+        forward = self._forward(obs)
+        scores = forward["scores"].copy()
+        scores[~obs.valid_cells] = -np.inf
+        if exclude_cells:
+            for cell in exclude_cells:
+                if 0 <= int(cell) < scores.size:
+                    scores[int(cell)] = -np.inf
+        # Rank cells by cell score plus the best conditioned type/quality.
+        h, w = (int(x) for x in forward["shape"])
+        candidates: list[tuple[float, int]] = []
+        for cell in np.argsort(scores)[::-1]:
+            cell = int(cell)
+            if not np.isfinite(scores[cell]):
+                break
+            joint = self._joint_logits(forward, cell, obs.action_mask)
+            if not np.isfinite(joint).any():
+                continue
+            candidates.append((float(scores[cell] + np.max(joint)), cell))
+            if len(candidates) >= count:
+                break
+        actions: list[Action] = []
+        for priority, (_, cell) in enumerate(candidates):
+            action = self._action_at(obs, forward, cell, priority=priority)
+            if action is not None:
+                actions.append(action)
+        return actions
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +510,41 @@ class RandomPolicy:
         cost = float(obs.cost_table[cell, type_id, quality])
         return Action(cell=cell, type_id=type_id, quality=quality, cost=cost)
 
+    def propose_bids(
+        self,
+        env: "CityEnvironment",
+        agent_id: int,
+        rng: np.random.Generator,
+        count: int,
+        exclude_cells: set[int] | None = None,
+    ) -> list[Action]:
+        obs = env.observe(agent_id)
+        valid_cells = [
+            int(c) for c in np.flatnonzero(obs.valid_cells)
+            if not exclude_cells or int(c) not in exclude_cells
+        ]
+        if not valid_cells:
+            return []
+        chosen = rng.choice(
+            valid_cells, size=min(count, len(valid_cells)), replace=False
+        )
+        actions: list[Action] = []
+        for priority, cell in enumerate(int(c) for c in np.atleast_1d(chosen)):
+            combos = np.argwhere(obs.action_mask[cell])
+            if combos.size == 0:
+                continue
+            type_id, quality = (int(x) for x in combos[int(rng.integers(combos.shape[0]))])
+            actions.append(
+                Action(
+                    cell=cell,
+                    type_id=type_id,
+                    quality=quality,
+                    cost=float(obs.cost_table[cell, type_id, quality]),
+                    priority=priority,
+                )
+            )
+        return actions
+
 
 # ---------------------------------------------------------------------------
 # Greedy baseline
@@ -224,6 +555,7 @@ class GreedyPolicy:
     name = "greedy"
 
     def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
+        del rng
         obs = env.observe(agent_id)
         if not obs.valid_cells.any() or obs.remaining_rounds <= 0:
             return Action.pass_action()
@@ -238,6 +570,49 @@ class GreedyPolicy:
         cost = float(obs.cost_table[cell, type_id, quality])
         return Action(cell=cell, type_id=type_id, quality=quality, cost=cost)
 
+    def propose_bids(
+        self,
+        env: "CityEnvironment",
+        agent_id: int,
+        rng: np.random.Generator,
+        count: int,
+        exclude_cells: set[int] | None = None,
+    ) -> list[Action]:
+        del rng
+        obs = env.observe(agent_id)
+        if not obs.valid_cells.any():
+            return []
+        income = env.projected_income_table(agent_id)
+        value = income * float(max(1, obs.remaining_rounds)) - obs.cost_table
+        value[~obs.action_mask] = -np.inf
+        order = np.argsort(value, axis=None)[::-1]
+        actions: list[Action] = []
+        used: set[int] = set(exclude_cells or set())
+        for flat in order:
+            if not np.isfinite(value.ravel()[flat]) or value.ravel()[flat] <= 0.0:
+                break
+            cell, type_id, quality = np.unravel_index(int(flat), value.shape)
+            cell, type_id, quality = int(cell), int(type_id), int(quality)
+            if cell in used:
+                continue
+            used.add(cell)
+            cost = float(obs.cost_table[cell, type_id, quality])
+            actions.append(
+                Action(
+                    cell=cell,
+                    type_id=type_id,
+                    quality=quality,
+                    cost=cost,
+                    bid=strategic_bid(
+                        float(value[cell, type_id, quality]), cost, obs.budget
+                    ),
+                    priority=len(actions),
+                )
+            )
+            if len(actions) >= count:
+                break
+        return actions
+
 
 # ---------------------------------------------------------------------------
 # Hand-designed parametric baseline (10 parameters)
@@ -245,16 +620,16 @@ class GreedyPolicy:
 
 
 MANUAL_PARAMETER_NAMES = (
-    "centre",       # 1 prefers high accessibility
-    "cheap",        # 2 prefers low land price
-    "road",         # 3 road access
-    "water",        # 4 water proximity
-    "soil",         # 5 soil quality
-    "green",        # 6 green preference
-    "housing",      # 7 housing preference
-    "commercial",   # 8 commercial preference
-    "industry",     # 9 industry preference
-    "quality",      # 10 quality level in [0, 1] -> low/medium/high
+    "centre",
+    "cheap",
+    "road",
+    "water",
+    "soil",
+    "green",
+    "housing",
+    "commercial",
+    "industry",
+    "quality",
 )
 
 
@@ -262,16 +637,16 @@ def default_manual_genome() -> np.ndarray:
     # Hand-tuned plausible developer; deliberately not optimised.
     return np.array(
         [
-            0.80,   # centre
-            0.25,   # cheap
-            0.60,   # road
-            0.15,   # water
-            0.30,   # soil
-            0.05,   # green
-            0.55,   # housing
-            0.45,   # commercial
-            -0.35,  # industry
-            0.60,   # quality
+            0.80,
+            0.25,
+            0.60,
+            0.15,
+            0.30,
+            0.05,
+            0.55,
+            0.45,
+            -0.35,
+            0.60,
         ],
         dtype=np.float64,
     )
@@ -299,11 +674,8 @@ class ManualPolicy:
         if self.params.shape != (10,):
             raise ValueError("manual genome must have exactly 10 parameters")
 
-    def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
+    def _score_table(self, env: "CityEnvironment", agent_id: int):
         obs = env.observe(agent_id)
-        if not obs.valid_cells.any():
-            return Action.pass_action()
-
         p = self.params
         f = obs.cell_features.reshape(env.h, env.w, -1)
         utility = (
@@ -314,6 +686,9 @@ class ManualPolicy:
             + p[4] * f[..., 1]
             - 0.35 * f[..., 5]
             + 0.20 * f[..., 9]
+            + 0.15 * f[..., 16]
+            - 0.20 * f[..., 17]
+            - 0.10 * f[..., 18]
         ).ravel()
 
         housing_share = f[..., 6].ravel()
@@ -327,32 +702,32 @@ class ManualPolicy:
         compat[2] = 0.45 * (housing_share + commercial_share) - 0.50 * industry_share + 0.15 * mean_quality
         compat[3] = 0.30 * industry_share - 0.45 * (housing_share + commercial_share)
         compat[4] = 0.25 * density - 0.20 * industry_share
-        for t in range(5):
-            compat[t] = compat[t].ravel()
-
         type_pref = np.array(
-            [
-                p[6],
-                p[7],
-                0.5 * (p[6] + p[7]),
-                p[8],
-                p[5],
-            ],
+            [p[6], p[7], 0.5 * (p[6] + p[7]), p[8], p[5]],
             dtype=np.float64,
         )
         base_scores = utility[None, :] + type_pref[:, None] + compat
+        income = env.projected_income_table(agent_id)
+        economic_value = income * float(max(1, obs.remaining_rounds)) - obs.cost_table
+        return obs, base_scores, economic_value
 
+    def _quality_order(self) -> list[int]:
         preferred_quality = int(
-            np.clip(np.round(np.clip(p[9], 0.0, 1.0) * 2.0), 0, 2)
+            np.clip(np.round(np.clip(self.params[9], 0.0, 1.0) * 2.0), 0, 2)
         )
         qualities = [preferred_quality]
         qualities += [q for q in (2, 1, 0) if q != preferred_quality]
+        return qualities
+
+    def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
+        del rng
+        obs, base_scores, economic_value = self._score_table(env, agent_id)
+        if not obs.valid_cells.any():
+            return Action.pass_action()
         max_cells = env.n_cells
-        income = env.projected_income_table(agent_id)
-        economic_value = income * float(obs.remaining_rounds) - obs.cost_table
-        for quality in qualities:
+        for quality in self._quality_order():
             mask = obs.action_mask[:, :, quality].T  # (5, cells)
-            mask &= economic_value[:, :, quality].T > 0.0
+            mask = mask & (economic_value[:, :, quality].T > 0.0)
             if not mask.any():
                 continue
             scores = base_scores.copy()
@@ -362,6 +737,55 @@ class ManualPolicy:
             cost = float(obs.cost_table[cell, type_id, quality])
             return Action(cell=cell, type_id=type_id, quality=quality, cost=cost)
         return Action.pass_action()
+
+    def propose_bids(
+        self,
+        env: "CityEnvironment",
+        agent_id: int,
+        rng: np.random.Generator,
+        count: int,
+        exclude_cells: set[int] | None = None,
+    ) -> list[Action]:
+        del rng
+        obs, base_scores, economic_value = self._score_table(env, agent_id)
+        if not obs.valid_cells.any():
+            return []
+        max_cells = env.n_cells
+        actions: list[Action] = []
+        used: set[int] = set(exclude_cells or set())
+        for quality in self._quality_order():
+            if len(actions) >= count:
+                break
+            mask = obs.action_mask[:, :, quality].T
+            mask = mask & (economic_value[:, :, quality].T > 0.0)
+            for cell in used:
+                if 0 <= cell < max_cells:
+                    mask[:, cell] = False
+            while mask.any() and len(actions) < count:
+                scores = base_scores.copy()
+                scores[~mask] = -np.inf
+                flat = int(np.argmax(scores))
+                type_id, cell = divmod(flat, max_cells)
+                cell = int(cell)
+                type_id = int(type_id)
+                used.add(cell)
+                cost = float(obs.cost_table[cell, type_id, quality])
+                actions.append(
+                    Action(
+                        cell=cell,
+                        type_id=type_id,
+                        quality=quality,
+                        cost=cost,
+                        bid=strategic_bid(
+                            float(economic_value[cell, type_id, quality]),
+                            cost,
+                            obs.budget,
+                        ),
+                        priority=len(actions),
+                    )
+                )
+                mask[:, cell] = False
+        return actions
 
 
 def homogeneous_policies(

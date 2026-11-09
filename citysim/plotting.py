@@ -50,14 +50,47 @@ def plot_city(env: CityEnvironment, path: str | Path, title: str = "City") -> Pa
     return path
 
 
+def plot_compare_grids(
+    env_a: CityEnvironment,
+    env_b: CityEnvironment,
+    path: str | Path,
+    label_a: str = "A",
+    label_b: str = "B",
+) -> Path:
+    path = Path(path)
+    ensure_dir(path.parent)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    cmap = matplotlib.colors.ListedColormap(TYPE_COLORS)
+    for ax, env, label in ((axes[0], env_a, label_a), (axes[1], env_b, label_b)):
+        ax.imshow(env.type_grid, cmap=cmap, vmin=-0.5, vmax=5.5)
+        ax.set_title(label)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
 def _history_arrays(histories: Sequence[Sequence[dict]], key: str):
     max_len = max(len(h) for h in histories)
     values = np.full((len(histories), max_len), np.nan, dtype=np.float64)
     gens = np.arange(max_len)
     for i, hist in enumerate(histories):
         for row in hist:
-            values[i, int(row["gen"])] = float(row[key])
+            if key in row:
+                values[i, int(row["gen"])] = float(row[key])
     return gens, values
+
+
+def _mean_ci(values: np.ndarray):
+    mean = np.nanmean(values, axis=0)
+    if values.shape[0] > 1:
+        std = np.nanstd(values, axis=0, ddof=1)
+        ci = 1.96 * std / np.sqrt(values.shape[0])
+    else:
+        ci = np.zeros_like(mean)
+    return mean, ci
 
 
 def plot_learning_curve(
@@ -74,9 +107,7 @@ def plot_learning_curve(
         ("mean", "mean fitness", "#2ca02c"),
     ]:
         gens, values = _history_arrays(histories, key)
-        mean = np.nanmean(values, axis=0)
-        std = np.nanstd(values, axis=0, ddof=1) if len(histories) > 1 else np.zeros_like(mean)
-        ci = 1.96 * std / np.sqrt(max(1, len(histories)))
+        mean, ci = _mean_ci(values)
         axes[0].plot(gens, mean, label=label, color=color)
         axes[0].fill_between(gens, mean - ci, mean + ci, color=color, alpha=0.16)
     axes[0].set_xlabel("generation")
@@ -86,15 +117,73 @@ def plot_learning_curve(
     axes[0].grid(alpha=0.25)
 
     gens, values = _history_arrays(histories, "diversity")
-    mean = np.nanmean(values, axis=0)
-    std = np.nanstd(values, axis=0, ddof=1) if len(histories) > 1 else np.zeros_like(mean)
-    ci = 1.96 * std / np.sqrt(max(1, len(histories)))
+    mean, ci = _mean_ci(values)
     axes[1].plot(gens, mean, color="#d62728")
     axes[1].fill_between(gens, mean - ci, mean + ci, color="#d62728", alpha=0.16)
     axes[1].set_xlabel("generation")
     axes[1].set_ylabel("mean pairwise behaviour distance")
     axes[1].set_title("Behavioural diversity")
     axes[1].grid(alpha=0.25)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def plot_satisfaction_curve(
+    histories: Sequence[Sequence[dict]],
+    path: str | Path,
+    title: str = "Citizen satisfaction",
+) -> Path:
+    path = Path(path)
+    ensure_dir(path.parent)
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    candidates = [
+        (("mean_satisfaction", "eval_satisfaction"), "mean", "#2ca02c"),
+        (("rich_satisfaction", "eval_rich_satisfaction"), "rich", "#1f77b4"),
+        (("poor_satisfaction", "eval_poor_satisfaction"), "poor", "#d62728"),
+    ]
+    plotted = False
+    for keys, label, color in candidates:
+        gens, values = _history_arrays(histories, keys[0])
+        if np.all(np.isnan(values)):
+            gens, values = _history_arrays(histories, keys[1])
+        if np.all(np.isnan(values)):
+            continue
+        mean, ci = _mean_ci(values)
+        ax.plot(gens, mean, label=label, color=color)
+        ax.fill_between(gens, mean - ci, mean + ci, color=color, alpha=0.14)
+        plotted = True
+    ax.set_xlabel("generation / round")
+    ax.set_ylabel("satisfaction")
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    if plotted:
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def plot_history_panels(history: Sequence[dict], path: str | Path, title: str = "City history") -> Path:
+    path = Path(path)
+    ensure_dir(path.parent)
+    rounds = [int(row["round"]) + 1 for row in history]
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+    panels = [
+        ("city_quality", "city quality", "#4c78a8"),
+        ("mean_satisfaction", "mean satisfaction", "#54a24b"),
+        ("mean_utilization", "mean utilisation", "#f58518"),
+        ("damage_total", "cumulative externality damage", "#b6423c"),
+    ]
+    for ax, (key, label, color) in zip(axes.ravel(), panels):
+        values = [float(row.get(key, 0.0)) for row in history]
+        ax.plot(rounds, values, marker="o", color=color)
+        ax.set_xlabel("round")
+        ax.set_ylabel(label)
+        ax.grid(alpha=0.25)
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -179,6 +268,53 @@ def plot_profit_quality(
     ax.set_title(title)
     ax.grid(alpha=0.25)
     ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def plot_profit_satisfaction(
+    rows: Sequence[dict], path: str | Path, title: str = "Profit vs satisfaction"
+) -> Path:
+    path = Path(path)
+    ensure_dir(path.parent)
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for row in rows:
+        ax.scatter(row["profit_mean"], row["mean_satisfaction_mean"], s=80)
+        ax.annotate(
+            row["condition"],
+            (row["profit_mean"], row["mean_satisfaction_mean"]),
+            textcoords="offset points",
+            xytext=(6, 4),
+            fontsize=8,
+        )
+    ax.set_xlabel("mean profit per agent")
+    ax.set_ylabel("mean citizen satisfaction")
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def plot_distribution_matrix(
+    matrix: np.ndarray,
+    labels: Sequence[str],
+    path: str | Path,
+    title: str = "Path dependence",
+) -> Path:
+    path = Path(path)
+    ensure_dir(path.parent)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(np.asarray(matrix), cmap="viridis", vmin=0.0, vmax=1.0)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
+    fig.colorbar(im, ax=ax, label="type share")
+    ax.set_title(title)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)

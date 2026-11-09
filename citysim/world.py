@@ -11,36 +11,69 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .citizens import CitizenPool
 from .config import (
     ACTION_TYPE_NAMES,
+    BANKRUPTCY_STREAK,
+    BANKRUPTCY_THRESHOLD,
     BUILD_COST,
-    FEATURE_NAMES,
-    GLOBAL_FEATURE_NAMES,
+    CITIZEN_GOODS_DEMAND,
+    COMMERCIAL_CUSTOMERS,
+    COMMERCIAL_GOODS_DEMAND,
+    COMMERCIAL_JOBS,
+    DISTRICT_SIZE,
     GREEN_TARGET,
+    HOUSING_CAPACITY,
+    INDUSTRY_GOODS_SUPPLY,
+    INDUSTRY_JOBS,
     INCOME_BASE,
+    LAND_VALUE_MAX,
+    LAND_VALUE_MIN,
     MAINTENANCE_RATE,
     MAX_DEMAND,
     MAX_PRICE,
+    MIXED_CAPACITY,
+    MIXED_JOBS,
     N_CELL_FEATURES,
+    N_CITIZENS,
     N_GLOBAL_FEATURES,
+    NOISE_RADIUS,
     OPTIMAL_DISTANCE,
+    POLLUTION_RADIUS,
+    POPULATION_INERTIA,
     QUALITY_COST_MULT,
     QUALITY_INCOME_MULT,
-    QUALITY_NAMES,
+    SATURATION_ALPHA,
+    SATURATION_RADIUS,
     TYPE_NAMES,
     CityConfig,
 )
-from .grid import box_sum, distance_to_mask, incompatible_edges, make_static_layers, type_entropy
+from .grid import (
+    box_mean,
+    box_sum,
+    distance_to_mask,
+    district_ids,
+    incompatible_edges,
+    make_static_layers,
+    type_entropy,
+)
 
 
 @dataclass(frozen=True)
 class Action:
-    """A build action.  ``type_id`` is a policy index 0..4 (not a world id)."""
+    """A build or demolition action.
+
+    ``type_id`` is a policy index 0..4 (not a world id).  ``bid`` is the
+    auction payment for the plot, and ``demolish`` selects demolition mode.
+    """
 
     cell: int | None
     type_id: int = 0
     quality: int = 0
     cost: float = 0.0
+    bid: float = 0.0
+    demolish: bool = False
+    priority: int = 0
 
     @property
     def is_pass(self) -> bool:
@@ -61,6 +94,8 @@ class ActionRecord:
     cost: float
     damage: float
     accepted: bool
+    bid: float = 0.0
+    demolish: bool = False
 
 
 @dataclass
@@ -71,10 +106,16 @@ class AgentState:
     revenue: float = 0.0
     spend: float = 0.0
     maintenance: float = 0.0
+    tax_paid: float = 0.0
+    subsidy_received: float = 0.0
+    bid_paid: float = 0.0
+    refund_received: float = 0.0
     damage_caused: float = 0.0
     damage_suffered: float = 0.0
     build_count: int = 0
     skip_count: int = 0
+    bankrupt_streak: int = 0
+    bankrupt: bool = False
 
     def __post_init__(self) -> None:
         self.budget = float(self.initial_budget)
@@ -94,6 +135,7 @@ class Observation:
     cost_table: np.ndarray         # (n_cells, 5, 3)
     remaining_rounds: int
     budget: float
+    demolish_mask: np.ndarray | None = None  # (n_cells,) bool
 
 
 @dataclass
@@ -116,6 +158,13 @@ class AgentMetrics:
     high_quality_fraction: float
     type_entropy: float
     behavior: np.ndarray
+    tax_paid: float = 0.0
+    subsidy_received: float = 0.0
+    bid_paid: float = 0.0
+    refund_received: float = 0.0
+    bankrupt: bool = False
+    affordable_share: float = 0.0
+    green_share: float = 0.0
 
 
 @dataclass
@@ -134,6 +183,23 @@ class CityMetrics:
     gini_profit: float
     built_cells: int
     type_counts: dict[int, int]
+    population: float = 0.0
+    jobs: float = 0.0
+    goods_supply: float = 0.0
+    goods_demand: float = 0.0
+    goods_balance: float = 0.0
+    mean_utilization: float = 0.0
+    land_value_mean: float = 0.0
+    pollution_mean: float = 0.0
+    noise_mean: float = 0.0
+    mean_satisfaction: float = 0.0
+    gini_satisfaction: float = 0.0
+    rich_satisfaction: float = 0.0
+    poor_satisfaction: float = 0.0
+    tax_revenue: float = 0.0
+    subsidy_total: float = 0.0
+    bankrupt_agents: int = 0
+    affordable_share: float = 0.0
 
 
 class CityEnvironment:
@@ -151,6 +217,10 @@ class CityEnvironment:
         self.xx = xx.astype(np.float64)
         self.static = make_static_layers(self.rng, self.h, self.w)
         self.buildable = self.static["buildable"].astype(bool)
+        self.district_labels, self.n_districts = district_ids(
+            self.h, self.w, DISTRICT_SIZE
+        )
+        self.district_labels_flat = self.district_labels.ravel()
 
         self.type_grid = np.zeros((self.h, self.w), dtype=np.int8)
         self.quality_grid = np.full((self.h, self.w), -1, dtype=np.int8)
@@ -164,6 +234,28 @@ class CityEnvironment:
         self.round = 0
         self.actions: list[ActionRecord] = []
         self.history: list[dict] = []
+        self.shock_events: list[dict] = []
+
+        self.base_population = float(N_CITIZENS)
+        self.population_extra = 0.0
+        self.population = 0.0
+        self.jobs = 0.0
+        self.goods_supply = 0.0
+        self.goods_demand = 0.0
+        self.goods_balance = 0.0
+        self.utilization: dict[int, float] = {t: 0.0 for t in range(1, 6)}
+        self.util_grid = np.zeros((self.h, self.w), dtype=np.float64)
+        self.mean_utilization = 0.0
+        self.district_util = np.zeros((self.h, self.w), dtype=np.float64)
+        self.district_type = np.zeros((self.h, self.w), dtype=np.float64)
+        self.land_value = np.zeros((self.h, self.w), dtype=np.float64)
+        self.pollution = np.zeros((self.h, self.w), dtype=np.float64)
+        self.noise = np.zeros((self.h, self.w), dtype=np.float64)
+        self.attractiveness = np.zeros((self.h, self.w), dtype=np.float64)
+        self.local_saturation = np.zeros((self.h, self.w), dtype=np.float64)
+        self.local_same: dict[int, np.ndarray] = {
+            t: np.zeros((self.h, self.w), dtype=np.float64) for t in range(1, 6)
+        }
 
         ones = np.ones((self.h, self.w), dtype=np.float64)
         self._window_n1 = box_sum(ones, 1)
@@ -173,16 +265,9 @@ class CityEnvironment:
 
         self._industry_count = -1
         self.dist_to_industry = np.ones((self.h, self.w), dtype=np.float64)
-        self._refresh_layers()
-        
-        self._static_features = np.empty((self.h, self.w, N_CELL_FEATURES), dtype=np.float64)
-        self._static_features[..., 0] = 0.0  # price (динамический, заполним позже)
-        self._static_features[..., 1] = self.static["soil"]
-        self._static_features[..., 2] = self.static["water"]
-        self._static_features[..., 3] = self.static["road"]
-        self._static_features[..., 4] = self.static["dist_center"]
-        self._static_features[..., 12] = self.buildable.astype(np.float64)
-        self._cached_income = self._income_grid()
+        self._cluster_labels: dict[int, np.ndarray] = {}
+        self.citizens = CitizenPool(seed=self.seed + 7919)
+        self._refresh_layers(advance_population=False)
 
     # ------------------------------------------------------------------
     # Observation and cost tables
@@ -190,7 +275,7 @@ class CityEnvironment:
 
     def cost_table(self) -> np.ndarray:
         """Build costs for every (cell, action type, quality)."""
-        land_mult = (0.7 + 0.8 * self.price).ravel()
+        land_mult = (0.4 + 1.6 * self.land_value).ravel()
         soil_mult = (0.9 + 0.2 * self.static["soil"]).ravel()
         cell_mult = (land_mult * soil_mult)[:, None, None]
         return (
@@ -201,12 +286,12 @@ class CityEnvironment:
 
     def cost_of(self, cell: int, type_id: int, quality: int) -> float:
         c = int(np.clip(cell, 0, self.n_cells - 1))
-        price = float(self.price.ravel()[c])
+        land = float(self.land_value.ravel()[c])
         soil = float(self.static["soil"].ravel()[c])
         return float(
             BUILD_COST[type_id + 1]
             * QUALITY_COST_MULT[quality]
-            * (0.7 + 0.8 * price)
+            * (0.4 + 1.6 * land)
             * (0.9 + 0.2 * soil)
         )
 
@@ -221,8 +306,12 @@ class CityEnvironment:
             (self._built_count_r2 - own_count) / self._neighbor_n2, 0.0, 1.0
         )
 
-        f = self._static_features.copy()
+        f = np.empty((self.h, self.w, N_CELL_FEATURES), dtype=np.float64)
         f[..., 0] = np.clip(self.price / MAX_PRICE, 0.0, 1.0)
+        f[..., 1] = self.static["soil"]
+        f[..., 2] = self.static["water"]
+        f[..., 3] = self.static["road"]
+        f[..., 4] = self.static["dist_center"]
         f[..., 5] = self.density
         f[..., 6] = self.share_housing
         f[..., 7] = self.share_commercial
@@ -234,12 +323,24 @@ class CityEnvironment:
         f[..., 13] = free.astype(np.float64)
         f[..., 14] = competition
         f[..., 15] = self.dist_to_industry
+        f[..., 16] = self.land_value
+        f[..., 17] = self.pollution
+        f[..., 18] = self.noise
+        f[..., 19] = self.attractiveness
+        f[..., 20] = self.local_saturation
+        f[..., 21] = self.district_type / 5.0
+        f[..., 22] = self.district_util
 
         if not self.config.enable_externalities:
             # Ablation: the policy does not see any neighbour-dependent signal.
             f[..., 5:12] = 0.0
             f[..., 14] = 0.0
             f[..., 15] = 0.0
+            f[..., 17] = 0.0
+            f[..., 18] = 0.0
+            f[..., 19] = 0.0
+            f[..., 20] = 0.0
+            f[..., 22] = 0.0
 
         costs = self.cost_table()
         affordable = costs <= agent.budget + 1e-9
@@ -266,10 +367,16 @@ class CityEnvironment:
             & affordable
             & planning[:, :, None]
         )
+        if agent.bankrupt:
+            action_mask[:] = False
         valid = action_mask.any(axis=(1, 2))
+        demolish_mask = (self.owner_grid == agent_id) & (self.type_grid > 0)
+        if agent.bankrupt:
+            demolish_mask[:] = False
 
         built_fraction = float(built.mean())
         mean_price = float(np.clip(self.price.mean() / MAX_PRICE, 0.0, 1.0))
+        util_values = [self.utilization[t] for t in range(1, 6) if self.utilization[t] > 0]
         globals_ = np.array(
             [
                 np.clip(agent.budget / self.config.initial_budget, 0.0, 3.0),
@@ -278,10 +385,14 @@ class CityEnvironment:
                 built_fraction,
                 mean_price,
                 np.clip(self.config.n_agents / 15.0, 0.0, 1.0),
+                np.clip(self.population / self.base_population, 0.0, 1.5),
+                np.clip(self.jobs / max(1.0, self.population), 0.0, 2.0) / 2.0,
+                np.clip(self.goods_balance, -1.0, 1.0),
+                float(np.mean(util_values)) if util_values else 0.0,
             ],
             dtype=np.float64,
         )
-        return Observation(
+        obs = Observation(
             agent_id=agent_id,
             cell_features=f.reshape(self.n_cells, N_CELL_FEATURES),
             global_features=globals_,
@@ -290,7 +401,13 @@ class CityEnvironment:
             cost_table=costs,
             remaining_rounds=max(0, self.config.actions_per_agent - self.round),
             budget=float(agent.budget),
+            demolish_mask=demolish_mask.ravel(),
         )
+        # Private shape metadata used by the neural policy's grid convolutions.
+        obs._shape_hint = (self.h, self.w)  # type: ignore[attr-defined]
+        obs._district_labels = self.district_labels  # type: ignore[attr-defined]
+        obs._n_districts = self.n_districts  # type: ignore[attr-defined]
+        return obs
 
     # ------------------------------------------------------------------
     # Action application
@@ -298,6 +415,9 @@ class CityEnvironment:
 
     def apply_action(self, agent_id: int, action: Action) -> bool:
         agent = self.agents[agent_id]
+        if agent.bankrupt:
+            self._record_pass(agent_id)
+            return False
 
         if action.cell is None:
             self._record_pass(agent_id)
@@ -308,6 +428,35 @@ class CityEnvironment:
             self._record_pass(agent_id)
             return False
         row, col = divmod(cell, self.w)
+
+        if action.demolish:
+            if self.owner_grid[row, col] != agent_id or self.type_grid[row, col] == 0:
+                self._record_pass(agent_id)
+                return False
+            refund = 0.5 * float(self.cost_grid[row, col])
+            self.type_grid[row, col] = 0
+            self.quality_grid[row, col] = -1
+            self.owner_grid[row, col] = -1
+            self.cost_grid[row, col] = 0.0
+            agent.budget += refund
+            agent.refund_received += refund
+            self._refresh_layers(advance_population=False)
+            self.actions.append(
+                ActionRecord(
+                    round=self.round,
+                    agent_id=agent_id,
+                    cell=cell,
+                    type_id=-1,
+                    quality=-1,
+                    cost=0.0,
+                    damage=0.0,
+                    accepted=True,
+                    bid=0.0,
+                    demolish=True,
+                )
+            )
+            return True
+
         if self.type_grid[row, col] != 0 or not self.buildable[row, col]:
             self._record_pass(agent_id)
             return False
@@ -319,24 +468,25 @@ class CityEnvironment:
             return False
 
         cost = self.cost_of(cell, action.type_id, action.quality)
-        if cost > agent.budget + 1e-9:
+        bid = max(0.0, float(action.bid))
+        if cost + bid > agent.budget + 1e-9:
             self._record_pass(agent_id)
             return False
 
-        pre_income = self._cached_income
+        pre_income = self._income_grid()
         pre_built = self.type_grid > 0
 
         self.type_grid[row, col] = action.type_id + 1
         self.quality_grid[row, col] = action.quality
         self.owner_grid[row, col] = agent_id
         self.cost_grid[row, col] = cost
-        agent.budget = max(0.0, agent.budget - cost)
+        agent.budget -= cost + bid
         agent.spend += cost
+        agent.bid_paid += bid
         agent.build_count += 1
 
-        self._refresh_layers()
+        self._refresh_layers(advance_population=False)
         post_income = self._income_grid()
-        self._cached_income = post_income
         loss = np.maximum(0.0, pre_income - post_income)
         loss[~pre_built] = 0.0
         total_damage = float(loss.sum())
@@ -360,6 +510,7 @@ class CityEnvironment:
                 cost=cost,
                 damage=total_damage,
                 accepted=True,
+                bid=bid,
             )
         )
         return True
@@ -402,17 +553,30 @@ class CityEnvironment:
     # ------------------------------------------------------------------
 
     def end_round(self) -> None:
+        self._refresh_layers(advance_population=True)
         incomes = self._income_grid()
         maintenance = MAINTENANCE_RATE * self.cost_grid
+        regulation = self.config.regulation
         for agent in self.agents:
             mask = self.owner_grid == agent.agent_id
             if not mask.any():
                 continue
             revenue = float(incomes[mask].sum())
             maint = float(maintenance[mask].sum())
+            property_tax = float(regulation.property_tax_rate * self.cost_grid[mask].sum())
+            industry_tax = float(
+                regulation.industry_tax_rate
+                * incomes[mask & (self.type_grid == 4)].sum()
+            )
+            green_count = int(np.sum(mask & (self.type_grid == 5)))
+            subsidy = float(regulation.green_subsidy * green_count)
             agent.revenue += revenue
             agent.maintenance += maint
-            agent.budget = max(0.0, agent.budget + revenue - maint)
+            agent.tax_paid += property_tax + industry_tax
+            agent.subsidy_received += subsidy
+            agent.budget += revenue - maint - property_tax - industry_tax + subsidy
+
+        self._process_bankruptcies()
 
         if self.record_history:
             city = self.city_metrics()
@@ -425,22 +589,53 @@ class CityEnvironment:
                     "mean_load": city.mean_load,
                     "city_quality": city.city_quality,
                     "damage_total": city.externality_damage_total,
+                    "population": city.population,
+                    "jobs": city.jobs,
+                    "goods_balance": city.goods_balance,
+                    "mean_utilization": city.mean_utilization,
+                    "mean_satisfaction": city.mean_satisfaction,
+                    "gini_satisfaction": city.gini_satisfaction,
+                    "rich_satisfaction": city.rich_satisfaction,
+                    "poor_satisfaction": city.poor_satisfaction,
+                    "gini_profit": city.gini_profit,
+                    "violations": city.violations_total,
+                    "tax_revenue": city.tax_revenue,
+                    "subsidy_total": city.subsidy_total,
+                    "bankrupt_agents": city.bankrupt_agents,
                 }
             )
         self.round += 1
-        self._cached_income = self._income_grid()
+
+    def _process_bankruptcies(self) -> None:
+        threshold = BANKRUPTCY_THRESHOLD
+        for agent in self.agents:
+            if agent.bankrupt:
+                continue
+            if agent.budget < threshold:
+                agent.bankrupt_streak += 1
+            else:
+                agent.bankrupt_streak = 0
+            if agent.bankrupt_streak >= BANKRUPTCY_STREAK:
+                agent.bankrupt = True
+                mask = self.owner_grid == agent.agent_id
+                self.type_grid[mask] = 0
+                self.quality_grid[mask] = -1
+                self.owner_grid[mask] = -1
+                self.cost_grid[mask] = 0.0
+                agent.budget = 0.0
+                self._refresh_layers(advance_population=False)
 
     # ------------------------------------------------------------------
     # Dynamic layers
     # ------------------------------------------------------------------
 
-    def _refresh_layers(self) -> None:
+    def _refresh_layers(self, advance_population: bool = False) -> None:
         built = (self.type_grid > 0).astype(np.float64)
         built_bool = built > 0.0
 
         self._built_count_r1 = box_sum(built, 1) - built
         self._built_count_r2 = box_sum(built, 2) - built
-        self.density = np.minimum(np.maximum(self._built_count_r1 / self._neighbor_n1, 0.0), 1.0)
+        self.density = np.clip(self._built_count_r1 / self._neighbor_n1, 0.0, 1.0)
 
         counts: dict[int, np.ndarray] = {}
         for world_type in range(1, 6):
@@ -448,11 +643,11 @@ class CityEnvironment:
             counts[world_type] = box_sum(mask, 2) - mask
         self._type_counts_r2 = counts
 
-        self.share_housing = np.minimum(np.maximum(counts[1] / self._neighbor_n2, 0.0), 1.0)
-        self.share_commercial = np.minimum(np.maximum(counts[2] / self._neighbor_n2, 0.0), 1.0)
-        self.share_mixed =  np.minimum(np.maximum(counts[3] / self._neighbor_n2, 0.0), 1.0)
-        self.share_industry =  np.minimum(np.maximum(counts[4] / self._neighbor_n2, 0.0), 1.0)
-        self.share_green =  np.minimum(np.maximum(counts[5] / self._neighbor_n2, 0.0), 1.0)
+        self.share_housing = np.clip(counts[1] / self._neighbor_n2, 0.0, 1.0)
+        self.share_commercial = np.clip(counts[2] / self._neighbor_n2, 0.0, 1.0)
+        self.share_mixed = np.clip(counts[3] / self._neighbor_n2, 0.0, 1.0)
+        self.share_industry = np.clip(counts[4] / self._neighbor_n2, 0.0, 1.0)
+        self.share_green = np.clip(counts[5] / self._neighbor_n2, 0.0, 1.0)
         max_share = np.maximum.reduce(
             [
                 self.share_housing,
@@ -462,12 +657,77 @@ class CityEnvironment:
                 self.share_green,
             ]
         )
-        self.load =  np.minimum(np.maximum(0.5 * self.density + 0.5 * max_share, 0.0), 1.0)
+        self.load = np.clip(0.5 * self.density + 0.5 * max_share, 0.0, 1.0)
 
         quality = np.where(built_bool, self.quality_grid.astype(np.float64), 0.0)
         quality_sum = box_sum(quality, 2) - quality
-        self.mean_quality =  np.minimum(np.maximum(
-            quality_sum / np.maximum(1.0, self._built_count_r2) / 2.0, 0.0), 1.0
+        self.mean_quality = np.clip(
+            quality_sum / np.maximum(1.0, self._built_count_r2) / 2.0, 0.0, 1.0
+        )
+
+        # Local saturation around every cell.
+        for world_type in range(1, 6):
+            mask = (self.type_grid == world_type).astype(np.float64)
+            self.local_same[world_type] = (
+                box_sum(mask, SATURATION_RADIUS) - mask
+            ).astype(np.float64)
+        self.local_saturation = np.clip(
+            box_sum(built, SATURATION_RADIUS) / np.maximum(1.0, box_sum(
+                np.ones((self.h, self.w), dtype=np.float64), SATURATION_RADIUS
+            )),
+            0.0,
+            1.0,
+        )
+
+        industry_mask = (self.type_grid == 4).astype(np.float64)
+        industry_count = int(industry_mask.sum())
+        if industry_count != self._industry_count:
+            self._industry_count = industry_count
+            self.dist_to_industry = distance_to_mask(industry_mask > 0)
+        road_mask = self.static["road_mask"]
+        industry_dist = (
+            distance_to_mask(industry_mask > 0)
+            if industry_count
+            else np.ones((self.h, self.w), dtype=np.float64)
+        )
+        self.pollution = np.clip(
+            0.80 * np.exp(-6.0 * industry_dist)
+            + 0.15 * box_mean(road_mask, POLLUTION_RADIUS),
+            0.0,
+            1.0,
+        )
+        commercial_mask = (self.type_grid == 2).astype(np.float64)
+        self.noise = np.clip(
+            0.45 * box_mean(industry_mask + commercial_mask, NOISE_RADIUS)
+            + 0.45 * box_mean(road_mask, NOISE_RADIUS)
+            + 0.10 * self.density,
+            0.0,
+            1.0,
+        )
+        self.attractiveness = np.clip(
+            0.32 * box_mean((self.type_grid == 5).astype(np.float64), 1)
+            + 0.20 * self.static["water"]
+            + 0.20 * (1.0 - self.static["dist_center"])
+            + 0.15 * self.static["road"]
+            + 0.13 * (1.0 - self.density)
+            - 0.30 * self.pollution
+            - 0.15 * self.noise,
+            0.0,
+            1.0,
+        )
+
+        raw_land = (
+            0.38 * self.static["land_price"]
+            + 0.18 * (1.0 - self.static["dist_center"])
+            + 0.14 * self.static["road"]
+            + 0.15 * self.attractiveness
+            + 0.10 * self.density
+            - 0.20 * self.pollution
+            - 0.12 * self.noise
+        )
+        raw_land = np.clip(raw_land, LAND_VALUE_MIN, LAND_VALUE_MAX)
+        self.land_value = (raw_land - LAND_VALUE_MIN) / max(
+            1e-9, LAND_VALUE_MAX - LAND_VALUE_MIN
         )
 
         if self.config.enable_externalities:
@@ -476,14 +736,18 @@ class CityEnvironment:
                 + 0.25 * (1.0 - self.density)
                 + 0.10 * self.static["road"]
                 - 0.20 * self.load
-                - 0.15 * self.share_industry,
+                - 0.15 * self.share_industry
+                + 0.15 * self.attractiveness
+                - 0.10 * self.local_saturation,
                 0.10,
                 MAX_DEMAND,
             )
             self.price = np.clip(
                 0.55 * self.static["land_price"]
                 + 0.35 * (self.demand / MAX_DEMAND)
-                + 0.10 * (1.0 - self.density),
+                + 0.10 * (1.0 - self.density)
+                + 0.10 * self.land_value
+                - 0.10 * self.pollution,
                 0.0,
                 MAX_PRICE,
             )
@@ -491,10 +755,82 @@ class CityEnvironment:
             self.demand = self.static["base_demand"].copy()
             self.price = self.static["land_price"].copy()
 
-        industry_count = int(np.sum(self.type_grid == 4))
-        if industry_count != self._industry_count:
-            self._industry_count = industry_count
-            self.dist_to_industry = distance_to_mask(self.type_grid == 4)
+        self._update_stocks(advance_population=advance_population)
+        self._refresh_districts()
+
+    def _update_stocks(self, advance_population: bool) -> None:
+        counts = {
+            t: int(np.sum(self.type_grid == t)) for t in range(1, 6)
+        }
+        built_count = sum(counts.values())
+        housing_capacity = counts[1] * HOUSING_CAPACITY + counts[3] * MIXED_CAPACITY
+        target_population = min(
+            self.base_population + self.population_extra, housing_capacity
+        )
+        target_population = max(0.0, target_population)
+        if advance_population:
+            self.population = (
+                POPULATION_INERTIA * self.population
+                + (1.0 - POPULATION_INERTIA) * target_population
+            )
+        else:
+            self.population = min(self.population, target_population)
+
+        self.jobs = (
+            counts[2] * COMMERCIAL_JOBS
+            + counts[3] * MIXED_JOBS
+            + counts[4] * INDUSTRY_JOBS
+        )
+        self.goods_supply = counts[4] * INDUSTRY_GOODS_SUPPLY
+        self.goods_demand = (
+            CITIZEN_GOODS_DEMAND * self.population
+            + counts[2] * COMMERCIAL_GOODS_DEMAND
+        )
+        self.goods_balance = float(
+            (self.goods_supply - self.goods_demand)
+            / max(1.0, self.goods_supply + self.goods_demand)
+        )
+
+        housing_capacity = max(1e-9, counts[1] * HOUSING_CAPACITY)
+        commercial_capacity = max(1e-9, counts[2] * COMMERCIAL_CUSTOMERS)
+        mixed_capacity = max(1e-9, counts[3] * MIXED_CAPACITY)
+        self.utilization = {
+            1: min(1.0, self.population / housing_capacity) if counts[1] else 0.0,
+            2: min(1.0, self.population / commercial_capacity) if counts[2] else 0.0,
+            3: min(1.0, self.population / mixed_capacity) if counts[3] else 0.0,
+            4: min(1.0, self.goods_demand / max(1e-9, self.goods_supply))
+            if counts[4]
+            else 0.0,
+            5: 1.0 if counts[5] else 0.0,
+        }
+        self.util_grid = np.zeros((self.h, self.w), dtype=np.float64)
+        for world_type in range(1, 6):
+            self.util_grid[self.type_grid == world_type] = self.utilization[world_type]
+        self.mean_utilization = (
+            float(self.util_grid[self.type_grid > 0].mean()) if built_count else 0.0
+        )
+
+    def _refresh_districts(self) -> None:
+        labels = self.district_labels_flat
+        built = (self.type_grid > 0).ravel()
+        built_counts = np.bincount(
+            labels, weights=built.astype(np.float64), minlength=self.n_districts
+        )
+        # Dominant building type per district.
+        type_scores = np.zeros((self.n_districts, 6), dtype=np.float64)
+        for world_type in range(1, 6):
+            type_scores[:, world_type] = np.bincount(
+                labels,
+                weights=(self.type_grid.ravel() == world_type).astype(np.float64),
+                minlength=self.n_districts,
+            )
+        dominant = np.argmax(type_scores, axis=1)
+        self.district_type = dominant[labels].reshape(self.h, self.w).astype(np.float64)
+        util_sums = np.bincount(
+            labels, weights=self.util_grid.ravel(), minlength=self.n_districts
+        )
+        district_util = util_sums / np.maximum(1.0, built_counts)
+        self.district_util = district_util[labels].reshape(self.h, self.w)
 
     # ------------------------------------------------------------------
     # Income and externalities
@@ -539,6 +875,17 @@ class CityEnvironment:
             )
         return fields
 
+    def _sector_quality_penalty(self, action_type: int) -> np.ndarray:
+        if action_type == 0:      # housing
+            return np.clip(1.0 - 0.30 * self.pollution - 0.15 * self.noise, 0.25, 1.0)
+        if action_type == 1:      # commercial
+            return np.clip(1.0 - 0.15 * self.noise - 0.10 * self.pollution, 0.30, 1.0)
+        if action_type == 2:      # mixed
+            return np.clip(1.0 - 0.20 * self.pollution - 0.12 * self.noise, 0.30, 1.0)
+        if action_type == 3:      # industry
+            return np.clip(1.0 - 0.05 * self.noise, 0.50, 1.0)
+        return np.ones((self.h, self.w), dtype=np.float64)
+
     def _income_grid(self) -> np.ndarray:
         built = self.type_grid > 0
         if not built.any():
@@ -559,11 +906,30 @@ class CityEnvironment:
         soil_factor = 0.9 + 0.2 * self.static["soil"]
 
         if self.config.enable_externalities:
-            compatibility = self._compatibility_fields()[type_for_index, self.yy.astype(int), self.xx.astype(int)]
+            compatibility = self._compatibility_fields()[
+                type_for_index, self.yy.astype(int), self.xx.astype(int)
+            ]
             load_factor = 1.0 - 0.10 * self.load
+            penalties = np.ones((self.h, self.w), dtype=np.float64)
+            for action_type in range(5):
+                mask = world_type == action_type + 1
+                if mask.any():
+                    penalties[mask] = self._sector_quality_penalty(action_type)[mask]
+            util = np.zeros((self.h, self.w), dtype=np.float64)
+            saturation = np.ones((self.h, self.w), dtype=np.float64)
+            for action_type in range(5):
+                wt = action_type + 1
+                mask = world_type == wt
+                util[mask] = self.utilization[wt]
+                saturation[mask] = 1.0 / (
+                    1.0 + SATURATION_ALPHA * self.local_same[wt][mask]
+                )
         else:
             compatibility = np.ones((self.h, self.w), dtype=np.float64)
             load_factor = np.ones((self.h, self.w), dtype=np.float64)
+            penalties = np.ones((self.h, self.w), dtype=np.float64)
+            util = np.ones((self.h, self.w), dtype=np.float64)
+            saturation = np.ones((self.h, self.w), dtype=np.float64)
 
         income = (
             type_income
@@ -573,6 +939,9 @@ class CityEnvironment:
             * access_factor
             * compatibility
             * load_factor
+            * penalties
+            * util
+            * saturation
             * soil_factor
         )
         income[~built] = 0.0
@@ -584,6 +953,7 @@ class CityEnvironment:
         Shape: (n_cells, 5 action types, 3 qualities).  Used by the greedy
         baseline; learned policies never call this method.
         """
+        del agent_id
         fields = self._compatibility_fields() if self.config.enable_externalities else None
         if self.config.enable_externalities:
             load_factor = 1.0 - 0.10 * self.load
@@ -606,13 +976,79 @@ class CityEnvironment:
             base = INCOME_BASE[world_type] * (
                 demand_factor * road_factor * access_factor * soil_factor
             )
+            if self.config.enable_externalities:
+                sector_penalty = self._sector_quality_penalty(action_type)
+                util = self.utilization[world_type]
+                if util <= 0.0:
+                    util = 1.0  # a new sector starts with latent demand
+                saturation = 1.0 / (
+                    1.0 + SATURATION_ALPHA * self.local_same[world_type]
+                )
+            else:
+                sector_penalty = 1.0
+                util = 1.0
+                saturation = 1.0
             for quality in range(3):
                 out[:, action_type, quality] = (
-                    base * QUALITY_INCOME_MULT[quality]
+                    base
+                    * QUALITY_INCOME_MULT[quality]
                     * compatibility[action_type]
                     * load_factor
+                    * sector_penalty
+                    * util
+                    * saturation
                 ).ravel()
         return out
+
+    # ------------------------------------------------------------------
+    # Shocks
+    # ------------------------------------------------------------------
+
+    def apply_shock(self, kind: str, rng: np.random.Generator, magnitude: float = 0.5) -> dict:
+        """Apply an exogenous shock and return a short description."""
+        cleared = 0
+        if kind == "industry_removal":
+            cells = np.flatnonzero(self.type_grid == 4)
+            if cells.size:
+                n = max(1, int(round(magnitude * cells.size)))
+                chosen = rng.choice(cells, size=n, replace=False)
+                for cell in chosen:
+                    row, col = divmod(int(cell), self.w)
+                    self._clear_cell(row, col)
+                    cleared += 1
+        elif kind == "population_boom":
+            self.population_extra += float(magnitude)
+            self._refresh_layers(advance_population=False)
+            self.shock_events.append(
+                {"round": self.round, "kind": kind, "magnitude": float(magnitude), "cleared": 0}
+            )
+            return self.shock_events[-1]
+        elif kind == "earthquake":
+            cells = np.flatnonzero(self.type_grid > 0)
+            if cells.size:
+                n = max(1, int(round(magnitude * cells.size)))
+                chosen = rng.choice(cells, size=n, replace=False)
+                for cell in chosen:
+                    row, col = divmod(int(cell), self.w)
+                    self._clear_cell(row, col)
+                    cleared += 1
+        else:
+            raise ValueError(f"unknown shock kind: {kind}")
+        self._refresh_layers(advance_population=False)
+        event = {
+            "round": self.round,
+            "kind": kind,
+            "magnitude": float(magnitude),
+            "cleared": int(cleared),
+        }
+        self.shock_events.append(event)
+        return event
+
+    def _clear_cell(self, row: int, col: int) -> None:
+        self.type_grid[row, col] = 0
+        self.quality_grid[row, col] = -1
+        self.owner_grid[row, col] = -1
+        self.cost_grid[row, col] = 0.0
 
     # ------------------------------------------------------------------
     # Metrics
@@ -635,6 +1071,12 @@ class CityEnvironment:
         green_deficit = max(0.0, self.config.requirements.green_min - green_share)
         cap = self.config.requirements.density_cap
         density_excess_cell = np.maximum(0.0, self.density - cap)
+        quota = self.config.regulation.affordable_housing_quota
+        affordable_count = int(
+            np.sum((type_grid == 1) & (self.quality_grid == 0))
+        )
+        affordable_share = affordable_count / max(1, built_count)
+        affordable_deficit = max(0.0, quota - affordable_share)
 
         n = len(self.agents)
         violations = np.zeros(n, dtype=np.float64)
@@ -648,10 +1090,14 @@ class CityEnvironment:
             incompatible[agent.agent_id] = float(per_cell_incompatible[mask].sum())
             density_excess[agent.agent_id] = float(density_excess_cell[mask].sum())
             deficit_share = green_deficit * (own_builds / max(1, built_count))
+            affordable_share_agent = affordable_deficit * (
+                own_builds / max(1, built_count)
+            )
             violations[agent.agent_id] = (
                 incompatible[agent.agent_id]
                 + 4.0 * deficit_share
                 + 4.0 * density_excess[agent.agent_id]
+                + 4.0 * affordable_share_agent
             )
         return violations, incompatible, density_excess
 
@@ -665,9 +1111,19 @@ class CityEnvironment:
         if built_count:
             accessibility = 1.0 - float(self.static["dist_center"][built].mean())
             mean_load = float(self.load[built].mean())
+            land_value_mean = float(self.land_value[built].mean())
+            pollution_mean = float(self.pollution[built].mean())
+            noise_mean = float(self.noise[built].mean())
+            affordable_share = float(
+                np.sum((type_grid == 1) & (self.quality_grid == 0)) / built_count
+            )
         else:
             accessibility = 0.0
             mean_load = 0.0
+            land_value_mean = float(self.land_value.mean())
+            pollution_mean = float(self.pollution.mean())
+            noise_mean = float(self.noise.mean())
+            affordable_share = 0.0
         inc_edges, total_edges = incompatible_edges(type_grid)
         compatibility = 1.0 - inc_edges / max(1, total_edges)
         green_component = float(
@@ -688,6 +1144,8 @@ class CityEnvironment:
         damage_total = float(sum(a.damage_caused for a in self.agents))
         profits = np.array([a.profit for a in self.agents], dtype=np.float64)
         shifted = profits - profits.min() if profits.size else profits
+        satisfaction = self.citizens.evaluate_city(self)
+        util_values = [v for v in self.utilization.values() if v > 0]
         return CityMetrics(
             green_share=float(green_share),
             green_component=green_component,
@@ -705,6 +1163,23 @@ class CityEnvironment:
             gini_profit=float(gini_from_values(shifted)),
             built_cells=built_count,
             type_counts=counts,
+            population=float(self.population),
+            jobs=float(self.jobs),
+            goods_supply=float(self.goods_supply),
+            goods_demand=float(self.goods_demand),
+            goods_balance=float(self.goods_balance),
+            mean_utilization=float(np.mean(util_values)) if util_values else 0.0,
+            land_value_mean=land_value_mean,
+            pollution_mean=pollution_mean,
+            noise_mean=noise_mean,
+            mean_satisfaction=satisfaction["mean_satisfaction"],
+            gini_satisfaction=satisfaction["gini_satisfaction"],
+            rich_satisfaction=satisfaction["rich_satisfaction"],
+            poor_satisfaction=satisfaction["poor_satisfaction"],
+            tax_revenue=float(sum(a.tax_paid for a in self.agents)),
+            subsidy_total=float(sum(a.subsidy_received for a in self.agents)),
+            bankrupt_agents=int(sum(a.bankrupt for a in self.agents)),
+            affordable_share=affordable_share,
         )
 
     def agent_metrics(self) -> list[AgentMetrics]:
@@ -713,6 +1188,10 @@ class CityEnvironment:
         built_count = int(built.sum())
         green_share = np.sum(self.type_grid == 5) / max(1, built_count)
         green_deficit = max(0.0, self.config.requirements.green_min - green_share)
+        quota = self.config.regulation.affordable_housing_quota
+        affordable_count = int(np.sum((self.type_grid == 1) & (self.quality_grid == 0)))
+        affordable_share = affordable_count / max(1, built_count)
+        affordable_deficit = max(0.0, quota - affordable_share)
         metrics: list[AgentMetrics] = []
         for agent in self.agents:
             mask = self.owner_grid == agent.agent_id
@@ -726,12 +1205,22 @@ class CityEnvironment:
                 )
                 total = counts.sum()
                 p = counts[counts > 0] / total
-                own_entropy = max(0.0, float(-np.sum(p * np.log(p)) / np.log(5.0)))
+                own_entropy = float(-np.sum(p * np.log(p)) / np.log(5.0))
+                own_green = float(np.sum(own_types == 5) / max(1, total))
+                own_affordable = float(
+                    np.sum((own_types == 1) & (self.quality_grid[mask] == 0))
+                    / max(1, total)
+                )
             else:
                 mean_distance = 1.0
                 high_quality = 0.0
                 own_entropy = 0.0
+                own_green = 0.0
+                own_affordable = 0.0
             deficit_share = green_deficit * (own_builds / max(1, built_count))
+            affordable_deficit_share = affordable_deficit * (
+                own_builds / max(1, built_count)
+            )
             metrics.append(
                 AgentMetrics(
                     agent_id=agent.agent_id,
@@ -746,12 +1235,22 @@ class CityEnvironment:
                     damage_suffered=agent.damage_suffered,
                     violations=float(violations[agent.agent_id]),
                     incompatible_neighbors=float(incompatible[agent.agent_id]),
-                    green_deficit_share=float(deficit_share),
+                    green_deficit_share=float(deficit_share + affordable_deficit_share),
                     density_excess=float(density_excess[agent.agent_id]),
                     mean_distance=mean_distance,
                     high_quality_fraction=high_quality,
                     type_entropy=own_entropy,
-                    behavior=np.array([mean_distance, high_quality, own_entropy], dtype=np.float64),
+                    behavior=np.array(
+                        [mean_distance, high_quality, own_entropy, own_green],
+                        dtype=np.float64,
+                    ),
+                    tax_paid=agent.tax_paid,
+                    subsidy_received=agent.subsidy_received,
+                    bid_paid=agent.bid_paid,
+                    refund_received=agent.refund_received,
+                    bankrupt=agent.bankrupt,
+                    affordable_share=own_affordable,
+                    green_share=own_green,
                 )
             )
         return metrics

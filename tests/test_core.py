@@ -1,23 +1,37 @@
-"""Core smoke tests (unittest, no extra dependencies)."""
+"""Core smoke and unit tests for the second version of CitySim."""
 
 from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 
+from citysim.citizens import CitizenPool
 from citysim.config import (
-    CityConfig,
+    BID_MAX,
     EvolutionConfig,
+    N_CELL_FEATURES,
+    N_GLOBAL_FEATURES,
+    REGULATION_SCENARIOS,
     REQUIREMENT_PROFILES,
     quick_city_config,
 )
-from citysim.episode import run_episode, score_episode
+from citysim.episode import run_episode, score_breakdown, score_episode
 from citysim.evolution import EvolutionEngine
+from citysim.grid import district_ids
+from citysim.metrics import (
+    cluster_counts,
+    grid_distance,
+    kendall_tau,
+    local_entropy,
+    morans_i,
+    spatial_metrics,
+    type_distribution,
+)
 from citysim.policy import (
     DEFAULT_LAYOUT,
-    GenomeLayout,
     GreedyPolicy,
     ManualPolicy,
     NeuralPolicy,
@@ -27,120 +41,319 @@ from citysim.policy import (
 from citysim.world import Action, CityEnvironment
 
 
+def first_buildable(env: CityEnvironment, skip: int = 0) -> int:
+    cells = np.flatnonzero(env.buildable.ravel())
+    return int(cells[skip])
+
+
 class TestGenome(unittest.TestCase):
-    def test_parameter_count(self) -> None:
-        self.assertEqual(DEFAULT_LAYOUT.parameter_count, 6217)
+    def test_parameter_count_and_shapes(self) -> None:
+        layout = DEFAULT_LAYOUT
+        self.assertEqual(N_CELL_FEATURES, 23)
+        self.assertEqual(N_GLOBAL_FEATURES, 10)
+        self.assertEqual(layout.cell_mlp_input, 44)
+        self.assertEqual(layout.parameter_count, 6491)
         rng = np.random.default_rng(0)
-        genome = random_genome(rng, DEFAULT_LAYOUT)
-        self.assertEqual(genome.shape, (6217,))
-        policy = NeuralPolicy(genome, DEFAULT_LAYOUT)
-        self.assertEqual(policy.W1.shape, (22, 64))
-        self.assertEqual(policy.W_type.shape, (64, 5))
+        genome = random_genome(rng, layout)
+        self.assertEqual(genome.shape, (6491,))
+        policy = NeuralPolicy(genome, layout)
+        self.assertEqual(policy.W1.shape, (44, 48))
+        self.assertEqual(policy.W_type.shape, (48, 5))
 
-    def test_custom_hidden_size(self) -> None:
-        layout = GenomeLayout(hidden_size=16)
-        self.assertEqual(layout.parameter_count, 22 * 16 + 16 + 16 * 16 + 16 + 16 + 1 + 16 * 5 + 5 + 16 * 3 + 3)
-
-
-class TestEnvironment(unittest.TestCase):
-    def test_observation_and_action(self) -> None:
-        config = quick_city_config(n_agents=3, actions_per_agent=2)
-        env = CityEnvironment(config, seed=7)
+    def test_forward_scores_are_finite(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        env = CityEnvironment(city, seed=3)
         obs = env.observe(0)
-        self.assertEqual(obs.cell_features.shape, (config.n_cells, 16))
-        self.assertEqual(obs.global_features.shape, (6,))
-        self.assertEqual(obs.action_mask.shape, (config.n_cells, 5, 3))
-        self.assertEqual(obs.cost_table.shape, (config.n_cells, 5, 3))
+        policy = NeuralPolicy(random_genome(np.random.default_rng(1)))
+        forward = policy._forward(obs)
+        self.assertEqual(forward["scores"].shape, (city.n_cells,))
+        self.assertTrue(np.isfinite(forward["scores"]).all())
+        self.assertEqual(forward["shape"].tolist(), [city.height, city.width])
 
-        cells = np.flatnonzero(obs.valid_cells)
-        self.assertGreater(cells.size, 0)
-        cell = int(cells[0])
-        types, qualities = np.where(obs.action_mask[cell])
-        self.assertGreater(types.size, 0)
-        action = Action(
-            cell=cell,
-            type_id=int(types[0]),
-            quality=int(qualities[0]),
-            cost=float(obs.cost_table[cell, types[0], qualities[0]]),
+    def test_neural_bids_are_capped(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=2)
+        env = CityEnvironment(city, seed=4)
+        policy = NeuralPolicy(random_genome(np.random.default_rng(2)))
+        actions = policy.propose_bids(env, 0, np.random.default_rng(0), count=3)
+        self.assertGreater(len(actions), 0)
+        for action in actions:
+            self.assertLessEqual(action.bid, BID_MAX * city.initial_budget + 1e-9)
+            self.assertLessEqual(action.bid, city.initial_budget / 10.0 + 1e-9)
+
+
+class TestObservationAndEconomy(unittest.TestCase):
+    def test_observation_contract(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        env = CityEnvironment(city, seed=11)
+        obs = env.observe(0)
+        self.assertEqual(obs.cell_features.shape, (city.n_cells, N_CELL_FEATURES))
+        self.assertEqual(obs.global_features.shape, (N_GLOBAL_FEATURES,))
+        self.assertEqual(obs.action_mask.shape, (city.n_cells, 5, 3))
+        self.assertEqual(obs.demolish_mask.shape, (city.n_cells,))
+        self.assertEqual(obs.cost_table.shape, (city.n_cells, 5, 3))
+        self.assertTrue(np.isfinite(obs.cell_features).all())
+        self.assertTrue(np.isfinite(obs.global_features).all())
+        self.assertEqual(getattr(obs, "_shape_hint"), (city.height, city.width))
+        labels, n_districts = district_ids(city.height, city.width, 3)
+        self.assertEqual(getattr(obs, "_n_districts"), n_districts)
+
+    def test_land_value_pollution_and_noise(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=2, initial_budget=2000)
+        env = CityEnvironment(city, seed=12)
+        self.assertTrue(((env.land_value >= 0.0) & (env.land_value <= 1.0)).all())
+        self.assertTrue(((env.pollution >= 0.0) & (env.pollution <= 1.0)).all())
+        self.assertTrue(((env.noise >= 0.0) & (env.noise <= 1.0)).all())
+        cell = first_buildable(env)
+        clean = float(env.pollution.ravel()[cell])
+        row, col = divmod(cell, env.w)
+        before = env.pollution.copy()
+        ok = env.apply_action(0, Action(cell=cell, type_id=3, quality=2))
+        self.assertTrue(ok)
+        self.assertGreater(float(env.pollution[row, col]), clean)
+        self.assertGreater(float(env.pollution.sum()), float(before.sum()))
+        self.assertGreater(float(env.local_same[4].sum()), 0.0)
+
+    def test_global_stocks_and_utilization(self) -> None:
+        city = quick_city_config(
+            n_agents=2, actions_per_agent=4, initial_budget=5000
         )
-        before = env.agents[0].budget
-        accepted = env.apply_action(0, action)
-        self.assertTrue(accepted)
-        self.assertEqual(env.type_grid.ravel()[cell], int(types[0]) + 1)
-        self.assertLess(env.agents[0].budget, before)
+        city = replace(city, requirements=REQUIREMENT_PROFILES["soft"])
+        env = CityEnvironment(city, seed=13)
+        cells = np.flatnonzero(env.buildable.ravel())[:8]
+        # Two housing, two commercial, two industry, one green.
+        plan = [(0, 0), (1, 0), (2, 1), (3, 1), (4, 3), (5, 3), (6, 4)]
+        for cell, type_id in plan:
+            self.assertTrue(
+                env.apply_action(0, Action(cell=int(cells[cell]), type_id=type_id, quality=1))
+            )
         env.end_round()
-        metrics = env.city_metrics()
-        self.assertEqual(metrics.built_cells, 1)
-        self.assertGreaterEqual(metrics.city_quality, 0.0)
-        self.assertLessEqual(metrics.city_quality, 1.0)
+        self.assertGreater(env.population, 0.0)
+        self.assertGreater(env.jobs, 0.0)
+        self.assertGreater(env.goods_supply, 0.0)
+        self.assertGreaterEqual(env.goods_demand, 0.0)
+        self.assertGreaterEqual(env.goods_balance, -1.0)
+        self.assertLessEqual(env.goods_balance, 1.0)
+        for value in env.utilization.values():
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
+        self.assertGreaterEqual(env.mean_utilization, 0.0)
+        self.assertLessEqual(env.mean_utilization, 1.0)
 
-    def test_reject_occupied_cell(self) -> None:
-        config = quick_city_config(n_agents=2, actions_per_agent=1)
-        env = CityEnvironment(config, seed=3)
-        obs = env.observe(0)
-        cell = int(np.flatnonzero(obs.valid_cells)[0])
-        types, qualities = np.where(obs.action_mask[cell])
-        action = Action(cell, int(types[0]), int(qualities[0]))
-        self.assertTrue(env.apply_action(0, action))
-        obs2 = env.observe(1)
-        self.assertFalse(obs2.valid_cells[cell])
-        self.assertFalse(env.apply_action(1, action))
-
-    def test_industry_buffer_mask(self) -> None:
-        config = CityConfig(
-            height=6,
-            width=6,
-            n_agents=2,
-            actions_per_agent=2,
-            initial_budget=10_000,
-            requirements=REQUIREMENT_PROFILES["hard"],
+    def test_demolition_refund(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=2, initial_budget=2000)
+        env = CityEnvironment(city, seed=14)
+        cell = first_buildable(env)
+        self.assertTrue(env.apply_action(0, Action(cell=cell, type_id=0, quality=1)))
+        row, col = divmod(cell, env.w)
+        cost = float(env.cost_grid[row, col])
+        budget_before = env.agents[0].budget
+        self.assertTrue(env.apply_action(0, Action(cell=cell, demolish=True)))
+        self.assertEqual(int(env.type_grid[row, col]), 0)
+        self.assertAlmostEqual(
+            env.agents[0].budget, budget_before + 0.5 * cost, places=6
         )
-        env = CityEnvironment(config, seed=11)
-        buildable = np.argwhere(env.buildable)
-        self.assertGreater(buildable.shape[0], 0)
-        row, col = (int(x) for x in buildable[0])
-        self.assertTrue(env.apply_action(0, Action(row * config.width + col, 0, 1)))
-        obs = env.observe(1)
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                r, c = row + dr, col + dc
-                if 0 <= r < config.height and 0 <= c < config.width:
-                    cell = r * config.width + c
-                    if cell != row * config.width + col:
-                        self.assertFalse(obs.action_mask[cell, 3].any())
+        self.assertAlmostEqual(env.agents[0].refund_received, 0.5 * cost, places=6)
+        self.assertAlmostEqual(env.cost_grid[row, col], 0.0, places=6)
 
-    def test_policies_return_valid_or_pass(self) -> None:
-        config = quick_city_config(n_agents=2, actions_per_agent=2)
-        env = CityEnvironment(config, seed=5)
-        rng = np.random.default_rng(0)
-        for policy in [
-            RandomPolicy(),
-            GreedyPolicy(),
-            ManualPolicy(),
-            NeuralPolicy(random_genome(rng), DEFAULT_LAYOUT),
-        ]:
-            obs = env.observe(0)
-            action = policy.act(env, 0, rng)
-            if action.cell is not None:
-                cell = int(action.cell)
-                self.assertTrue(obs.valid_cells[cell])
-                self.assertTrue(obs.action_mask[cell, action.type_id, action.quality])
+    def test_bankruptcy_clears_buildings(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=3, initial_budget=5000)
+        env = CityEnvironment(city, seed=15)
+        cell = first_buildable(env)
+        self.assertTrue(env.apply_action(0, Action(cell=cell, type_id=0, quality=1)))
+        row, col = divmod(cell, env.w)
+        env.agents[0].budget = -1000.0
+        for _ in range(3):
+            env.end_round()
+        self.assertTrue(env.agents[0].bankrupt)
+        self.assertEqual(int(env.type_grid[row, col]), 0)
+        self.assertEqual(int(env.owner_grid[row, col]), -1)
+        self.assertEqual(env.agents[0].budget, 0.0)
 
 
-class TestEpisode(unittest.TestCase):
-    def test_episode_and_score(self) -> None:
-        config = quick_city_config(n_agents=4, actions_per_agent=2)
-        policies = [RandomPolicy() for _ in range(config.n_agents)]
-        result = run_episode(config, policies, seed=42, record_history=True)
-        self.assertEqual(len(result.agents), config.n_agents)
-        self.assertEqual(len(result.history), config.actions_per_agent)
-        scores = score_episode(result)
-        self.assertEqual(scores.shape, (config.n_agents,))
-        self.assertTrue(np.all(np.isfinite(scores)))
-        self.assertGreaterEqual(result.city.city_quality, 0.0)
-        self.assertLessEqual(result.city.city_quality, 1.0)
+class TestActionModes(unittest.TestCase):
+    def _run(self, policy_factory, use_auction: bool):
+        city = quick_city_config(
+            n_agents=4,
+            actions_per_agent=3,
+            initial_budget=1000,
+            use_auction=use_auction,
+        )
+        policies = [policy_factory() for _ in range(city.n_agents)]
+        return run_episode(city, policies, seed=21, record_history=True)
 
-    def test_tiny_evolution(self) -> None:
+    def test_auction_and_sequential_modes(self) -> None:
+        auction = self._run(GreedyPolicy, True)
+        sequential = self._run(GreedyPolicy, False)
+        for result in (auction, sequential):
+            self.assertGreater(result.city.built_cells, 0)
+            self.assertEqual(len(result.history), result.config.actions_per_agent)
+            self.assertTrue(np.isfinite(score_episode(result)).all())
+        self.assertGreater(
+            sum(a.bid_paid for a in auction.agents), 0.0
+        )
+        self.assertEqual(
+            sum(a.bid_paid for a in sequential.agents), 0.0
+        )
+        winning_bids = [a.bid for a in auction.actions if a.accepted and not a.demolish]
+        self.assertTrue(any(bid > 0 for bid in winning_bids))
+
+    def test_buildings_per_action(self) -> None:
+        city = quick_city_config(
+            n_agents=3, actions_per_agent=2, initial_budget=5000,
+            buildings_per_action=2,
+        )
+        result = run_episode(
+            city, [GreedyPolicy() for _ in range(3)], seed=22
+        )
+        per_round: dict[tuple[int, int], int] = {}
+        for record in result.actions:
+            if record.accepted and not record.demolish:
+                key = (record.round, record.agent_id)
+                per_round[key] = per_round.get(key, 0) + 1
+        self.assertEqual(max(per_round.values(), default=0), 2)
+        builds_per_agent = [a.builds for a in result.agents]
+        self.assertGreater(max(builds_per_agent), 1)
+        self.assertLessEqual(max(builds_per_agent), 4)
+
+
+class TestCitizensAndMetrics(unittest.TestCase):
+    def test_satisfaction_metrics(self) -> None:
+        city = quick_city_config(n_agents=3, actions_per_agent=3)
+        result = run_episode(
+            city, [ManualPolicy() for _ in range(3)], seed=31,
+            record_history=True,
+        )
+        metrics = result.city
+        for value in (
+            metrics.mean_satisfaction,
+            metrics.gini_satisfaction,
+            metrics.rich_satisfaction,
+            metrics.poor_satisfaction,
+        ):
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
+        self.assertEqual(len(result.history), city.actions_per_agent)
+        history_row = result.history[-1]
+        self.assertIn("mean_satisfaction", history_row)
+        self.assertIn("bankrupt_agents", history_row)
+
+    def test_citizen_pool_reproducible(self) -> None:
+        a = CitizenPool(seed=5)
+        b = CitizenPool(seed=5)
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        env = CityEnvironment(city, seed=32)
+        self.assertEqual(a.evaluate_city(env), b.evaluate_city(env))
+
+    def test_spatial_metrics(self) -> None:
+        block = np.zeros((9, 9), dtype=np.int8)
+        block[0:3, 0:3] = 1
+        block[0:3, 3:6] = 2
+        block[0:3, 6:9] = 3
+        block[3:6, 0:3] = 4
+        block[3:6, 3:6] = 5
+        block[3:6, 6:9] = 1
+        block[6:9, 0:3] = 2
+        block[6:9, 3:6] = 4
+        block[6:9, 6:9] = 5
+        random_grid = np.random.default_rng(0).integers(0, 6, size=(12, 12))
+        self.assertGreater(morans_i(block), 0.05)
+        self.assertGreater(morans_i(block), morans_i(random_grid))
+        self.assertLess(local_entropy(block), 0.5)
+        counts = cluster_counts(block)
+        self.assertEqual(sum(counts.values()), 9)
+        spatial = spatial_metrics(block)
+        for key in ("morans_i", "local_entropy", "cluster_count", "green_share"):
+            self.assertIn(key, spatial)
+        self.assertTrue(np.isfinite(type_distribution(block)).all())
+        self.assertAlmostEqual(float(type_distribution(block).sum()), 1.0)
+        self.assertGreaterEqual(kendall_tau([1, 2, 3], [1, 2, 3]), 0.99)
+        self.assertEqual(grid_distance(block, block), 0.0)
+
+    def test_fitness_breakdown_and_bankruptcy_penalty(self) -> None:
+        city = quick_city_config(n_agents=4, actions_per_agent=3)
+        result = run_episode(
+            city, [RandomPolicy() for _ in range(4)], seed=33
+        )
+        breakdown = score_breakdown(result)
+        self.assertEqual(breakdown["score"].shape, (4,))
+        self.assertTrue(np.isfinite(breakdown["score"]).all())
+        self.assertIn("city_quality", breakdown)
+        self.assertIn("satisfaction", breakdown)
+
+        def agent(bankrupt: bool):
+            return SimpleNamespace(
+                profit=50.0,
+                builds=2,
+                skips=0,
+                violations=0.0,
+                damage_caused=0.0,
+                bankrupt=bankrupt,
+            )
+
+        fake = SimpleNamespace(
+            agents=[agent(False), agent(True)],
+            city=SimpleNamespace(city_quality=0.5, mean_satisfaction=0.5),
+            config=city,
+        )
+        scores = score_breakdown(fake)["score"]
+        self.assertAlmostEqual(
+            float(scores[0] - scores[1]), city.fitness.bankruptcy, places=6
+        )
+
+
+class TestShocksAndRegulation(unittest.TestCase):
+    def test_shocks(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=2, initial_budget=5000)
+        env = CityEnvironment(city, seed=41)
+        cells = np.flatnonzero(env.buildable.ravel())
+        for cell in cells[:4]:
+            self.assertTrue(
+                env.apply_action(0, Action(cell=int(cell), type_id=3, quality=1))
+            )
+        event = env.apply_shock("industry_removal", np.random.default_rng(1), 0.5)
+        self.assertEqual(event["kind"], "industry_removal")
+        self.assertEqual(event["cleared"], 2)
+        self.assertEqual(int(np.sum(env.type_grid == 4)), 2)
+
+        env2 = CityEnvironment(city, seed=42)
+        env2.apply_shock("population_boom", np.random.default_rng(1), 200)
+        self.assertAlmostEqual(env2.population_extra, 200.0)
+
+        env3 = CityEnvironment(city, seed=43)
+        for cell in np.flatnonzero(env3.buildable.ravel())[:4]:
+            env3.apply_action(0, Action(cell=int(cell), type_id=0, quality=1))
+        event3 = env3.apply_shock("earthquake", np.random.default_rng(2), 0.5)
+        self.assertEqual(event3["cleared"], 2)
+        self.assertEqual(int(np.sum(env3.type_grid > 0)), 2)
+
+    def test_regulation_scenarios(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=3, initial_budget=5000)
+        env = CityEnvironment(
+            replace(city, regulation=REGULATION_SCENARIOS["green_subsidy"]),
+            seed=44,
+        )
+        cell = first_buildable(env)
+        self.assertTrue(env.apply_action(0, Action(cell=cell, type_id=4, quality=1)))
+        env.end_round()
+        self.assertGreater(env.agents[0].subsidy_received, 0.0)
+
+        env_tax = CityEnvironment(
+            replace(city, regulation=REGULATION_SCENARIOS["no_tax"]), seed=45
+        )
+        cell = first_buildable(env_tax)
+        env_tax.apply_action(0, Action(cell=cell, type_id=0, quality=1))
+        env_tax.end_round()
+        self.assertEqual(env_tax.agents[0].tax_paid, 0.0)
+
+        env_default = CityEnvironment(city, seed=46)
+        cell = first_buildable(env_default)
+        env_default.apply_action(0, Action(cell=cell, type_id=0, quality=1))
+        env_default.end_round()
+        self.assertGreater(env_default.agents[0].tax_paid, 0.0)
+
+
+class TestEvolution(unittest.TestCase):
+    def _config(self) -> tuple[EvolutionConfig, CityConfig]:
         city = quick_city_config(n_agents=3, actions_per_agent=2)
         evo = EvolutionConfig(
             population_size=8,
@@ -149,27 +362,58 @@ class TestEpisode(unittest.TestCase):
             elites=2,
             islands=2,
             fresh_blood_count=1,
+            hidden_size=48,
+            use_parallel=False,
             verbose=False,
+            log_every=1,
+            use_map_elites=True,
+            map_elites_bins=3,
         )
-        engine = EvolutionEngine(evo, city)
-        result = engine.run()
-        self.assertEqual(len(result.history), 2)
-        self.assertEqual(result.best_genome.shape, (6217,))
+        return evo, city
+
+    def test_evolution_and_map_elites(self) -> None:
+        evo, city = self._config()
+        result = EvolutionEngine(evo, city).run()
+        self.assertEqual(result.best_genome.shape, (6491,))
         self.assertTrue(np.isfinite(result.best_fitness))
-        self.assertEqual(len(result.population), 8)
-        self.assertTrue(all(ind.episodes >= 1 for ind in result.population))
+        self.assertEqual(len(result.history), 2)
+        row = result.history[-1]
+        for key in (
+            "best", "mean", "diversity", "eval_satisfaction",
+            "eval_city_quality", "eval_utilization", "eval_bankrupt_agents",
+        ):
+            self.assertIn(key, row)
+        self.assertTrue(result.archive)
+        for key, individual in result.archive.items():
+            self.assertEqual(len(key), 2)
+            for bucket in key:
+                self.assertGreaterEqual(bucket, 0)
+                self.assertLess(bucket, 3)
+            self.assertEqual(individual.genome.shape, (6491,))
+            self.assertTrue(np.isfinite(individual.fitness))
 
 
-class TestRequirements(unittest.TestCase):
-    def test_profiles_are_ordered(self) -> None:
-        self.assertGreater(
-            REQUIREMENT_PROFILES["hard"].green_min,
-            REQUIREMENT_PROFILES["medium"].green_min,
+class TestCli(unittest.TestCase):
+    def test_parser_and_configs(self) -> None:
+        from citysim.cli import build_configs, build_parser, parse_grid, parse_seeds
+
+        self.assertEqual(parse_grid("12x9"), (12, 9))
+        self.assertEqual(parse_seeds("0-2"), [0, 1, 2])
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "experiment", "e8", "--quick", "--buildings-per-action", "2",
+                "--requirements", "hard", "--regulation", "no_tax",
+                "--no-auction", "--hidden", "32",
+            ]
         )
-        self.assertGreater(
-            REQUIREMENT_PROFILES["hard"].industry_buffer,
-            REQUIREMENT_PROFILES["soft"].industry_buffer,
-        )
+        city, evo, seeds = build_configs(args)
+        self.assertEqual(city.buildings_per_action, 2)
+        self.assertFalse(city.use_auction)
+        self.assertEqual(city.requirements.name, "hard")
+        self.assertEqual(city.regulation.name, "no_tax")
+        self.assertEqual(evo.hidden_size, 32)
+        self.assertEqual(seeds, [0, 1])
 
 
 if __name__ == "__main__":

@@ -1,40 +1,51 @@
-"""Experiment runners E1-E7 and shared aggregation helpers."""
+"""Experiment runners E1-E11 and shared aggregation helpers."""
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Sequence
-from concurrent.futures import ProcessPoolExecutor
-import os
+
 import numpy as np
 
 from .config import (
     CityConfig,
     EvolutionConfig,
+    REGULATION_SCENARIOS,
     REQUIREMENT_PROFILES,
-    quick_city_config,
-    quick_evolution_config,
     seed_bases_for_run,
 )
+from .episode import run_episode, score_episode
 from .evolution import (
     EvolutionEngine,
     EvolutionResult,
     evaluate_homogeneous,
     evaluate_league,
     evaluate_population,
+    layout_from_config,
     mean_pairwise_distance,
     unique_behaviors,
 )
 from .io import ensure_dir, save_genome, write_csv, write_json
+from .metrics import (
+    grid_distance,
+    kendall_tau,
+    resilience_metrics,
+    spatial_metrics,
+    type_distribution,
+)
 from .plotting import (
     plot_bars,
+    plot_distribution_matrix,
     plot_learning_curve,
     plot_metric_vs_x,
     plot_profit_quality,
+    plot_profit_satisfaction,
+    plot_satisfaction_curve,
 )
 from .policy import (
-    DEFAULT_LAYOUT,
     GreedyPolicy,
     ManualPolicy,
     NeuralPolicy,
@@ -49,8 +60,13 @@ from .policy import (
 # ---------------------------------------------------------------------------
 
 
+def _max_workers() -> int:
+    return max(1, min(8, os.cpu_count() or 1))
+
+
 def _stats(values: Sequence[float]) -> dict[str, float]:
     x = np.asarray(values, dtype=np.float64)
+    x = x[np.isfinite(x)]
     if x.size == 0:
         return {"mean": float("nan"), "std": float("nan"), "ci95": float("nan"), "n": 0}
     mean = float(x.mean())
@@ -68,6 +84,27 @@ def _run_config(base: EvolutionConfig, run_seed: int) -> EvolutionConfig:
         validation_seed_base=validation,
         test_seed_base=test,
         verbose=True,
+    )
+
+
+def _ensure_evolution_feasible(
+    config: EvolutionConfig, n_agents: int
+) -> EvolutionConfig:
+    """Bump population/episodes so every agent can host a distinct genome."""
+    population = max(config.population_size, int(n_agents))
+    if config.use_islands and config.islands > 1:
+        population = int(
+            np.ceil(population / config.islands) * config.islands
+        )
+    episodes = int(config.episodes_per_generation)
+    while episodes * int(n_agents) < population:
+        episodes += 1
+    if population == config.population_size and episodes == config.episodes_per_generation:
+        return config
+    return replace(
+        config,
+        population_size=population,
+        episodes_per_generation=episodes,
     )
 
 
@@ -95,6 +132,20 @@ def train_evolution(
     if out is not None:
         write_csv(out / f"{tag}_history.csv", _history_rows(result))
         save_genome(out / f"{tag}_best_genome.npy", result.best_genome)
+        archive_rows = [
+            {
+                "niche": f"{key[0]}_{key[1]}",
+                "fitness": ind.fitness,
+                "behavior": ind.behavior,
+            }
+            for key, ind in result.archive.items()
+        ]
+        if archive_rows:
+            write_csv(out / f"{tag}_archive.csv", archive_rows)
+            np.savez(
+                out / f"{tag}_archive_genomes.npz",
+                **{f"niche_{key[0]}_{key[1]}": ind.genome for key, ind in result.archive.items()},
+            )
         write_json(
             out / f"{tag}_summary.json",
             {
@@ -103,6 +154,7 @@ def train_evolution(
                 "best_behavior": result.best_behavior,
                 "evolution_config": evolution_config.as_dict(),
                 "city_config": city_config.as_dict(),
+                "archive": archive_rows,
             },
         )
         plot_learning_curve([result.history], out / f"{tag}_learning_curve.png")
@@ -110,16 +162,25 @@ def train_evolution(
 
 
 def _aggregate_history(histories: list[list[dict]], keys: Sequence[str]) -> list[dict]:
-    max_len = max(len(h) for h in histories)
+    max_len = max((len(h) for h in histories), default=0)
     rows = []
     for gen in range(max_len):
         row: dict = {"gen": gen}
         for key in keys:
-            values = [float(h[gen][key]) for h in histories if gen < len(h)]
-            stats = _stats(values)
-            row[f"{key}_mean"] = stats["mean"]
-            row[f"{key}_std"] = stats["std"]
-            row[f"{key}_ci95"] = stats["ci95"]
+            values = [
+                float(h[gen][key])
+                for h in histories
+                if gen < len(h) and key in h[gen]
+            ]
+            if values:
+                stats = _stats(values)
+                row[f"{key}_mean"] = stats["mean"]
+                row[f"{key}_std"] = stats["std"]
+                row[f"{key}_ci95"] = stats["ci95"]
+            else:
+                row[f"{key}_mean"] = float("nan")
+                row[f"{key}_std"] = float("nan")
+                row[f"{key}_ci95"] = float("nan")
         rows.append(row)
     return rows
 
@@ -136,6 +197,17 @@ def _eval_seeds(base: int, count: int) -> list[int]:
     return [int(base) + i for i in range(count)]
 
 
+def _metric_row(metrics: dict, keys: Sequence[str]) -> dict:
+    return {
+        **{f"{key}_mean": metrics[key]["mean"] for key in keys},
+        **{f"{key}_ci95": metrics[key]["ci95"] for key in keys},
+    }
+
+
+def _shared_executor() -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(max_workers=_max_workers())
+
+
 # ---------------------------------------------------------------------------
 # E1. Learning curves
 # ---------------------------------------------------------------------------
@@ -148,11 +220,11 @@ def e1_learning_curve(
     out_dir: str | Path,
     eval_seed_count: int = 5,
 ) -> dict:
-    del eval_seed_count  # E1 only needs training curves
+    del eval_seed_count
     out = ensure_dir(out_dir)
     histories: list[list[dict]] = []
     runs: list[dict] = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as shared_executor:
+    with _shared_executor() as shared_executor:
         for run_seed in seeds:
             print(f"  [E1] Training neuroevolution, seed={run_seed}...")
             cfg = _run_config(evolution_config, run_seed)
@@ -161,8 +233,12 @@ def e1_learning_curve(
             save_genome(out / f"best_genome_seed{run_seed}.npy", result.best_genome)
             best_curve = np.array([row["best"] for row in result.history], dtype=np.float64)
             final_best = float(best_curve[-1])
-            threshold = 0.9 * final_best if final_best > -1e17 else np.inf
-            reached = int(np.argmax(best_curve >= threshold)) if np.isfinite(threshold) else -1
+            if final_best > 0.0:
+                threshold = 0.9 * final_best
+                reached_mask = best_curve >= threshold
+                reached = int(np.argmax(reached_mask)) if reached_mask.any() else -1
+            else:
+                reached = -1
             runs.append(
                 {
                     "seed": int(run_seed),
@@ -176,13 +252,21 @@ def e1_learning_curve(
                     "best_behavior": result.best_behavior,
                 }
             )
-            print(f"  [E1] seed {run_seed} training done. Evaluating...")
+            print(f"  [E1] seed {run_seed} training done.")
     aggregate = _aggregate_history(
         histories,
-        ["best", "mean", "std", "diversity", "unique_behaviors", "sigma", "best_ever"],
+        [
+            "best", "mean", "std", "diversity", "unique_behaviors", "sigma",
+            "best_ever", "best_green_share", "archive_coverage",
+            "morans_i", "local_entropy", "cluster_count", "snapshot_satisfaction",
+            "eval_city_quality", "eval_satisfaction", "eval_rich_satisfaction",
+            "eval_poor_satisfaction", "eval_utilization", "eval_population",
+            "eval_damage", "eval_bankrupt_agents",
+        ],
     )
     write_csv(out / "e1_history.csv", aggregate)
     plot_learning_curve(histories, out / "e1_learning_curve.png")
+    plot_satisfaction_curve(histories, out / "e1_satisfaction.png")
     summary = {
         "experiment": "E1",
         "seeds": [int(s) for s in seeds],
@@ -221,19 +305,18 @@ def e2_baselines(
     behavior_variants: int = 32,
 ) -> dict:
     out = ensure_dir(out_dir)
-    test_base = 9_000_000
-    eval_seeds = _eval_seeds(test_base, eval_seed_count)
+    eval_seeds = _eval_seeds(9_000_000, eval_seed_count)
+    layout = layout_from_config(evolution_config)
     neural_summaries: list[dict] = []
     neural_run_records: list[dict] = []
     evolved_behaviors: list[np.ndarray] = []
 
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as shared_executor:
+    with _shared_executor() as shared_executor:
         for run_seed in seeds:
             print(f"  [E2] Training neuroevolution, seed={run_seed}...")
             cfg = _run_config(evolution_config, run_seed)
             result = EvolutionEngine(cfg, city_config, executor=shared_executor).run()
             save_genome(out / f"best_genome_seed{run_seed}.npy", result.best_genome)
-            layout = DEFAULT_LAYOUT if evolution_config.hidden_size == 64 else result_layout_from_config(evolution_config)
             summary = evaluate_league(
                 lambda: NeuralPolicy(result.best_genome, layout),
                 city_config,
@@ -245,8 +328,9 @@ def e2_baselines(
                 eval_seeds,
             )
             neural_summaries.append(summary)
-            behavior_matrix = np.array([ind.behavior for ind in result.population], dtype=np.float64)
-            evolved_behaviors.append(behavior_matrix)
+            evolved_behaviors.append(
+                np.array([ind.behavior for ind in result.population], dtype=np.float64)
+            )
             neural_run_records.append(
                 {
                     "seed": int(run_seed),
@@ -255,11 +339,12 @@ def e2_baselines(
                     "homogeneous_fitness": _summary_value(homogeneous, "fitness"),
                     "eval_profit": _summary_value(summary, "profit"),
                     "eval_city_quality": _summary_value(summary, "city_quality"),
+                    "eval_satisfaction": _summary_value(summary, "mean_satisfaction"),
                     "eval_damage": _summary_value(summary, "damage_total"),
                     "eval_violations": _summary_value(summary, "violations"),
                 }
             )
-            print(f"  [E2] seed {run_seed} training done. Evaluating...")
+            print(f"  [E2] seed {run_seed} training done.")
 
     print("  [E2] Evaluating baselines (manual, greedy, random)...")
     baseline_factories: dict[str, Callable[[], object]] = {
@@ -283,10 +368,9 @@ def e2_baselines(
         city_config,
         behavior_seeds,
     )
-    random_layout = DEFAULT_LAYOUT if evolution_config.hidden_size == 64 else result_layout_from_config(evolution_config)
     random_set = _evaluate_behavior_set(
         [
-            lambda g=random_genome(rng, random_layout): NeuralPolicy(g, random_layout)
+            lambda g=random_genome(rng, layout): NeuralPolicy(g, layout)
             for _ in range(behavior_variants)
         ],
         city_config,
@@ -297,44 +381,45 @@ def e2_baselines(
 
     rows = []
     neural_fitness = _run_metric_summary(neural_summaries, "fitness")
-    neural_profit = _run_metric_summary(neural_summaries, "profit")
-    neural_quality = _run_metric_summary(neural_summaries, "city_quality")
-    neural_damage = _run_metric_summary(neural_summaries, "damage_total")
-    neural_violations = _run_metric_summary(neural_summaries, "violations")
-    neural_homogeneous = _stats([r["homogeneous_fitness"] for r in neural_run_records])
-    rows.append(
-        {
-            "condition": "neuroevolution",
-            "fitness_mean": neural_fitness["mean"],
-            "fitness_ci95": neural_fitness["ci95"],
-            "homogeneous_fitness_mean": neural_homogeneous["mean"],
-            "profit_mean": neural_profit["mean"],
-            "city_quality_mean": neural_quality["mean"],
-            "damage_total_mean": neural_damage["mean"],
-            "violations_mean": neural_violations["mean"],
-            "behavior_diversity": float(np.mean(evolved_diversity)),
-            "unique_behaviors": float(np.mean(evolved_unique)),
-        }
-    )
-    for name, summary in baseline_summaries.items():
-        rows.append(
-            {
-                "condition": name,
-                "fitness_mean": _summary_value(summary, "fitness"),
-                "fitness_ci95": summary["fitness"]["ci95"],
-                "homogeneous_fitness_mean": _summary_value(baseline_homogeneous[name], "fitness"),
-                "profit_mean": _summary_value(summary, "profit"),
-                "city_quality_mean": _summary_value(summary, "city_quality"),
-                "damage_total_mean": _summary_value(summary, "damage_total"),
-                "violations_mean": _summary_value(summary, "violations"),
-                "behavior_diversity": 0.0 if name == "greedy" else float(
-                    mean_pairwise_distance(manual_set if name == "manual" else random_set)
-                ),
-                "unique_behaviors": 0.0 if name == "greedy" else float(
-                    unique_behaviors(manual_set if name == "manual" else random_set)
-                ),
-            }
-        )
+    for condition, summary in [("neuroevolution", None), *baseline_summaries.items()]:
+        if condition == "neuroevolution":
+            rows.append(
+                {
+                    "condition": condition,
+                    "fitness_mean": neural_fitness["mean"],
+                    "fitness_ci95": neural_fitness["ci95"],
+                    "homogeneous_fitness_mean": _stats(
+                        [r["homogeneous_fitness"] for r in neural_run_records]
+                    )["mean"],
+                    "profit_mean": _run_metric_summary(neural_summaries, "profit")["mean"],
+                    "city_quality_mean": _run_metric_summary(neural_summaries, "city_quality")["mean"],
+                    "satisfaction_mean": _run_metric_summary(neural_summaries, "mean_satisfaction")["mean"],
+                    "damage_total_mean": _run_metric_summary(neural_summaries, "damage_total")["mean"],
+                    "violations_mean": _run_metric_summary(neural_summaries, "violations")["mean"],
+                    "behavior_diversity": float(np.mean(evolved_diversity)),
+                    "unique_behaviors": float(np.mean(evolved_unique)),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "condition": condition,
+                    "fitness_mean": _summary_value(summary, "fitness"),
+                    "fitness_ci95": summary["fitness"]["ci95"],
+                    "homogeneous_fitness_mean": _summary_value(baseline_homogeneous[condition], "fitness"),
+                    "profit_mean": _summary_value(summary, "profit"),
+                    "city_quality_mean": _summary_value(summary, "city_quality"),
+                    "satisfaction_mean": _summary_value(summary, "mean_satisfaction"),
+                    "damage_total_mean": _summary_value(summary, "damage_total"),
+                    "violations_mean": _summary_value(summary, "violations"),
+                    "behavior_diversity": 0.0 if condition == "greedy" else float(
+                        mean_pairwise_distance(manual_set if condition == "manual" else random_set)
+                    ),
+                    "unique_behaviors": 0.0 if condition == "greedy" else float(
+                        unique_behaviors(manual_set if condition == "manual" else random_set)
+                    ),
+                }
+            )
 
     write_csv(out / "e2_summary.csv", rows)
     plot_bars(
@@ -371,12 +456,6 @@ def e2_baselines(
     return summary
 
 
-def result_layout_from_config(evolution_config: EvolutionConfig):
-    from .policy import GenomeLayout
-
-    return GenomeLayout(hidden_size=evolution_config.hidden_size)
-
-
 # ---------------------------------------------------------------------------
 # E3. Externality ablation
 # ---------------------------------------------------------------------------
@@ -398,7 +477,7 @@ def e3_externalities(
     ]
     rows: list[dict] = []
     run_records: list[dict] = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as shared_executor:
+    with _shared_executor() as shared_executor:
         for condition, enabled in conditions:
             train_city = replace(city_config, enable_externalities=enabled)
             matching_summaries: list[dict] = []
@@ -407,7 +486,7 @@ def e3_externalities(
                 print(f"  [E3] Training neuroevolution, seed={run_seed}...")
                 cfg = _run_config(evolution_config, run_seed)
                 result = EvolutionEngine(cfg, train_city, executor=shared_executor).run()
-                layout = result_layout_from_config(evolution_config)
+                layout = layout_from_config(evolution_config)
                 matching = evaluate_homogeneous(
                     lambda: NeuralPolicy(result.best_genome, layout), train_city, eval_seeds
                 )
@@ -425,7 +504,7 @@ def e3_externalities(
                         "full_damage": _summary_value(full, "damage_total"),
                     }
                 )
-                print(f"  [E3] seed {run_seed} training done. Evaluating...")
+                print(f"  [E3] seed {run_seed} done.")
             for eval_name, summaries in [
                 ("matching", matching_summaries),
                 ("full", full_summaries),
@@ -433,22 +512,16 @@ def e3_externalities(
                 metrics = {
                     key: _run_metric_summary(summaries, key)
                     for key in (
-                        "fitness",
-                        "profit",
-                        "city_quality",
-                        "damage_total",
-                        "damage_per_agent",
-                        "share_agents_causing_damage",
-                        "violations",
-                        "built_cells",
+                        "fitness", "profit", "city_quality", "mean_satisfaction",
+                        "damage_total", "damage_per_agent", "share_agents_causing_damage",
+                        "violations", "built_cells",
                     )
                 }
                 rows.append(
                     {
                         "condition": condition,
                         "eval_env": eval_name,
-                        **{f"{key}_mean": value["mean"] for key, value in metrics.items()},
-                        **{f"{key}_ci95": value["ci95"] for key, value in metrics.items()},
+                        **_metric_row(metrics, list(metrics)),
                     }
                 )
     write_csv(out / "e3_summary.csv", rows)
@@ -504,7 +577,7 @@ def e4_requirements(
     eval_seeds = _eval_seeds(9_200_000, eval_seed_count)
     profiles = ["soft", "medium", "hard"]
     rows: list[dict] = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as shared_executor:
+    with _shared_executor() as shared_executor:
         for train_profile in profiles:
             train_city = replace(
                 city_config, requirements=REQUIREMENT_PROFILES[train_profile]
@@ -514,7 +587,7 @@ def e4_requirements(
                 print(f"  [E4] Training profile={train_profile}, seed={run_seed}...")
                 cfg = _run_config(evolution_config, run_seed)
                 result = EvolutionEngine(cfg, train_city, executor=shared_executor).run()
-                layout = result_layout_from_config(evolution_config)
+                layout = layout_from_config(evolution_config)
                 for eval_profile in profiles:
                     eval_city = replace(
                         city_config, requirements=REQUIREMENT_PROFILES[eval_profile]
@@ -525,35 +598,26 @@ def e4_requirements(
                         eval_seeds,
                     )
                     per_eval_profile[eval_profile].append(summary)
-                print(f"  [E4] seed {run_seed} done. Evaluated.")
+                print(f"  [E4] seed {run_seed} done.")
             for eval_profile in profiles:
                 summaries = per_eval_profile[eval_profile]
                 metrics = {
                     key: _run_metric_summary(summaries, key)
                     for key in (
-                        "fitness",
-                        "profit",
-                        "city_quality",
-                        "green_share",
-                        "type_entropy",
-                        "accessibility",
-                        "violations",
-                        "damage_total",
-                        "built_cells",
+                        "fitness", "profit", "city_quality", "mean_satisfaction",
+                        "green_share", "type_entropy", "accessibility",
+                        "violations", "damage_total", "built_cells",
                     )
                 }
                 rows.append(
                     {
                         "trained_profile": train_profile,
                         "eval_profile": eval_profile,
-                        **{f"{key}_mean": value["mean"] for key, value in metrics.items()},
-                        **{f"{key}_ci95": value["ci95"] for key, value in metrics.items()},
+                        **_metric_row(metrics, list(metrics)),
                     }
                 )
     write_csv(out / "e4_summary.csv", rows)
-    diagonal = [
-        row for row in rows if row["trained_profile"] == row["eval_profile"]
-    ]
+    diagonal = [row for row in rows if row["trained_profile"] == row["eval_profile"]]
     plot_profit_quality(
         [
             {
@@ -567,24 +631,20 @@ def e4_requirements(
         "E4: profit vs city quality by requirement profile",
     )
     by_profile = {row["trained_profile"]: row for row in diagonal}
-    profit_soft = by_profile["soft"]["profit_mean"]
-    profit_medium = by_profile["medium"]["profit_mean"]
-    profit_hard = by_profile["hard"]["profit_mean"]
-    quality_soft = by_profile["soft"]["city_quality_mean"]
-    quality_medium = by_profile["medium"]["city_quality_mean"]
-    quality_hard = by_profile["hard"]["city_quality_mean"]
+    profit = {name: by_profile[name]["profit_mean"] for name in profiles}
+    quality = {name: by_profile[name]["city_quality_mean"] for name in profiles}
     hypotheses = {
-        "H2_profit_decreases": bool(profit_soft >= profit_medium >= profit_hard),
-        "H2_quality_increases": bool(quality_soft <= quality_medium <= quality_hard),
-        "H2_both_fall_at_hard": bool(
-            profit_hard < profit_medium and quality_hard < quality_medium
+        "H2_profit_decreases": bool(
+            profit["soft"] >= profit["medium"] >= profit["hard"]
         ),
-        "profit": {"soft": profit_soft, "medium": profit_medium, "hard": profit_hard},
-        "city_quality": {
-            "soft": quality_soft,
-            "medium": quality_medium,
-            "hard": quality_hard,
-        },
+        "H2_quality_increases": bool(
+            quality["soft"] <= quality["medium"] <= quality["hard"]
+        ),
+        "H2_both_fall_at_hard": bool(
+            profit["hard"] < profit["medium"] and quality["hard"] < quality["medium"]
+        ),
+        "profit": profit,
+        "city_quality": quality,
     }
     summary = {
         "experiment": "E4",
@@ -613,7 +673,7 @@ def e5_agents(
     out = ensure_dir(out_dir)
     eval_seeds = _eval_seeds(9_300_000, eval_seed_count)
     rows: list[dict] = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as shared_executor:
+    with _shared_executor() as shared_executor:
         for n_agents in n_values:
             sweep_city = replace(
                 city_config,
@@ -622,27 +682,25 @@ def e5_agents(
                 width=int(grid[1]),
             )
             summaries: list[dict] = []
+            layout = layout_from_config(evolution_config)
             for run_seed in seeds:
-                cfg = _run_config(evolution_config, run_seed)
-                result = EvolutionEngine(cfg, sweep_city, executor=shared_executor).run()
-                layout = result_layout_from_config(evolution_config)
-                summary = evaluate_homogeneous(
-                    lambda: NeuralPolicy(result.best_genome, layout),
-                    sweep_city,
-                    eval_seeds,
+                cfg = _ensure_evolution_feasible(
+                    _run_config(evolution_config, run_seed), int(n_agents)
                 )
-                summaries.append(summary)
+                result = EvolutionEngine(cfg, sweep_city, executor=shared_executor).run()
+                summaries.append(
+                    evaluate_homogeneous(
+                        lambda: NeuralPolicy(result.best_genome, layout),
+                        sweep_city,
+                        eval_seeds,
+                    )
+                )
             metrics = {
                 key: _run_metric_summary(summaries, key)
                 for key in (
-                    "fitness",
-                    "profit",
-                    "city_quality",
-                    "damage_total",
-                    "damage_per_agent",
-                    "share_agents_causing_damage",
-                    "violations",
-                    "built_cells",
+                    "fitness", "profit", "city_quality", "mean_satisfaction",
+                    "damage_total", "damage_per_agent", "share_agents_causing_damage",
+                    "violations", "built_cells",
                 )
             }
             built = max(1.0, metrics["built_cells"]["mean"])
@@ -650,8 +708,7 @@ def e5_agents(
                 {
                     "n_agents": int(n_agents),
                     "grid": f"{grid[0]}x{grid[1]}",
-                    **{f"{key}_mean": value["mean"] for key, value in metrics.items()},
-                    **{f"{key}_ci95": value["ci95"] for key, value in metrics.items()},
+                    **_metric_row(metrics, list(metrics)),
                     "damage_per_built": metrics["damage_total"]["mean"] / built,
                 }
             )
@@ -711,27 +768,21 @@ def e6_generalization(
     out = ensure_dir(out_dir)
     rows: list[dict] = []
     run_records: list[dict] = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as shared_executor:
+    with _shared_executor() as shared_executor:
         for run_seed in seeds:
             cfg = _run_config(evolution_config, run_seed)
             result = EvolutionEngine(cfg, city_config, executor=shared_executor).run()
             validation_seeds = _eval_seeds(cfg.validation_seed_base, eval_seed_count)
             test_seeds = _eval_seeds(cfg.test_seed_base, eval_seed_count)
             validation = evaluate_population(
-                result.population,
-                city_config,
-                cfg,
-                validation_seeds,
+                result.population, city_config, cfg, validation_seeds,
                 episodes_per_seed=episodes_per_seed,
             )
             test = evaluate_population(
-                result.population,
-                city_config,
-                cfg,
-                test_seeds,
+                result.population, city_config, cfg, test_seeds,
                 episodes_per_seed=episodes_per_seed,
             )
-            layout = result_layout_from_config(evolution_config)
+            layout = layout_from_config(evolution_config)
             best_test = evaluate_homogeneous(
                 lambda: NeuralPolicy(result.best_genome, layout),
                 city_config,
@@ -748,27 +799,19 @@ def e6_generalization(
                     "best_homogeneous_test": _summary_value(best_test, "fitness"),
                 }
             )
-    rows.append(
-        {
-            "condition": "train",
-            "fitness_mean": _stats([r["train_mean"] for r in run_records])["mean"],
-            "fitness_ci95": _stats([r["train_mean"] for r in run_records])["ci95"],
-        }
-    )
-    rows.append(
-        {
-            "condition": "validation",
-            "fitness_mean": _stats([r["validation_mean"] for r in run_records])["mean"],
-            "fitness_ci95": _stats([r["validation_mean"] for r in run_records])["ci95"],
-        }
-    )
-    rows.append(
-        {
-            "condition": "test",
-            "fitness_mean": _stats([r["test_mean"] for r in run_records])["mean"],
-            "fitness_ci95": _stats([r["test_mean"] for r in run_records])["ci95"],
-        }
-    )
+    for condition, key in [
+        ("train", "train_mean"),
+        ("validation", "validation_mean"),
+        ("test", "test_mean"),
+    ]:
+        stats = _stats([r[key] for r in run_records])
+        rows.append(
+            {
+                "condition": condition,
+                "fitness_mean": stats["mean"],
+                "fitness_ci95": stats["ci95"],
+            }
+        )
     write_csv(out / "e6_summary.csv", rows)
     plot_bars(
         [row["condition"] for row in rows],
@@ -803,7 +846,7 @@ def e7_diversity(
     out = ensure_dir(out_dir)
     rows: list[dict] = []
     curves: dict[str, list[list[dict]]] = {}
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as shared_executor:
+    with _shared_executor() as shared_executor:
         for condition, use_sharing in [("sharing_on", True), ("sharing_off", False)]:
             histories: list[list[dict]] = []
             best_values = []
@@ -866,4 +909,348 @@ def e7_diversity(
         "hypotheses": hypotheses,
     }
     write_json(out / "e7_summary.json", summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# E8. Emergent districts
+# ---------------------------------------------------------------------------
+
+
+def e8_districts(
+    evolution_config: EvolutionConfig,
+    city_config: CityConfig,
+    seeds: Sequence[int],
+    out_dir: str | Path,
+    eval_seed_count: int = 5,
+) -> dict:
+    out = ensure_dir(out_dir)
+    eval_seeds = _eval_seeds(9_500_000, eval_seed_count)
+    cfg_base = replace(evolution_config, track_spatial=True, spatial_every=5)
+    layout = layout_from_config(cfg_base)
+    rows: list[dict] = []
+    histories: list[list[dict]] = []
+    with _shared_executor() as shared_executor:
+        for run_seed in seeds:
+            cfg = _run_config(cfg_base, run_seed)
+            result = EvolutionEngine(cfg, city_config, executor=shared_executor).run()
+            histories.append(result.history)
+            for eval_seed in eval_seeds:
+                policies = [
+                    NeuralPolicy(result.best_genome, layout)
+                    for _ in range(city_config.n_agents)
+                ]
+                episode = run_episode(city_config, policies, int(eval_seed))
+                spatial = spatial_metrics(episode.type_grid)
+                rows.append(
+                    {
+                        "seed": int(run_seed),
+                        "eval_seed": int(eval_seed),
+                        "city_quality": episode.city.city_quality,
+                        "mean_satisfaction": episode.city.mean_satisfaction,
+                        "green_share": episode.city.green_share,
+                        **spatial,
+                    }
+                )
+            print(f"  [E8] seed {run_seed} done.")
+    write_csv(out / "e8_summary.csv", rows)
+    metrics = {
+        key: _stats([row[key] for row in rows])
+        for key in ("morans_i", "local_entropy", "cluster_count", "green_share", "city_quality", "mean_satisfaction")
+    }
+    aggregate = _aggregate_history(
+        histories, ["morans_i", "local_entropy", "cluster_count", "snapshot_satisfaction"]
+    )
+    write_csv(out / "e8_history.csv", aggregate)
+    gens = [row["gen"] for row in aggregate]
+    plot_metric_vs_x(
+        gens,
+        {
+            "Moran's I": (
+                [row["morans_i_mean"] for row in aggregate],
+                [row["morans_i_ci95"] for row in aggregate],
+            ),
+            "local entropy": (
+                [row["local_entropy_mean"] for row in aggregate],
+                [row["local_entropy_ci95"] for row in aggregate],
+            ),
+        },
+        out / "e8_spatial.png",
+        "generation",
+        "spatial structure",
+        "E8: emergent districts",
+    )
+    summary = {
+        "experiment": "E8",
+        "eval_seeds": eval_seeds,
+        "metrics": metrics,
+        "rows": rows,
+        "hypothesis": {
+            "H4_clustering": bool(metrics["morans_i"]["mean"] > 0.10),
+            "morans_i": metrics["morans_i"]["mean"],
+            "local_entropy": metrics["local_entropy"]["mean"],
+        },
+    }
+    write_json(out / "e8_summary.json", summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# E9. Path dependence
+# ---------------------------------------------------------------------------
+
+
+def e9_path_dependence(
+    evolution_config: EvolutionConfig,
+    city_config: CityConfig,
+    seeds: Sequence[int],
+    out_dir: str | Path,
+    paths: int = 10,
+) -> dict:
+    out = ensure_dir(out_dir)
+    if not seeds:
+        raise ValueError("E9 needs at least one training seed")
+    train_seed = int(seeds[0])
+    cfg = _run_config(evolution_config, train_seed)
+    result = EvolutionEngine(cfg, city_config).run()
+    layout = layout_from_config(evolution_config)
+    city_seed = 9_400_000
+    distributions = []
+    grids = []
+    rows = []
+    for index in range(paths):
+        rng_seed = int(seeds[index % len(seeds)]) * 1000 + index + 1
+        policies = [
+            NeuralPolicy(result.best_genome, layout)
+            for _ in range(city_config.n_agents)
+        ]
+        episode = run_episode(
+            city_config, policies, city_seed, rng_seed=rng_seed
+        )
+        distribution = type_distribution(episode.type_grid)
+        distributions.append(distribution)
+        grids.append(episode.type_grid)
+        rows.append(
+            {
+                "path": index,
+                "rng_seed": rng_seed,
+                "city_quality": episode.city.city_quality,
+                "mean_satisfaction": episode.city.mean_satisfaction,
+                "type_distribution": "|".join(f"{x:.4f}" for x in distribution),
+            }
+        )
+    taus = []
+    distances = []
+    for i in range(paths):
+        for j in range(i + 1, paths):
+            taus.append(kendall_tau(distributions[i], distributions[j]))
+            distances.append(grid_distance(grids[i], grids[j]))
+    unique_grids = len({g.tobytes() for g in grids})
+    np.savez(
+        out / "e9_grids.npz",
+        **{f"path_{i}": grid for i, grid in enumerate(grids)},
+    )
+    matrix = np.array(distributions)
+    plot_distribution_matrix(
+        matrix,
+        [f"path {i}" for i in range(paths)],
+        out / "e9_distributions.png",
+        "E9: final type distribution by path",
+    )
+    write_csv(out / "e9_summary.csv", rows)
+    summary = {
+        "experiment": "E9",
+        "train_seed": train_seed,
+        "city_seed": city_seed,
+        "paths": paths,
+        "kendall_tau": _stats(taus),
+        "grid_distance": _stats(distances),
+        "unique_final_grids": unique_grids,
+        "hypothesis": {
+            "H5_path_dependence": bool(
+                _stats(taus)["mean"] < 0.90 or _stats(distances)["mean"] > 0.20
+            ),
+        },
+        "rows": rows,
+    }
+    write_json(out / "e9_summary.json", summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# E10. Regulation
+# ---------------------------------------------------------------------------
+
+
+def e10_regulation(
+    evolution_config: EvolutionConfig,
+    city_config: CityConfig,
+    seeds: Sequence[int],
+    out_dir: str | Path,
+    eval_seed_count: int = 5,
+) -> dict:
+    out = ensure_dir(out_dir)
+    eval_seeds = _eval_seeds(9_600_000, eval_seed_count)
+    scenarios = ["no_tax", "property_tax_5", "industry_tax_10", "green_subsidy", "affordable_quota"]
+    rows: list[dict] = []
+    with _shared_executor() as shared_executor:
+        for scenario in scenarios:
+            regulation = REGULATION_SCENARIOS[scenario]
+            train_city = replace(city_config, regulation=regulation)
+            summaries = []
+            for run_seed in seeds:
+                cfg = _run_config(evolution_config, run_seed)
+                result = EvolutionEngine(cfg, train_city, executor=shared_executor).run()
+                layout = layout_from_config(evolution_config)
+                summaries.append(
+                    evaluate_homogeneous(
+                        lambda: NeuralPolicy(result.best_genome, layout),
+                        train_city,
+                        eval_seeds,
+                    )
+                )
+            metrics = {
+                key: _run_metric_summary(summaries, key)
+                for key in (
+                    "fitness", "profit", "city_quality", "mean_satisfaction",
+                    "green_share", "affordable_share", "tax_revenue",
+                    "subsidy_total", "violations", "built_cells",
+                )
+            }
+            rows.append(
+                {
+                    "condition": scenario,
+                    **_metric_row(metrics, list(metrics)),
+                }
+            )
+            print(f"  [E10] scenario {scenario} done.")
+    write_csv(out / "e10_summary.csv", rows)
+    plot_profit_satisfaction(
+        rows, out / "e10_profit_satisfaction.png", "E10: regulation scenarios"
+    )
+    plot_bars(
+        [row["condition"] for row in rows],
+        [row["green_share_mean"] for row in rows],
+        [row["green_share_ci95"] for row in rows],
+        out / "e10_green_share.png",
+        "green share",
+        "E10: green share by regulation",
+    )
+    summary = {
+        "experiment": "E10",
+        "rows": rows,
+        "hypothesis": {
+            "green_subsidy_raises_green": bool(
+                next(r for r in rows if r["condition"] == "green_subsidy")["green_share_mean"]
+                > next(r for r in rows if r["condition"] == "no_tax")["green_share_mean"]
+            ),
+            "taxes_reduce_profit": bool(
+                next(r for r in rows if r["condition"] == "property_tax_5")["profit_mean"]
+                < next(r for r in rows if r["condition"] == "no_tax")["profit_mean"]
+            ),
+        },
+    }
+    write_json(out / "e10_summary.json", summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# E11. Shocks and resilience
+# ---------------------------------------------------------------------------
+
+
+def e11_shocks(
+    evolution_config: EvolutionConfig,
+    city_config: CityConfig,
+    seeds: Sequence[int],
+    out_dir: str | Path,
+    eval_seed_count: int = 5,
+) -> dict:
+    out = ensure_dir(out_dir)
+    eval_seeds = _eval_seeds(9_700_000, eval_seed_count)
+    shock_round = max(1, city_config.actions_per_agent // 2)
+    shock_specs = [
+        ("no_shock", []),
+        ("industry_removal", [{"round": shock_round, "kind": "industry_removal", "magnitude": 0.5}]),
+        ("population_boom", [{"round": shock_round, "kind": "population_boom", "magnitude": 200}]),
+        ("earthquake", [{"round": shock_round, "kind": "earthquake", "magnitude": 0.20}]),
+    ]
+    layout = layout_from_config(evolution_config)
+    neural_genomes = []
+    with _shared_executor() as shared_executor:
+        for run_seed in seeds:
+            cfg = _run_config(evolution_config, run_seed)
+            result = EvolutionEngine(cfg, city_config, executor=shared_executor).run()
+            neural_genomes.append(result.best_genome)
+    conditions: dict[str, Callable[[], object]] = {
+        "neural": lambda: NeuralPolicy(neural_genomes[0], layout),
+        "greedy": lambda: GreedyPolicy(),
+        "manual": lambda: ManualPolicy(),
+    }
+    # For neural, average over all trained genomes by running each genome on a
+    # subset of evaluation seeds; baselines use the same seeds.
+    rows: list[dict] = []
+    for condition, factory in conditions.items():
+        for shock_name, shocks in shock_specs:
+            metrics = []
+            for i, eval_seed in enumerate(eval_seeds):
+                if condition == "neural":
+                    genome = neural_genomes[i % len(neural_genomes)]
+                    policies = [
+                        NeuralPolicy(genome, layout)
+                        for _ in range(city_config.n_agents)
+                    ]
+                else:
+                    policies = [factory() for _ in range(city_config.n_agents)]
+                episode = run_episode(
+                    city_config,
+                    policies,
+                    int(eval_seed),
+                    record_history=True,
+                    shocks=shocks,
+                )
+                resilience = resilience_metrics(episode.history, shock_round)
+                metrics.append(
+                    {
+                        "recovery": resilience["recovery"],
+                        "drop": resilience["drop"],
+                        "final_quality": episode.city.city_quality,
+                        "final_satisfaction": episode.city.mean_satisfaction,
+                        "final_profit": float(np.mean([a.profit for a in episode.agents])),
+                    }
+                )
+            rows.append(
+                {
+                    "condition": condition,
+                    "shock": shock_name,
+                    "recovery_mean": _stats([m["recovery"] for m in metrics])["mean"],
+                    "recovery_ci95": _stats([m["recovery"] for m in metrics])["ci95"],
+                    "drop_mean": _stats([m["drop"] for m in metrics])["mean"],
+                    "final_quality_mean": _stats([m["final_quality"] for m in metrics])["mean"],
+                    "final_satisfaction_mean": _stats([m["final_satisfaction"] for m in metrics])["mean"],
+                    "final_profit_mean": _stats([m["final_profit"] for m in metrics])["mean"],
+                }
+            )
+    write_csv(out / "e11_summary.csv", rows)
+    labels = [f"{row['condition']}\n{row['shock']}" for row in rows]
+    plot_bars(
+        labels,
+        [row["recovery_mean"] for row in rows],
+        [row["recovery_ci95"] for row in rows],
+        out / "e11_recovery.png",
+        "recovery ratio",
+        "E11: resilience to shocks",
+    )
+    summary = {
+        "experiment": "E11",
+        "shock_round": shock_round,
+        "rows": rows,
+        "hypothesis": {
+            "H6_neural_more_resilient": bool(
+                next(r for r in rows if r["condition"] == "neural" and r["shock"] == "earthquake")["recovery_mean"]
+                > next(r for r in rows if r["condition"] == "greedy" and r["shock"] == "earthquake")["recovery_mean"]
+            ),
+        },
+    }
+    write_json(out / "e11_summary.json", summary)
     return summary

@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import numpy as np
-from numba import njit
+
+try:  # numba is optional at runtime, but strongly recommended
+    from numba import njit
+except Exception:  # pragma: no cover - exercised only without numba
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+
+        if args and callable(args[0]):
+            return args[0]
+        return decorator
 
 
-#@njit(cache=True)
+@njit(cache=True)
 def _box_sum_numba(a, radius):
     h, w = a.shape
     integral = np.zeros((h + 1, w + 1), dtype=np.float64)
-    
-    # cumsum по строкам и столбцам
     for i in range(h):
         row_sum = 0.0
         for j in range(w):
@@ -26,22 +34,29 @@ def _box_sum_numba(a, radius):
             x0 = max(0, x - radius)
             x1 = min(w, x + radius + 1)
             result[y, x] = (
-                integral[y1, x1] - integral[y0, x1] 
-                - integral[y1, x0] + integral[y0, x0]
+                integral[y1, x1]
+                - integral[y0, x1]
+                - integral[y1, x0]
+                + integral[y0, x0]
             )
     return result
 
+
 def box_sum(values: np.ndarray, radius: int) -> np.ndarray:
-    """Сумма по квадрату (2r+1)x(2r+1) с обрезкой по краям."""
-    a = np.asarray(values, dtype=np.float64)
-    return _box_sum_numba(a, radius)
+    """Sum over a (2r+1)x(2r+1) square, clipped at the boundary."""
+    a = np.ascontiguousarray(values, dtype=np.float64)
+    return _box_sum_numba(a, int(radius))
+
+
+def box_mean(values: np.ndarray, radius: int) -> np.ndarray:
+    a = np.ascontiguousarray(values, dtype=np.float64)
+    ones = np.ones_like(a)
+    return box_sum(a, radius) / np.maximum(1.0, box_sum(ones, radius))
 
 
 def smooth(values: np.ndarray, radius: int = 1) -> np.ndarray:
     """Boundary-aware box blur."""
-    a = np.asarray(values, dtype=np.float64)
-    ones = np.ones_like(a)
-    return box_sum(a, radius) / np.maximum(1.0, box_sum(ones, radius))
+    return box_mean(values, radius)
 
 
 def normalise01(values: np.ndarray) -> np.ndarray:
@@ -96,7 +111,7 @@ def make_static_layers(rng: np.random.Generator, height: int, width: int) -> dic
         scale_x = rng.uniform(0.9, 2.0)
         water += np.exp(
             -((yy - blob_y) ** 2) / (2 * scale_y**2)
-            -((xx - blob_x) ** 2) / (2 * scale_x**2)
+            - ((xx - blob_x) ** 2) / (2 * scale_x**2)
         )
     water = np.clip(water, 0.0, 1.0)
     water_threshold = max(0.55, float(np.quantile(water, 0.82)))
@@ -137,6 +152,16 @@ def make_static_layers(rng: np.random.Generator, height: int, width: int) -> dic
         "buildable": buildable.astype(np.float64),
         "road_mask": road_mask,
     }
+
+
+def district_ids(height: int, width: int, size: int = 3) -> tuple[np.ndarray, int]:
+    """Return a district label grid and the number of districts."""
+    yy, xx = np.mgrid[0:height, 0:width]
+    labels = (yy // size) * ((width + size - 1) // size) + (xx // size)
+    labels = labels.astype(np.int64)
+    # Compact labels in case the last district row/column is partial.
+    unique, inverse = np.unique(labels, return_inverse=True)
+    return inverse.reshape(height, width).astype(np.int64), int(unique.size)
 
 
 def incompatible_edges(type_grid: np.ndarray) -> tuple[int, int]:

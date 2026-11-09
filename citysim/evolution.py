@@ -1,15 +1,17 @@
 """Population-level neuroevolution: islands, tournament, sharing, migration."""
 
 from __future__ import annotations
+
 import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from .config import CityConfig, EvolutionConfig
+from .config import BEHAVIOR_DIM, CityConfig, EvolutionConfig
 from .episode import EpisodeResult, run_episode, score_episode
+from .metrics import spatial_metrics
 from .policy import (
     GenomeLayout,
     GreedyPolicy,
@@ -21,14 +23,23 @@ from .policy import (
     random_genome,
 )
 
+
+def layout_from_config(config: EvolutionConfig) -> GenomeLayout:
+    return GenomeLayout(
+        hidden_size=config.hidden_size,
+        attention_dim=config.attention_dim,
+        district_hidden=config.district_hidden,
+        global_hidden=config.global_hidden,
+    )
+
+
 def _run_episode_worker(genomes, city_config, seed, layout):
-    from .policy import NeuralPolicy
+    """Top-level worker used by the process pool."""
     policies = [NeuralPolicy(g, layout) for g in genomes]
-    from .episode import run_episode, score_episode
     result = run_episode(city_config, policies, seed)
     scores = score_episode(result, city_config.fitness)
     behaviors = [a.behavior for a in result.agents]
-    return scores, behaviors
+    return scores, behaviors, result.city
 
 
 @dataclass
@@ -37,7 +48,9 @@ class Individual:
     island: int = 0
     fitness: float = -1e18
     shaped_fitness: float = -1e18
-    behavior: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    behavior: np.ndarray = field(
+        default_factory=lambda: np.zeros(BEHAVIOR_DIM, dtype=np.float64)
+    )
     episodes: int = 0
 
 
@@ -52,6 +65,7 @@ class EvolutionResult:
     best_behavior: np.ndarray
     best_generation: int
     hall_of_fame: list[tuple[int, float, np.ndarray]]
+    archive: dict[tuple[int, int], Individual] = field(default_factory=dict)
 
 
 def balanced_episode_indices(
@@ -90,7 +104,12 @@ def unique_behaviors(points: np.ndarray, decimals: int = 2) -> int:
 
 
 class EvolutionEngine:
-    def __init__(self, config: EvolutionConfig, city_config: CityConfig, executor=None):
+    def __init__(
+        self,
+        config: EvolutionConfig,
+        city_config: CityConfig,
+        executor: ProcessPoolExecutor | None = None,
+    ):
         if config.episodes_per_generation * city_config.n_agents < config.population_size:
             raise ValueError(
                 "episodes_per_generation * n_agents must be >= population_size "
@@ -98,7 +117,7 @@ class EvolutionEngine:
             )
         self.config = config
         self.city_config = city_config
-        self.layout = GenomeLayout(hidden_size=config.hidden_size)
+        self.layout = layout_from_config(config)
         self.rng = np.random.default_rng(config.seed)
         self.sigma = float(config.mutation_sigma)
         self.generation = 0
@@ -111,59 +130,71 @@ class EvolutionEngine:
             for i in range(config.population_size)
         ]
         self.history: list[dict] = []
+        self.archive: dict[tuple[int, int], Individual] = {}
+        self._last_city_metrics: dict[str, float] = {}
         self.best_ever = -1e18
         self.best_ever_genome: np.ndarray | None = None
-        self.best_ever_behavior: np.ndarray = np.zeros(3)
+        self.best_ever_behavior: np.ndarray = np.zeros(BEHAVIOR_DIM)
         self.best_ever_generation = -1
         self.hall_of_fame: list[tuple[int, float, np.ndarray]] = []
-        self._own_executor = executor is None
-        self.executor = executor if executor is not None else ProcessPoolExecutor(max_workers=os.cpu_count())
+
+        self._own_executor = False
+        self.executor = executor
+        if self.executor is None and config.use_parallel:
+            self.executor = ProcessPoolExecutor(
+                max_workers=min(8, os.cpu_count() or 1)
+            )
+            self._own_executor = True
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     def run(self) -> EvolutionResult:
-        for gen in range(self.config.generations):
-            self.generation = gen
-            self._evaluate_generation(gen)
-            row = self._log_generation(gen)
-            self.history.append(row)
-            if self.config.verbose and (
-                gen % max(1, self.config.log_every) == 0
-                or gen == self.config.generations - 1
-            ):
-                print(
-                    f"[gen {gen:4d}] best={row['best']:.4f} "
-                    f"mean={row['mean']:.4f} div={row['diversity']:.4f} "
-                    f"sigma={row['sigma']:.4f} best_ever={row['best_ever']:.4f}"
+        try:
+            for gen in range(self.config.generations):
+                self.generation = gen
+                self._evaluate_generation(gen)
+                row = self._log_generation(gen)
+                self.history.append(row)
+                if self.config.verbose and (
+                    gen % max(1, self.config.log_every) == 0
+                    or gen == self.config.generations - 1
+                ):
+                    print(
+                        f"[gen {gen:4d}] best={row['best']:.4f} "
+                        f"mean={row['mean']:.4f} div={row['diversity']:.4f} "
+                        f"sigma={row['sigma']:.4f} best_ever={row['best_ever']:.4f}"
+                    )
+                if gen == self.config.generations - 1:
+                    break
+                self._select()
+                if (
+                    self.config.use_islands
+                    and self.config.migration_interval > 0
+                    and (gen + 1) % self.config.migration_interval == 0
+                ):
+                    self._migrate()
+                if (
+                    self.config.fresh_blood_interval > 0
+                    and (gen + 1) % self.config.fresh_blood_interval == 0
+                ):
+                    self._fresh_blood()
+                self.sigma = max(
+                    self.config.min_sigma, self.sigma * self.config.sigma_decay
                 )
-            if gen == self.config.generations - 1:
-                break
-            self._select()
-            if (
-                self.config.use_islands
-                and self.config.migration_interval > 0
-                and (gen + 1) % self.config.migration_interval == 0
-            ):
-                self._migrate()
-            if (
-                self.config.fresh_blood_interval > 0
-                and (gen + 1) % self.config.fresh_blood_interval == 0
-            ):
-                self._fresh_blood()
-            self.sigma = max(
-                self.config.min_sigma, self.sigma * self.config.sigma_decay
-            )
 
-        if self.best_ever_genome is None:
-            best = max(self.population, key=lambda ind: ind.fitness)
-            self.best_ever = best.fitness
-            self.best_ever_genome = best.genome.copy()
-            self.best_ever_behavior = best.behavior.copy()
-            self.best_ever_generation = self.generation
-        if self._own_executor:
-            self.executor.shutdown(wait=True)
+            if self.best_ever_genome is None:
+                best = max(self.population, key=lambda ind: ind.fitness)
+                self.best_ever = best.fitness
+                self.best_ever_genome = best.genome.copy()
+                self.best_ever_behavior = best.behavior.copy()
+                self.best_ever_generation = self.generation
+        finally:
+            if self._own_executor and self.executor is not None:
+                self.executor.shutdown(wait=True)
+                self.executor = None
+
         return EvolutionResult(
             evolution_config=self.config,
             city_config=self.city_config,
@@ -174,6 +205,7 @@ class EvolutionEngine:
             best_behavior=self.best_ever_behavior.copy(),
             best_generation=int(self.best_ever_generation),
             hall_of_fame=list(self.hall_of_fame),
+            archive=dict(self.archive),
         )
 
     # ------------------------------------------------------------------
@@ -189,31 +221,66 @@ class EvolutionEngine:
             cfg.episodes_per_generation,
         )
         fitness_sum = np.zeros(cfg.population_size, dtype=np.float64)
-        behavior_sum = np.zeros((cfg.population_size, 3), dtype=np.float64)
+        behavior_sum = np.zeros((cfg.population_size, BEHAVIOR_DIM), dtype=np.float64)
         appearances = np.zeros(cfg.population_size, dtype=np.int64)
+        city_keys = (
+            "city_quality",
+            "mean_satisfaction",
+            "rich_satisfaction",
+            "poor_satisfaction",
+            "gini_satisfaction",
+            "mean_utilization",
+            "population",
+            "green_share",
+            "externality_damage_total",
+            "bankrupt_agents",
+        )
+        city_sum = {key: 0.0 for key in city_keys}
+        city_episodes = 0
 
-        # Подготовка задач для параллельного запуска
-        # Подготовка задач
         tasks = []
         for episode_idx, devs in enumerate(episodes):
             seed = cfg.train_seed_base + gen * cfg.episodes_per_generation + episode_idx
             genomes = [self.population[int(idx)].genome for idx in devs]
             tasks.append((genomes, seed))
-            
-        # Параллельный запуск в постоянном пуле
-        futures = [
-            self.executor.submit(_run_episode_worker, genomes, self.city_config, seed, self.layout)
-            for genomes, seed in tasks
-        ]
-        results = [f.result() for f in futures]
-        
-        for (scores, behaviors), devs in zip(results, episodes):
+
+        if self.executor is not None:
+            futures = [
+                self.executor.submit(
+                    _run_episode_worker,
+                    genomes,
+                    self.city_config,
+                    seed,
+                    self.layout,
+                )
+                for genomes, seed in tasks
+            ]
+            results = [future.result() for future in futures]
+        else:
+            results = [
+                _run_episode_worker(
+                    genomes, self.city_config, seed, self.layout
+                )
+                for genomes, seed in tasks
+            ]
+
+        for (scores, behaviors, city), devs in zip(results, episodes):
+            city_episodes += 1
+            for key in city_keys:
+                city_sum[key] += float(getattr(city, key))
             for slot, idx in enumerate(devs):
                 idx = int(idx)
                 fitness_sum[idx] += float(scores[slot])
-                behavior_sum[idx] += np.array(behaviors[slot])
+                behavior_sum[idx] += np.asarray(behaviors[slot], dtype=np.float64)
                 appearances[idx] += 1
-        
+
+        if city_episodes:
+            self._last_city_metrics = {
+                key: city_sum[key] / city_episodes for key in city_keys
+            }
+        else:
+            self._last_city_metrics = {key: 0.0 for key in city_keys}
+
         for i, ind in enumerate(self.population):
             ind.episodes = int(appearances[i])
             if appearances[i] > 0:
@@ -221,9 +288,10 @@ class EvolutionEngine:
                 ind.behavior = behavior_sum[i] / appearances[i]
             else:
                 ind.fitness = -1e18
-                ind.behavior = np.zeros(3)
+                ind.behavior = np.zeros(BEHAVIOR_DIM)
 
         self._apply_fitness_sharing()
+        self._update_archive()
 
         best = max(self.population, key=lambda ind: ind.fitness)
         if best.fitness > self.best_ever:
@@ -241,7 +309,6 @@ class EvolutionEngine:
             for ind in self.population:
                 ind.shaped_fitness = ind.fitness
             return
-        groups: list[list[int]]
         if cfg.use_islands:
             groups = [
                 [i for i, ind in enumerate(self.population) if ind.island == island]
@@ -259,6 +326,24 @@ class EvolutionEngine:
             for local, idx in enumerate(group):
                 self.population[idx].shaped_fitness = (
                     self.population[idx].fitness - float(penalties[local])
+                )
+
+    def _update_archive(self) -> None:
+        if not self.config.use_map_elites:
+            return
+        bins = self.config.map_elites_bins
+        for ind in self.population:
+            d_bucket = int(np.clip(ind.behavior[0] * bins, 0, bins - 1))
+            g_bucket = int(np.clip(ind.behavior[3] * bins, 0, bins - 1))
+            key = (d_bucket, g_bucket)
+            current = self.archive.get(key)
+            if current is None or ind.fitness > current.fitness:
+                self.archive[key] = Individual(
+                    genome=ind.genome.copy(),
+                    island=ind.island,
+                    fitness=ind.fitness,
+                    shaped_fitness=ind.shaped_fitness,
+                    behavior=ind.behavior.copy(),
                 )
 
     # ------------------------------------------------------------------
@@ -280,9 +365,7 @@ class EvolutionEngine:
             base_elites = cfg.elites // cfg.islands
             extra = cfg.elites % cfg.islands
             for island in range(cfg.islands):
-                members = [
-                    ind for ind in self.population if ind.island == island
-                ]
+                members = [ind for ind in self.population if ind.island == island]
                 members.sort(key=lambda ind: ind.fitness, reverse=True)
                 elite_count = base_elites + (1 if island < extra else 0)
                 elite_count = min(elite_count, len(members))
@@ -350,7 +433,7 @@ class EvolutionEngine:
             worst.genome = best_by_island[src % len(best_by_island)].genome.copy()
             worst.fitness = -1e18
             worst.shaped_fitness = -1e18
-            worst.behavior = np.zeros(3)
+            worst.behavior = np.zeros(BEHAVIOR_DIM)
             worst.episodes = 0
 
     def _fresh_blood(self) -> None:
@@ -367,7 +450,7 @@ class EvolutionEngine:
                 ind.genome = random_genome(self.rng, self.layout)
                 ind.fitness = -1e18
                 ind.shaped_fitness = -1e18
-                ind.behavior = np.zeros(3)
+                ind.behavior = np.zeros(BEHAVIOR_DIM)
                 ind.episodes = 0
 
     # ------------------------------------------------------------------
@@ -378,7 +461,7 @@ class EvolutionEngine:
         fitness = np.array([ind.fitness for ind in self.population], dtype=np.float64)
         shaped = np.array([ind.shaped_fitness for ind in self.population], dtype=np.float64)
         behaviors = np.array([ind.behavior for ind in self.population], dtype=np.float64)
-        return {
+        row = {
             "gen": gen,
             "best": float(fitness.max()),
             "mean": float(fitness.mean()),
@@ -389,7 +472,50 @@ class EvolutionEngine:
             "unique_behaviors": unique_behaviors(behaviors),
             "sigma": float(self.sigma),
             "best_ever": float(self.best_ever),
+            "best_green_share": float(behaviors[:, 3].max()),
+            "archive_coverage": float(len(self.archive)),
         }
+        city = self._last_city_metrics
+        row.update(
+            {
+                "eval_city_quality": float(city.get("city_quality", 0.0)),
+                "eval_satisfaction": float(city.get("mean_satisfaction", 0.0)),
+                "eval_rich_satisfaction": float(city.get("rich_satisfaction", 0.0)),
+                "eval_poor_satisfaction": float(city.get("poor_satisfaction", 0.0)),
+                "eval_gini_satisfaction": float(city.get("gini_satisfaction", 0.0)),
+                "eval_utilization": float(city.get("mean_utilization", 0.0)),
+                "eval_population": float(city.get("population", 0.0)),
+                "eval_green_share": float(city.get("green_share", 0.0)),
+                "eval_damage": float(city.get("externality_damage_total", 0.0)),
+                "eval_bankrupt_agents": float(city.get("bankrupt_agents", 0.0)),
+            }
+        )
+        if (
+            self.config.track_spatial
+            and (gen % max(1, self.config.spatial_every) == 0
+                 or gen == self.config.generations - 1)
+        ):
+            row.update(self._spatial_snapshot())
+        return row
+
+    def _spatial_snapshot(self) -> dict[str, float]:
+        if self.best_ever_genome is None:
+            return {}
+        best = max(self.population, key=lambda ind: ind.fitness)
+        policies = [
+            NeuralPolicy(best.genome, self.layout)
+            for _ in range(self.city_config.n_agents)
+        ]
+        result = run_episode(
+            self.city_config,
+            policies,
+            seed=self.config.validation_seed_base + 777,
+            rng_seed=self.config.seed + 8888,
+        )
+        metrics = spatial_metrics(result.type_grid)
+        metrics["snapshot_satisfaction"] = result.city.mean_satisfaction
+        metrics["snapshot_quality"] = result.city.city_quality
+        return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +548,9 @@ def evaluate_population(
     k = len(population)
     n = city_config.n_agents
     episodes = episodes_per_seed or max(1, int(np.ceil(k / n)))
-    layout = GenomeLayout(hidden_size=evolution_config.hidden_size)
+    layout = layout_from_config(evolution_config)
     fitness_sum = np.zeros(k, dtype=np.float64)
-    behavior_sum = np.zeros((k, 3), dtype=np.float64)
+    behavior_sum = np.zeros((k, BEHAVIOR_DIM), dtype=np.float64)
     appearance = np.zeros(k, dtype=np.int64)
     per_seed: list[dict] = []
 
@@ -432,6 +558,7 @@ def evaluate_population(
         rng = np.random.default_rng((int(seed) * 6_364_136_223 + 0x1234) % (2**63))
         assignments = balanced_episode_indices(rng, k, n, episodes)
         seed_scores: list[float] = []
+        seed_cities = []
         for ep, devs in enumerate(assignments):
             episode_seed = int(seed) * 1000 + ep
             policies = [
@@ -440,6 +567,7 @@ def evaluate_population(
             result = run_episode(city_config, policies, episode_seed)
             scores = score_episode(result)
             seed_scores.extend(float(x) for x in scores)
+            seed_cities.append(result.city)
             for slot, idx in enumerate(devs):
                 idx = int(idx)
                 fitness_sum[idx] += float(scores[slot])
@@ -450,11 +578,15 @@ def evaluate_population(
                 "seed": int(seed),
                 "fitness_mean": float(np.mean(seed_scores)),
                 "fitness_std": float(np.std(seed_scores, ddof=1)) if len(seed_scores) > 1 else 0.0,
+                "city_quality": float(np.mean([c.city_quality for c in seed_cities])),
+                "mean_satisfaction": float(np.mean([c.mean_satisfaction for c in seed_cities])),
+                "green_share": float(np.mean([c.green_share for c in seed_cities])),
+                "damage_total": float(np.mean([c.externality_damage_total for c in seed_cities])),
             }
         )
 
     per_individual = np.full(k, np.nan, dtype=np.float64)
-    per_behavior = np.full((k, 3), np.nan, dtype=np.float64)
+    per_behavior = np.full((k, BEHAVIOR_DIM), np.nan, dtype=np.float64)
     for i in range(k):
         if appearance[i] > 0:
             per_individual[i] = fitness_sum[i] / appearance[i]
@@ -508,6 +640,8 @@ def evaluate_league(
                 "fitness": float(scores[slot]),
                 "profit": float(focal.profit),
                 "city_quality": float(result.city.city_quality),
+                "mean_satisfaction": float(result.city.mean_satisfaction),
+                "gini_satisfaction": float(result.city.gini_satisfaction),
                 "green_share": float(result.city.green_share),
                 "green_component": float(result.city.green_component),
                 "type_entropy": float(result.city.type_entropy),
@@ -519,6 +653,9 @@ def evaluate_league(
                 "share_agents_causing_damage": float(result.city.share_agents_causing_damage),
                 "gini_profit": float(result.city.gini_profit),
                 "built_cells": int(result.city.built_cells),
+                "tax_revenue": float(result.city.tax_revenue),
+                "subsidy_total": float(result.city.subsidy_total),
+                "bankrupt_agents": int(result.city.bankrupt_agents),
                 "behavior": focal.behavior.tolist(),
             }
         )
@@ -526,6 +663,8 @@ def evaluate_league(
         "fitness",
         "profit",
         "city_quality",
+        "mean_satisfaction",
+        "gini_satisfaction",
         "green_share",
         "green_component",
         "type_entropy",
@@ -537,9 +676,12 @@ def evaluate_league(
         "share_agents_causing_damage",
         "gini_profit",
         "built_cells",
+        "tax_revenue",
+        "subsidy_total",
+        "bankrupt_agents",
     ]
     summary = {key: _stats([row[key] for row in per_seed]) for key in keys}
-    summary["behavior"] = np.mean(behaviors, axis=0).tolist() if behaviors else [1.0, 0.0, 0.0]
+    summary["behavior"] = np.mean(behaviors, axis=0).tolist() if behaviors else [1.0, 0.0, 0.0, 0.0]
     summary["per_seed"] = per_seed
     return summary
 
@@ -566,6 +708,10 @@ def evaluate_homogeneous(
                 "fitness_std": float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
                 "profit": float(np.mean(profits)),
                 "city_quality": float(result.city.city_quality),
+                "mean_satisfaction": float(result.city.mean_satisfaction),
+                "gini_satisfaction": float(result.city.gini_satisfaction),
+                "rich_satisfaction": float(result.city.rich_satisfaction),
+                "poor_satisfaction": float(result.city.poor_satisfaction),
                 "green_share": float(result.city.green_share),
                 "green_component": float(result.city.green_component),
                 "type_entropy": float(result.city.type_entropy),
@@ -577,6 +723,12 @@ def evaluate_homogeneous(
                 "share_agents_causing_damage": float(result.city.share_agents_causing_damage),
                 "gini_profit": float(result.city.gini_profit),
                 "built_cells": int(result.city.built_cells),
+                "population": float(result.city.population),
+                "mean_utilization": float(result.city.mean_utilization),
+                "tax_revenue": float(result.city.tax_revenue),
+                "subsidy_total": float(result.city.subsidy_total),
+                "bankrupt_agents": int(result.city.bankrupt_agents),
+                "affordable_share": float(result.city.affordable_share),
                 "behavior": behavior.tolist(),
             }
         )
@@ -584,6 +736,10 @@ def evaluate_homogeneous(
         "fitness",
         "profit",
         "city_quality",
+        "mean_satisfaction",
+        "gini_satisfaction",
+        "rich_satisfaction",
+        "poor_satisfaction",
         "green_share",
         "green_component",
         "type_entropy",
@@ -595,11 +751,14 @@ def evaluate_homogeneous(
         "share_agents_causing_damage",
         "gini_profit",
         "built_cells",
+        "population",
+        "mean_utilization",
+        "tax_revenue",
+        "subsidy_total",
+        "bankrupt_agents",
+        "affordable_share",
     ]
-    summary = {
-        key: _stats([row[key] for row in per_seed])
-        for key in keys
-    }
+    summary = {key: _stats([row[key] for row in per_seed]) for key in keys}
     summary["behavior"] = np.mean(behavior_accumulator, axis=0).tolist()
     summary["per_seed"] = per_seed
     return summary
