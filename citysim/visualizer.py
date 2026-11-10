@@ -10,6 +10,14 @@ except ImportError:  # pragma: no cover - pygame is optional
 import numpy as np
 
 from .config import TYPE_NAMES
+from .isometric import (
+    building_height,
+    cell_center,
+    cell_faces,
+    darken,
+    grid_bounds,
+    hit_test,
+)
 
 
 # Cell type colors (RGB)
@@ -177,23 +185,53 @@ class _BaseVisualizer:
 class CityVisualizer(_BaseVisualizer):
     """Pygame window that renders one city, its agents and four live charts."""
 
-    def __init__(self, env, cell_size: int = 36, speed_ms: int = 80):
+    def __init__(
+        self,
+        env,
+        cell_size: int = 36,
+        speed_ms: int = 80,
+        projection: str = "isometric",
+    ):
         super().__init__(speed_ms=speed_ms)
+        if projection not in ("isometric", "top-down"):
+            raise ValueError("projection must be 'isometric' or 'top-down'")
         self.env = env
         self.h = env.h
         self.w = env.w
         self.n_agents = len(env.agents)
+        self.projection = projection
 
         self.panel_width = 410
         max_grid_w = 1060
+        scale_denominator = (
+            (self.h + self.w) / 2.0
+            if projection == "isometric"
+            else max(self.h, self.w)
+        )
         self.cell_size = min(
             cell_size,
-            max(14, (max_grid_w - self.panel_width) // max(self.h, self.w)),
+            max(14, int((max_grid_w - self.panel_width) / scale_denominator)),
         )
-        self.grid_w = self.w * self.cell_size
-        self.grid_h = self.h * self.cell_size
+        self.tile_width = float(self.cell_size)
+        self.tile_height = max(8.0, self.cell_size / 2.0)
         self.header_h = 42
         self.footer_h = 26
+        self.max_building_height = max(
+            building_height(type_id, quality, self.tile_height)
+            for type_id in range(1, 6)
+            for quality in range(3)
+        )
+        if projection == "isometric":
+            self.grid_w, self.grid_h = grid_bounds(
+                self.h,
+                self.w,
+                self.tile_width,
+                self.tile_height,
+                self.max_building_height,
+            )
+        else:
+            self.grid_w = self.w * self.cell_size
+            self.grid_h = self.h * self.cell_size
         self.width = self.grid_w + self.panel_width
         self.height = max(self.grid_h + self.header_h + self.footer_h + 8, 720)
 
@@ -224,6 +262,9 @@ class CityVisualizer(_BaseVisualizer):
     # -- drawing ----------------------------------------------------------
 
     def _draw_grid(self) -> None:
+        if self.projection == "isometric":
+            self._draw_isometric_grid()
+            return
         for y in range(self.h):
             for x in range(self.w):
                 rect = pygame.Rect(
@@ -257,6 +298,102 @@ class CityVisualizer(_BaseVisualizer):
                 if self.selected_cell == cell_id:
                     pygame.draw.rect(self.screen, (255, 255, 255), rect, 2)
 
+    def _isometric_origin(self) -> tuple[float, float]:
+        return (
+            self.h * self.tile_width / 2.0,
+            self.header_h + self.max_building_height + self.tile_height / 2.0,
+        )
+
+    def _draw_isometric_grid(self) -> None:
+        origin_x, origin_y = self._isometric_origin()
+        for row, col in sorted(
+            ((r, c) for r in range(self.h) for c in range(self.w)),
+            key=lambda cell: (cell[0] + cell[1], cell[1]),
+        ):
+            type_id = int(self.env.type_grid[row, col])
+            elevation = building_height(
+                type_id,
+                int(self.env.quality_grid[row, col]),
+                self.tile_height,
+            )
+            ground, left, right, top = cell_faces(
+                row,
+                col,
+                self.h,
+                self.tile_width,
+                self.tile_height,
+                origin_x,
+                origin_y,
+                elevation,
+            )
+            pygame.draw.polygon(
+                self.screen,
+                TYPE_COLORS[type_id],
+                [(int(x), int(y)) for x, y in ground],
+            )
+            if left:
+                pygame.draw.polygon(
+                    self.screen,
+                    darken(TYPE_COLORS[type_id], 0.58),
+                    [(int(x), int(y)) for x, y in left],
+                )
+                pygame.draw.polygon(
+                    self.screen,
+                    (55, 55, 55),
+                    [(int(x), int(y)) for x, y in left],
+                    1,
+                )
+            if right:
+                pygame.draw.polygon(
+                    self.screen,
+                    darken(TYPE_COLORS[type_id], 0.76),
+                    [(int(x), int(y)) for x, y in right],
+                )
+                pygame.draw.polygon(
+                    self.screen,
+                    (55, 55, 55),
+                    [(int(x), int(y)) for x, y in right],
+                    1,
+                )
+            pygame.draw.polygon(
+                self.screen, TYPE_COLORS[type_id], [(int(x), int(y)) for x, y in top]
+            )
+            pygame.draw.polygon(
+                self.screen, (55, 55, 55), [(int(x), int(y)) for x, y in top], 1
+            )
+
+            if type_id > 0:
+                owner = int(self.env.owner_grid[row, col])
+                if 0 <= owner < self.n_agents:
+                    center = cell_center(
+                        row,
+                        col,
+                        self.tile_width,
+                        self.tile_height,
+                        origin_x,
+                        origin_y,
+                        elevation,
+                    )
+                    pygame.draw.circle(
+                        self.screen,
+                        AGENT_COLORS[owner % len(AGENT_COLORS)],
+                        (int(center[0]), int(center[1])),
+                        max(2, self.cell_size // 8),
+                    )
+
+            cell_id = row * self.w + col
+            for agent_id, (cell, round_at, _) in self.latest_action.items():
+                if cell is not None and cell == cell_id and round_at == self.round_idx:
+                    pygame.draw.polygon(
+                        self.screen,
+                        AGENT_COLORS[agent_id % len(AGENT_COLORS)],
+                        [(int(x), int(y)) for x, y in top],
+                        3,
+                    )
+                    break
+            if self.selected_cell == cell_id:
+                pygame.draw.polygon(self.screen, (255, 255, 255), top, 2)
+
     def _draw_header(self) -> None:
         built = int((self.env.type_grid > 0).sum())
         total = self.h * self.w
@@ -264,7 +401,8 @@ class CityVisualizer(_BaseVisualizer):
         title = self.font_header.render(
             f"CitySim  |  Round {self.round_idx + 1}/{self.env.config.actions_per_agent}"
             f"  |  Built: {built}/{total}"
-            f"  |  {status}  |  Space pause, ↑/↓ speed, Esc quit, click a cell",
+            f"  |  {self.projection}  |  {status}"
+            f"  |  Space pause, ↑/↓ speed, Esc quit, click a cell",
             True,
             (240, 240, 240),
         )
@@ -426,6 +564,21 @@ class CityVisualizer(_BaseVisualizer):
         x, y = pos
         if x >= self.grid_w or y < self.header_h:
             return
+        if self.projection == "isometric":
+            origin_x, origin_y = self._isometric_origin()
+            cell = hit_test(
+                (x, y),
+                self.env.type_grid,
+                self.env.quality_grid,
+                self.tile_width,
+                self.tile_height,
+                origin_x,
+                origin_y,
+            )
+            if cell is not None:
+                self.selected_cell = cell
+                self.draw()
+            return
         col = x // self.cell_size
         row = (y - self.header_h) // self.cell_size
         if 0 <= col < self.w and 0 <= row < self.h:
@@ -507,22 +660,50 @@ class ComparisonVisualizer(_BaseVisualizer):
         label_b: str = "B",
         cell_size: int = 28,
         speed_ms: int = 60,
+        projection: str = "isometric",
     ):
         super().__init__(speed_ms=speed_ms)
+        if projection not in ("isometric", "top-down"):
+            raise ValueError("projection must be 'isometric' or 'top-down'")
         self.envs = {"a": env_a, "b": env_b}
         self.labels = {"a": label_a, "b": label_b}
         self.h = env_a.h
         self.w = env_a.w
         self.n_agents = len(env_a.agents)
+        self.projection = projection
 
         self.panel_width = 320
         max_total_grid = 1320
-        base = max(12, (max_total_grid - self.panel_width - 16) // (2 * max(self.h, self.w)))
+        scale_denominator = (
+            self.h + self.w
+            if projection == "isometric"
+            else 2 * max(self.h, self.w)
+        )
+        base = max(
+            12,
+            int((max_total_grid - self.panel_width - 16) / scale_denominator),
+        )
         self.cell_size = min(cell_size, base)
-        self.grid_w = self.w * self.cell_size
-        self.grid_h = self.h * self.cell_size
+        self.tile_width = float(self.cell_size)
+        self.tile_height = max(8.0, self.cell_size / 2.0)
         self.header_h = 40
         self.footer_h = 24
+        self.max_building_height = max(
+            building_height(type_id, quality, self.tile_height)
+            for type_id in range(1, 6)
+            for quality in range(3)
+        )
+        if projection == "isometric":
+            self.grid_w, self.grid_h = grid_bounds(
+                self.h,
+                self.w,
+                self.tile_width,
+                self.tile_height,
+                self.max_building_height,
+            )
+        else:
+            self.grid_w = self.w * self.cell_size
+            self.grid_h = self.h * self.cell_size
         self.width = 2 * self.grid_w + 8 + self.panel_width
         self.height = max(self.grid_h + self.header_h + self.footer_h + 6, 640)
         self.screen = pygame.display.set_mode((self.width, self.height))
@@ -546,6 +727,9 @@ class ComparisonVisualizer(_BaseVisualizer):
         return 0 if side == "a" else self.grid_w + 8
 
     def _draw_grid(self, side: str) -> None:
+        if self.projection == "isometric":
+            self._draw_isometric_grid(side)
+            return
         env = self.envs[side]
         x0 = self._grid_origin(side)
         for y in range(self.h):
@@ -581,6 +765,82 @@ class ComparisonVisualizer(_BaseVisualizer):
                         break
                 if self.selected[side] == cell_id:
                     pygame.draw.rect(self.screen, (255, 255, 255), rect, 2)
+        label = self.font_header.render(
+            f"{side.upper()}: {self.labels[side]}", True, (240, 240, 240)
+        )
+        self.screen.blit(label, (x0 + 4, self.header_h - 18))
+
+    def _draw_isometric_grid(self, side: str) -> None:
+        env = self.envs[side]
+        x0 = self._grid_origin(side)
+        origin_x = self.h * self.tile_width / 2.0
+        origin_y = self.header_h + self.max_building_height + self.tile_height / 2.0
+        for row, col in sorted(
+            ((r, c) for r in range(self.h) for c in range(self.w)),
+            key=lambda cell: (cell[0] + cell[1], cell[1]),
+        ):
+            type_id = int(env.type_grid[row, col])
+            elevation = building_height(
+                type_id, int(env.quality_grid[row, col]), self.tile_height
+            )
+            ground, left, right, top = cell_faces(
+                row,
+                col,
+                self.h,
+                self.tile_width,
+                self.tile_height,
+                origin_x,
+                origin_y,
+                elevation,
+            )
+            faces = (
+                (ground, TYPE_COLORS[type_id]),
+                (left, darken(TYPE_COLORS[type_id], 0.58)),
+                (right, darken(TYPE_COLORS[type_id], 0.76)),
+                (top, TYPE_COLORS[type_id]),
+            )
+            for face_index, (polygon, color) in enumerate(faces):
+                if polygon:
+                    shifted = [(int(x0 + x), int(y)) for x, y in polygon]
+                    pygame.draw.polygon(self.screen, color, shifted)
+                    if face_index > 0:
+                        pygame.draw.polygon(self.screen, (55, 55, 55), shifted, 1)
+            if type_id > 0:
+                owner = int(env.owner_grid[row, col])
+                if 0 <= owner < self.n_agents:
+                    center = cell_center(
+                        row,
+                        col,
+                        self.tile_width,
+                        self.tile_height,
+                        origin_x + x0,
+                        origin_y,
+                        elevation,
+                    )
+                    pygame.draw.circle(
+                        self.screen,
+                        AGENT_COLORS[owner % len(AGENT_COLORS)],
+                        (int(center[0]), int(center[1])),
+                        max(2, self.cell_size // 8),
+                    )
+
+            cell_id = row * self.w + col
+            for agent_id, (cell, round_at, _) in self.latest_action[side].items():
+                if cell is not None and cell == cell_id and round_at == self.round_idx:
+                    pygame.draw.polygon(
+                        self.screen,
+                        AGENT_COLORS[agent_id % len(AGENT_COLORS)],
+                        [(int(x0 + x), int(y)) for x, y in top],
+                        2,
+                    )
+                    break
+            if self.selected[side] == cell_id:
+                pygame.draw.polygon(
+                    self.screen,
+                    (255, 255, 255),
+                    [(int(x0 + x), int(y)) for x, y in top],
+                    2,
+                )
         label = self.font_header.render(
             f"{side.upper()}: {self.labels[side]}", True, (240, 240, 240)
         )
@@ -689,6 +949,27 @@ class ComparisonVisualizer(_BaseVisualizer):
     def _on_click(self, pos) -> None:
         x, y = pos
         if y < self.header_h:
+            return
+        if self.projection == "isometric":
+            if x < self.grid_w:
+                side = "a"
+            elif self.grid_w + 8 <= x < 2 * self.grid_w + 8:
+                side = "b"
+            else:
+                return
+            x0 = self._grid_origin(side)
+            cell = hit_test(
+                (x - x0, y),
+                self.envs[side].type_grid,
+                self.envs[side].quality_grid,
+                self.tile_width,
+                self.tile_height,
+                self.h * self.tile_width / 2.0,
+                self.header_h + self.max_building_height + self.tile_height / 2.0,
+            )
+            if cell is not None:
+                self.selected[side] = cell
+                self.draw()
             return
         row = (y - self.header_h) // self.cell_size
         if not 0 <= row < self.h:

@@ -5,10 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.115",
     "matplotlib>=3.11.2",
     "numba>=0.68.1",
     "numpy>=2.5.4",
     "pandas>=3.1.1",
     "py-spy>=0.4.3",
     "pygame>=2.6.1",
+    "uvicorn>=0.32",
 ]
+
+[tool.setuptools.package-data]
+citysim = ["web/*.html", "web/build/*", "web/build/assets/*"]

@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CitySim — панель обучения</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 15px/1.45 "Segoe UI", sans-serif;
+      background: #111827;
+      color: #e5e7eb;
+      --panel: #1f2937;
+      --line: #374151;
+      --accent: #60a5fa;
+      --muted: #9ca3af;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { padding: 18px 24px; background: #0b1220; border-bottom: 1px solid var(--line); }
+    h1 { margin: 0; font-size: 1.35rem; }
+    main { max-width: 1440px; margin: auto; padding: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; align-items: start; }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 16px; }
+    h2 { margin: 0 0 12px; font-size: 1.05rem; }
+    label { display: block; color: var(--muted); font-size: .88rem; margin: 9px 0 4px; }
+    input, select, button { font: inherit; }
+    input, select { width: 100%; padding: 8px; color: inherit; background: #111827; border: 1px solid #4b5563; border-radius: 5px; }
+    input[type=checkbox] { width: auto; margin-right: 7px; }
+    button { border: 0; border-radius: 5px; padding: 8px 12px; margin: 8px 5px 0 0; color: #08111f; background: var(--accent); cursor: pointer; }
+    button.secondary { color: inherit; background: #4b5563; }
+    button.danger { background: #f87171; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .status { margin: 12px 0; color: var(--muted); }
+    progress { width: 100%; height: 17px; accent-color: #34d399; }
+    pre { max-height: 330px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; margin: 8px 0 0; color: #d1d5db; background: #0b1220; border: 1px solid var(--line); border-radius: 5px; }
+    #logs { min-height: 100px; max-height: 250px; }
+    .error { color: #fca5a5; min-height: 1.4em; }
+    .hint { color: var(--muted); font-size: .86rem; }
+    @media (max-width: 600px) { main { padding: 10px; } .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header><h1>CitySim · панель обучения</h1></header>
+  <main>
+    <div id="error" class="error" role="alert"></div>
+    <div class="grid">
+      <section>
+        <h2>Обучение и эксперименты</h2>
+        <label for="job-kind">Задача</label>
+        <select id="job-kind"><option value="train">Обучать ветку</option><option value="experiment">Эксперимент E1–E11</option></select>
+        <div id="branch-options">
+          <label for="branch">Ветка</label><select id="branch"></select>
+          <label><input id="resume" type="checkbox">Продолжить выбранную ветку</label>
+        </div>
+        <div id="experiment-options" hidden>
+          <label for="experiment">Эксперимент</label>
+          <select id="experiment">
+            <option>e1</option><option>e2</option><option>e3</option><option>e4</option>
+            <option>e5</option><option>e6</option><option>e7</option><option>e8</option>
+            <option>e9</option><option>e10</option><option>e11</option><option>all</option>
+          </select>
+          <label for="seeds">Обучающие сиды (например, 0-2)</label><input id="seeds" value="0-2">
+        </div>
+        <div class="row">
+          <div><label for="generations">Поколений</label><input id="generations" type="number" min="1" value="100"></div>
+          <div><label for="episodes">Эпизодов на поколение</label><input id="episodes" type="number" min="1" value="10"></div>
+          <div><label for="population">Размер популяции (кратно 4)</label><input id="population" type="number" min="8" step="4" value="32"></div>
+          <div><label for="agents">Агентов в городе</label><input id="agents" type="number" min="1" value="10"></div>
+          <div><label for="workers">Рабочих CPU (пусто — авто)</label><input id="workers" type="number" min="1" placeholder="авто"></div>
+          <div><label for="checkpoint">Сохранять каждые N поколений</label><input id="checkpoint" type="number" min="1" value="10"></div>
+        </div>
+        <label><input id="quick" type="checkbox">Быстрая конфигурация</label>
+        <button id="start">Запустить</button><button id="resume-last" class="secondary">Возобновить последнюю задачу</button>
+        <button id="stop" class="danger" disabled>Остановить после поколения</button>
+        <div id="job-status" class="status">Нет активной задачи</div>
+        <progress id="progress" max="1" value="0"></progress>
+        <div id="progress-detail" class="hint">ETA — оценка до конца текущего обучения; для пакета E1–E11 это не прогноз всего пакета.</div>
+      </section>
+
+      <section>
+        <h2>Ветки и снимки</h2>
+        <div class="row"><div><label for="history-branch">Ветка</label><select id="history-branch"></select></div><div><label>&nbsp;</label><button id="refresh-history" class="secondary">Обновить</button></div></div>
+        <button id="checkout" class="secondary">Сделать активной</button>
+        <label for="create-name">Создать ветку от снимка (оставьте ссылку пустой для вершины активной ветки)</label>
+        <input id="create-name" placeholder="experiment">
+        <div class="row"><input id="create-ref" placeholder="main@40"><button id="create-branch">Создать ветку</button></div>
+        <label for="reset-ref">Переместить указатель выбранной ветки к снимку</label>
+        <div class="row"><input id="reset-ref" placeholder="main@20"><button id="reset-branch" class="secondary">Переместить</button></div>
+        <pre id="history">Выберите ветку, чтобы увидеть историю.</pre>
+      </section>
+
+      <section>
+        <h2>Сравнение стратегий</h2>
+        <p class="hint">Обе оценки используют одинаковые тестовые сиды и город из эталонного снимка.</p>
+        <label for="left-ref">Первый снимок</label><select id="left-ref"></select>
+        <label for="right-ref">Второй снимок</label><select id="right-ref"></select>
+        <label for="reference-ref">Эталонный снимок (конфигурация города)</label><select id="reference-ref"></select>
+        <div class="row">
+          <div><label for="seed-base">Первый тестовый сид</label><input id="seed-base" type="number" value="9000000"></div>
+          <div><label for="seed-count">Число общих сидов</label><input id="seed-count" type="number" min="1" value="5"></div>
+        </div>
+        <button id="compare">Сравнить снимки</button>
+        <pre id="comparison">Здесь появятся результаты сравнения.</pre>
+      </section>
+
+      <section>
+        <h2>Целостность и очистка истории</h2>
+        <button id="verify" class="secondary">Проверить БД и снимки</button>
+        <button id="gc-preview" class="secondary">Предпросмотр очистки</button>
+        <button id="gc-apply" class="danger" disabled>Удалить показанные недостижимые данные</button>
+        <pre id="maintenance">Проверка или предпросмотр очистки ещё не запускались.</pre>
+      </section>
+
+      <section>
+        <h2>Сохранённые логи задач</h2>
+        <label for="saved-jobs">Задачи</label><select id="saved-jobs"></select>
+        <pre id="logs">Запустите задачу, чтобы увидеть вывод.</pre>
+      </section>
+    </div>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let activeJob = null;
+    let selectedLogJob = null;
+    let logOffset = 0;
+    let gcToken = null;
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || response.statusText);
+      return body;
+    }
+
+    function showError(error) { $("error").textContent = error.message || String(error); }
+    function clearError() { $("error").textContent = ""; }
+    function fill(select, options, selected) {
+      select.replaceChildren();
+      for (const item of options) {
+        const option = document.createElement("option");
+        option.value = item.value;
+        option.textContent = item.label;
+        select.append(option);
+      }
+      if (selected) select.value = selected;
+    }
+    function refOptions(commits) {
+      return commits.map((item) => ({
+        value: `${item.branch_name}@${item.generation}`,
+        label: `${item.branch_name}@${item.generation} · ${item.commit_id.slice(0, 10)}`
+      }));
+    }
+    function toggleJobFields() {
+      const experiment = $("job-kind").value === "experiment";
+      $("branch-options").hidden = experiment;
+      $("experiment-options").hidden = !experiment;
+    }
+    $("job-kind").addEventListener("change", toggleJobFields);
+
+    async function refreshHistory() {
+      clearError();
+      const data = await api("/api/branches");
+      const branchOptions = data.branches.map((branch) => ({
+        value: branch.name,
+        label: `${branch.name}${branch.generation == null ? " · empty" : ` · gen ${branch.generation}`}`
+      }));
+      fill($("branch"), branchOptions, data.active);
+      fill($("history-branch"), branchOptions, data.active);
+      const commitLists = await Promise.all(data.branches
+        .filter((branch) => branch.head_commit)
+        .map((branch) => api(`/api/history?branch=${encodeURIComponent(branch.name)}`)));
+      const commits = commitLists.flatMap((item) => item.commits).reverse();
+      const options = refOptions(commits);
+      fill($("left-ref"), options, options[0]?.value);
+      fill($("right-ref"), options, options[1]?.value || options[0]?.value);
+      fill($("reference-ref"), options, options[0]?.value);
+      if (options.length) await loadBranchHistory();
+    }
+
+    async function loadBranchHistory() {
+      const branch = $("history-branch").value;
+      if (!branch) return;
+      const result = await api(`/api/history?branch=${encodeURIComponent(branch)}`);
+      $("history").textContent = JSON.stringify(result.commits.map((row) => ({
+        generation: row.generation,
+        commit: row.commit_id,
+        parent: row.parent_id,
+        best_fitness: row.best_fitness,
+        complete: Boolean(row.complete),
+        branch: row.branch_name,
+        created_at: row.created_at
+      })), null, 2);
+      const options = refOptions(result.commits).reverse();
+      const all = [...$("left-ref").options].map((option) => ({ value: option.value, label: option.textContent }));
+      const merged = new Map([...all, ...options].map((item) => [item.value, item]));
+      fill($("left-ref"), [...merged.values()], $("left-ref").value);
+      fill($("right-ref"), [...merged.values()], $("right-ref").value);
+      fill($("reference-ref"), [...merged.values()], $("reference-ref").value);
+    }
+
+    async function refreshStatus() {
+      const status = await api("/api/jobs");
+      activeJob = status.job_id;
+      if (!selectedLogJob && activeJob) selectedLogJob = activeJob;
+      $("stop").disabled = !["running", "stopping"].includes(status.state);
+      $("stop").textContent = status.kind === "compare" ? "Остановить после оценки" : "Остановить после поколения";
+      const stateLabels = { idle: "нет активной задачи", running: "выполняется", stopping: "остановка после поколения", completed: "завершена", stopped: "остановлена", failed: "ошибка" };
+      const kindLabels = { train: "Обучение", experiment: "Эксперимент", compare: "Сравнение" };
+      $("job-status").textContent = `${kindLabels[status.kind] || "Задача"}: ${stateLabels[status.state] || status.state}${status.exit_code == null ? "" : ` (код ${status.exit_code})`}`;
+      const progress = status.progress;
+      if (progress) {
+        const total = Number(progress.generations || 0);
+        const current = Number(progress.generation || 0);
+        $("progress").value = total ? Math.min(current / total, 1) : 0;
+        const eta = progress.eta_seconds == null ? "ETA рассчитывается" : `~${Math.ceil(progress.eta_seconds)} с до конца текущего запуска`;
+        $("progress-detail").textContent = `${progress.phase || `Запуск ${progress.run_index || 1}`} · поколение ${current}/${total} · лучший fitness ${Number(progress.best_fitness || 0).toFixed(4)} · ${eta}`;
+      } else {
+        $("progress").value = 0;
+        $("progress-detail").textContent = "ETA — оценка до конца текущего обучения; для пакета E1–E11 это не прогноз всего пакета.";
+      }
+      if (status.result) $("comparison").textContent = JSON.stringify({
+        refs: status.result.refs,
+        reference_ref: status.result.reference_ref,
+        seeds: status.result.seeds,
+        metric_differences: status.result.metric_differences,
+        config_differences: status.result.config_differences
+      }, null, 2);
+      if (selectedLogJob) await refreshLogs(selectedLogJob);
+    }
+
+    async function refreshJobList() {
+      const result = await api("/api/jobs/history");
+      const options = result.jobs.map((job) => ({
+        value: job.job_id,
+        label: `${job.kind} · ${job.state} · ${job.job_id.slice(0, 8)}`
+      }));
+      fill($("saved-jobs"), options, selectedLogJob || options[0]?.value);
+      if (!selectedLogJob && options.length) selectedLogJob = options[0].value;
+    }
+
+    async function refreshLogs(jobId) {
+      const result = await api(`/api/jobs/${jobId}/logs?offset=${logOffset}`);
+      if (result.text) {
+        $("logs").textContent += result.text;
+        $("logs").scrollTop = $("logs").scrollHeight;
+        logOffset = result.next_offset;
+      }
+      $("saved-jobs").onchange = () => {
+        selectedLogJob = $("saved-jobs").value;
+        logOffset = 0;
+        $("logs").textContent = "";
+        if (selectedLogJob) refreshLogs(selectedLogJob).catch(showError);
+      };
+    }
+
+    $("refresh-history").onclick = () => refreshHistory().catch(showError);
+    $("history-branch").onchange = () => loadBranchHistory().catch(showError);
+    $("checkout").onclick = async () => {
+      try { await api("/api/checkout", { method: "POST", body: JSON.stringify({ branch: $("history-branch").value }) }); await refreshHistory(); }
+      catch (error) { showError(error); }
+    };
+    $("create-branch").onclick = async () => {
+      try {
+        const body = { name: $("create-name").value, from_ref: $("create-ref").value || null };
+        await api("/api/branches", { method: "POST", body: JSON.stringify(body) });
+        $("create-name").value = ""; await refreshHistory();
+      } catch (error) { showError(error); }
+    };
+    $("reset-branch").onclick = async () => {
+      try {
+        await api("/api/reset", { method: "POST", body: JSON.stringify({
+          branch: $("history-branch").value, to_ref: $("reset-ref").value
+        }) });
+        $("reset-ref").value = ""; await refreshHistory();
+      } catch (error) { showError(error); }
+    };
+    $("start").onclick = async () => {
+      try {
+        clearError(); logOffset = 0; $("logs").textContent = "";
+        const body = {
+          kind: $("job-kind").value,
+          branch: $("branch").value,
+          resume: $("resume").checked,
+          experiment: $("experiment").value,
+          quick: $("quick").checked,
+          generations: Number($("generations").value),
+          episodes: Number($("episodes").value),
+          population: Number($("population").value),
+          n_agents: Number($("agents").value),
+          workers: $("workers").value ? Number($("workers").value) : null,
+          checkpoint_every: Number($("checkpoint").value),
+          seeds: $("seeds").value,
+          eval_seeds: 5
+        };
+        const result = await api("/api/jobs", { method: "POST", body: JSON.stringify(body) });
+        activeJob = result.job_id;
+        selectedLogJob = result.job_id;
+        await refreshJobList();
+      } catch (error) { showError(error); }
+    };
+    $("stop").onclick = async () => {
+      if (!activeJob) return;
+      try { await api(`/api/jobs/${activeJob}/stop`, { method: "POST" }); }
+      catch (error) { showError(error); }
+    };
+    $("resume-last").onclick = async () => {
+      try {
+        clearError(); logOffset = 0; $("logs").textContent = "";
+        const result = await api("/api/jobs/resume", { method: "POST" });
+        activeJob = result.job_id;
+        selectedLogJob = result.job_id;
+        await refreshJobList();
+      } catch (error) { showError(error); }
+    };
+    $("compare").onclick = async () => {
+      try {
+        clearError(); logOffset = 0; $("logs").textContent = "";         $("comparison").textContent = "Выполняется сравнение…";
+        const result = await api("/api/compare", { method: "POST", body: JSON.stringify({
+          left_ref: $("left-ref").value,
+          right_ref: $("right-ref").value,
+          reference_ref: $("reference-ref").value,
+          seed_base: Number($("seed-base").value),
+          seed_count: Number($("seed-count").value)
+        }) });
+        activeJob = result.job_id;
+        selectedLogJob = result.job_id;
+        await refreshJobList();
+      } catch (error) { showError(error); }
+    };
+    $("verify").onclick = async () => {
+      try { $("maintenance").textContent = JSON.stringify(await api("/api/verify"), null, 2); }
+      catch (error) { showError(error); }
+    };
+    $("gc-preview").onclick = async () => {
+      try {
+        const result = await api("/api/gc/preview");
+        gcToken = result.confirmation_token;
+        $("maintenance").textContent = JSON.stringify(result, null, 2);
+        $("gc-apply").disabled = !result.commit_ids.length && !result.objects.length;
+      } catch (error) { showError(error); }
+    };
+    $("gc-apply").onclick = async () => {
+      if (!gcToken || !confirm("Permanently delete the unreachable commits and checkpoint files shown in the preview?")) return;
+      try {
+        const result = await api("/api/gc", { method: "POST", body: JSON.stringify({ confirmation_token: gcToken }) });
+        gcToken = null; $("gc-apply").disabled = true;
+        $("maintenance").textContent = JSON.stringify(result, null, 2);
+        await refreshHistory();
+      } catch (error) { showError(error); }
+    };
+
+    refreshHistory().catch(showError);
+    refreshJobList().catch(showError);
+    setInterval(() => refreshStatus().catch(showError), 1000);
+    setInterval(() => refreshHistory().catch(showError), 10000);
+    setInterval(() => refreshJobList().catch(showError), 10000);
+  </script>
+</body>
+</html>

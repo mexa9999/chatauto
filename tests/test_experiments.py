@@ -7,7 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from citysim.config import EvolutionConfig, quick_city_config
-from citysim import experiments
+from citysim import (
+    experiments,
+    experiments_learning,
+    experiments_robustness,
+    experiments_sweeps,
+)
 
 
 class TestExperiments(unittest.TestCase):
@@ -62,6 +67,56 @@ class TestExperiments(unittest.TestCase):
 
         self.assertEqual(evolution_config.max_workers, 12)
 
+    def test_cli_exposes_resume_and_checkpoint_interval(self) -> None:
+        from citysim.cli import build_parser
+        from citysim.training_history import DEFAULT_HISTORY_DIR
+
+        args = build_parser().parse_args(
+            [
+                "experiment",
+                "all",
+                "--resume",
+                "--cache-dir",
+                "runs/cache",
+                "--checkpoint-every",
+                "3",
+            ]
+        )
+
+        self.assertTrue(args.resume)
+        self.assertEqual(args.cache_dir, "runs/cache")
+        self.assertEqual(args.checkpoint_every, 3)
+
+        parser = build_parser()
+        train_args = parser.parse_args(["train"])
+        experiment_args = parser.parse_args(["experiment", "e1"])
+        dashboard_args = parser.parse_args(["dashboard", "--no-browser"])
+        history_args = parser.parse_args(["history", "branches"])
+        self.assertEqual(train_args.history_dir, str(DEFAULT_HISTORY_DIR))
+        self.assertEqual(experiment_args.cache_dir, str(DEFAULT_HISTORY_DIR))
+        self.assertEqual(dashboard_args.history_dir, str(DEFAULT_HISTORY_DIR))
+        self.assertEqual(history_args.history_dir, str(DEFAULT_HISTORY_DIR))
+
+    def test_cli_exposes_dashboard_and_progress_hooks(self) -> None:
+        from citysim.cli import build_parser
+
+        parser = build_parser()
+        train_args = parser.parse_args(
+            [
+                "train",
+                "--progress-file",
+                "progress.json",
+                "--stop-file",
+                "stop.request",
+            ]
+        )
+        dashboard_args = parser.parse_args(["dashboard", "--no-browser"])
+
+        self.assertEqual(train_args.progress_file, "progress.json")
+        self.assertEqual(train_args.stop_file, "stop.request")
+        self.assertEqual(dashboard_args.host, "127.0.0.1")
+        self.assertTrue(dashboard_args.no_browser)
+
     def test_e1_keeps_aggregated_learning_curve(self) -> None:
         history = [
             {
@@ -81,12 +136,12 @@ class TestExperiments(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as output:
             with (
-                patch.object(experiments, "EvolutionEngine") as engine,
-                patch.object(experiments, "save_genome"),
-                patch.object(experiments, "write_csv"),
-                patch.object(experiments, "write_json"),
-                patch.object(experiments, "plot_learning_curve") as plot_curve,
-                patch.object(experiments, "plot_satisfaction_curve"),
+                patch.object(experiments_learning, "EvolutionEngine") as engine,
+                patch.object(experiments_learning, "save_genome"),
+                patch.object(experiments_learning, "write_csv"),
+                patch.object(experiments_learning, "write_json"),
+                patch.object(experiments_learning, "plot_learning_curve") as plot_curve,
+                patch.object(experiments_learning, "plot_satisfaction_curve"),
             ):
                 engine.return_value.run.return_value = result
                 experiments.e1_learning_curve(
@@ -125,17 +180,21 @@ class TestExperiments(unittest.TestCase):
         result = SimpleNamespace(best_genome=[])
         with tempfile.TemporaryDirectory() as output:
             with (
-                patch.object(experiments, "EvolutionEngine") as engine,
-                patch.object(experiments, "evaluate_homogeneous", side_effect=evaluate),
+                patch.object(experiments_sweeps, "EvolutionEngine") as engine,
                 patch.object(
-                    experiments,
+                    experiments_sweeps,
+                    "evaluate_homogeneous",
+                    side_effect=evaluate,
+                ),
+                patch.object(
+                    experiments_sweeps,
                     "write_csv",
                     side_effect=lambda path, rows: csv_rows.setdefault(
                         Path(path).name, rows
                     ),
                 ),
-                patch.object(experiments, "write_json"),
-                patch.object(experiments, "plot_profit_quality"),
+                patch.object(experiments_sweeps, "write_json"),
+                patch.object(experiments_sweeps, "plot_profit_quality"),
             ):
                 engine.return_value.run.return_value = result
                 experiments.e4_requirements(
@@ -153,6 +212,33 @@ class TestExperiments(unittest.TestCase):
             if row["trained_profile"] == "soft" and row["eval_profile"] == "soft"
         )
         self.assertEqual(soft_to_soft["fitness_mean"], 2.5)
+
+    def test_public_facade_reexports_all_experiments(self) -> None:
+        public_modules = (
+            (experiments_learning, ("e1_learning_curve", "e2_baselines")),
+            (
+                experiments_sweeps,
+                (
+                    "e3_externalities",
+                    "e4_requirements",
+                    "e5_agents",
+                    "e6_generalization",
+                    "e7_diversity",
+                    "e8_districts",
+                ),
+            ),
+            (
+                experiments_robustness,
+                ("e9_path_dependence", "e10_regulation", "e11_shocks"),
+            ),
+        )
+        for module, names in public_modules:
+            for experiment in names:
+                with self.subTest(experiment=experiment):
+                    self.assertIs(
+                        getattr(experiments, experiment),
+                        getattr(module, experiment),
+                    )
 
 
 if __name__ == "__main__":

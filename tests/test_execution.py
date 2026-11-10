@@ -1,21 +1,342 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from citysim.config import EvolutionConfig, quick_city_config
 from citysim.evolution import (
+    EvolutionEngine,
     Individual,
+    _configuration_digest,
     evaluate_population,
     layout_from_config,
 )
 from citysim.execution import EpisodeExecutor, EpisodeTask
+from citysim.experiment_support import _run_evolution, training_cache
 from citysim.policy import random_genome
+from citysim.training_history import TrainingHistoryStore
 
 
 class TestEpisodeExecution(unittest.TestCase):
+    def test_generation_checkpoint_resumes_identically(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=4,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_map_elites=True,
+            map_elites_bins=2,
+            use_parallel=False,
+            seed=12,
+        )
+        uninterrupted = EvolutionEngine(config, city).run()
+
+        with tempfile.TemporaryDirectory() as output:
+            checkpoint = Path(output) / "resume.npz"
+            interrupted_engine = EvolutionEngine(config, city)
+            evaluate_generation = interrupted_engine._evaluate_generation
+
+            def stop_after_first_generation(generation: int) -> None:
+                if generation == 1:
+                    raise RuntimeError("simulated interruption")
+                evaluate_generation(generation)
+
+            with patch.object(
+                interrupted_engine,
+                "_evaluate_generation",
+                side_effect=stop_after_first_generation,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                    interrupted_engine.run(checkpoint_path=checkpoint)
+
+            resumed = EvolutionEngine(config, city).run(
+                checkpoint_path=checkpoint,
+                resume=True,
+            )
+
+        self.assertEqual(uninterrupted.history, resumed.history)
+        self.assertEqual(uninterrupted.best_fitness, resumed.best_fitness)
+        self.assertEqual(uninterrupted.best_generation, resumed.best_generation)
+        np.testing.assert_array_equal(uninterrupted.best_genome, resumed.best_genome)
+        self.assertEqual(uninterrupted.archive.keys(), resumed.archive.keys())
+        for expected, actual in zip(uninterrupted.population, resumed.population):
+            np.testing.assert_array_equal(expected.genome, actual.genome)
+            self.assertEqual(expected.fitness, actual.fitness)
+            np.testing.assert_array_equal(expected.behavior, actual.behavior)
+
+    def test_checkpoint_interval_still_saves_final_generation(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=5,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+        )
+        with tempfile.TemporaryDirectory() as output:
+            checkpoint = Path(output) / "interval.npz"
+            engine = EvolutionEngine(config, city)
+            write_checkpoint = engine._write_checkpoint
+            saved_generations = []
+
+            def record_checkpoint(path, next_generation, complete):
+                saved_generations.append((next_generation, complete))
+                write_checkpoint(path, next_generation, complete)
+
+            with patch.object(engine, "_write_checkpoint", side_effect=record_checkpoint):
+                engine.run(checkpoint_path=checkpoint, checkpoint_every=2)
+
+        self.assertEqual(
+            saved_generations,
+            [(2, False), (4, False), (5, True)],
+        )
+
+    def test_requested_stop_saves_and_resumes_on_generation_boundary(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=3,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+            seed=29,
+        )
+        with tempfile.TemporaryDirectory() as output:
+            checkpoint = Path(output) / "stop.npz"
+            progress = []
+            stopped = EvolutionEngine(config, city).run(
+                checkpoint_path=checkpoint,
+                checkpoint_every=10,
+                progress_callback=lambda generation, row, total: progress.append(
+                    (generation, total)
+                ),
+                stop_requested=lambda: True,
+            )
+            from citysim.checkpoint_io import read_checkpoint_metadata
+
+            metadata = read_checkpoint_metadata(checkpoint)
+            resumed = EvolutionEngine(config, city).run(
+                checkpoint_path=checkpoint,
+                resume=True,
+            )
+
+        self.assertEqual(progress, [(0, 3)])
+        self.assertEqual(len(stopped.history), 1)
+        self.assertFalse(metadata["complete"])
+        self.assertEqual(metadata["next_generation"], 1)
+        self.assertEqual(len(resumed.history), 3)
+
+    def test_completed_training_is_reused_only_for_same_configuration(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=2,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+            seed=17,
+        )
+        factory_calls = 0
+
+        def counting_factory(evolution_config, city_config):
+            nonlocal factory_calls
+            factory_calls += 1
+            return EvolutionEngine(evolution_config, city_config)
+
+        with tempfile.TemporaryDirectory() as output:
+            with training_cache(output):
+                first = _run_evolution(config, city, engine_factory=counting_factory)
+                second = _run_evolution(
+                    config,
+                    city,
+                    engine_factory=lambda *_: self.fail("cache should be reused"),
+                )
+                changed = _run_evolution(
+                    replace(config, seed=config.seed + 1),
+                    city,
+                    engine_factory=counting_factory,
+                )
+
+        self.assertEqual(factory_calls, 2)
+        np.testing.assert_array_equal(first.best_genome, second.best_genome)
+        self.assertFalse(np.array_equal(first.best_genome, changed.best_genome))
+        self.assertEqual(first.history, second.history)
+
+    def test_training_cache_requires_explicit_resume_for_partial_checkpoint(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=3,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+            seed=23,
+        )
+
+        def stop_after_first_generation(evolution_config, city_config):
+            engine = EvolutionEngine(evolution_config, city_config)
+            evaluate_generation = engine._evaluate_generation
+
+            def stop_before_second_generation(generation: int) -> None:
+                if generation == 1:
+                    raise RuntimeError("simulated interruption")
+                evaluate_generation(generation)
+
+            engine._evaluate_generation = stop_before_second_generation
+            return engine
+
+        with tempfile.TemporaryDirectory() as output:
+            with training_cache(output, checkpoint_every=1):
+                with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                    _run_evolution(
+                        config,
+                        city,
+                        engine_factory=stop_after_first_generation,
+                    )
+
+            with training_cache(output):
+                with self.assertRaisesRegex(FileExistsError, "rerun with --resume"):
+                    _run_evolution(config, city)
+
+            with training_cache(output, resume=True, checkpoint_every=1):
+                resumed = _run_evolution(config, city)
+
+            self.assertEqual(len(resumed.history), config.generations)
+            store = TrainingHistoryStore(output)
+            report = store.verify()
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["experiment_checkpoint_count"], 1)
+            digest = _configuration_digest(config, city)
+            restored = Path(output) / "restored-checkpoint.npz"
+            entry = store.restore_experiment_checkpoint(digest, restored)
+            self.assertIsNotNone(entry)
+            self.assertTrue(entry["complete"])
+            checkpoint = store.objects / f"{entry['checkpoint_hash']}.npz"
+            self.assertTrue(checkpoint.is_file())
+            self.assertNotIn(checkpoint.name, store.gc_preview()["objects"])
+
+    def test_training_history_branches_and_forks_from_generation(self) -> None:
+        from citysim.experiment_support import train_evolution
+
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=3,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+            seed=31,
+        )
+        with tempfile.TemporaryDirectory() as output:
+            store = TrainingHistoryStore(output)
+            train_evolution(
+                config,
+                city,
+                history_store=store,
+                checkpoint_every=1,
+            )
+            with self.assertRaisesRegex(RuntimeError, "advanced during training"):
+                store.record_checkpoint(
+                    "main",
+                    store.checkpoint_path("main"),
+                    3,
+                    True,
+                    config,
+                    city,
+                    expected_parent=None,
+                )
+            store.create_branch("city-test", "main@2")
+            branch_city = replace(city, requirements=replace(city.requirements, green_min=0.1))
+            branch_config = replace(
+                config,
+                generations=4,
+                mutation_sigma=0.08,
+                seed=config.seed + 1,
+            )
+            forked = train_evolution(
+                branch_config,
+                branch_city,
+                history_store=store,
+                branch="city-test",
+                resume=True,
+                checkpoint_every=1,
+            )
+
+            main_history = store.history("main")
+            branch_history = store.history("city-test")
+            branch_config_saved, evolution_config_saved = store.config_for_branch(
+                "city-test"
+            )
+            store.reset_branch("city-test", "main@1")
+            reset_history = store.history("city-test")
+
+        self.assertEqual([row["generation"] for row in main_history], [1, 2, 3])
+        self.assertEqual(
+            [row["generation"] for row in branch_history],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(branch_history[2]["branch_name"], "city-test")
+        self.assertEqual(branch_city, branch_config_saved)
+        self.assertEqual(branch_config, evolution_config_saved)
+        self.assertEqual(forked.evolution_config.generations, 4)
+        self.assertEqual([row["gen"] for row in forked.history], [2, 3])
+        self.assertGreaterEqual(forked.best_generation, 2)
+        self.assertEqual(reset_history[-1]["generation"], 1)
+
+    def test_training_history_rejects_architecture_change_on_branch(self) -> None:
+        from citysim.experiment_support import train_evolution
+
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=2,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+            seed=47,
+        )
+        with tempfile.TemporaryDirectory() as output:
+            store = TrainingHistoryStore(output)
+            train_evolution(config, city, history_store=store, checkpoint_every=1)
+            store.create_branch("wrong-network", "main@1")
+
+            with self.assertRaisesRegex(ValueError, "different neural architecture"):
+                train_evolution(
+                    replace(config, generations=3, hidden_size=9),
+                    city,
+                    history_store=store,
+                    branch="wrong-network",
+                    resume=True,
+                    checkpoint_every=1,
+                )
+
     def test_serial_and_process_episode_results_match(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=1)
         evolution = EvolutionConfig(

@@ -152,8 +152,8 @@ BEHAVIOR_DIM = 4
 class FitnessWeights:
     """Fitness weights fixed before experiments (week 2 of the plan).
 
-    ``city_quality`` is kept for reporting but, by protocol, has zero weight in
-    the selection score.  Banruptcy is a separate, smooth penalty.
+    ``city_quality`` is kept separate from the shared city-welfare bonus.
+    Bankruptcy is a separate, smooth penalty.
     """
 
     profit: float = 0.50
@@ -163,6 +163,7 @@ class FitnessWeights:
     externality_damage: float = 0.10
     skip_penalty: float = 0.05
     bankruptcy: float = 0.15
+    shared_reward: float = 0.15
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -173,6 +174,7 @@ class FitnessWeights:
             "w_externality_damage": self.externality_damage,
             "w_skip_penalty": self.skip_penalty,
             "w_bankruptcy": self.bankruptcy,
+            "w_shared_reward": self.shared_reward,
         }
 
 

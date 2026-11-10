@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
 from .config import BEHAVIOR_DIM, CityConfig, EvolutionConfig
-from .episode import EpisodeResult, run_episode
+from .episode import EpisodeResult, run_episode, score_episode
 from .execution import (
     CitySummary,
     EpisodeExecutor,
@@ -19,6 +22,7 @@ from .execution import (
     _worker_init,
 )
 from .metrics import spatial_metrics
+from .progress import ProgressCallback, StopRequested
 from .policy import (
     GenomeLayout,
     GreedyPolicy,
@@ -29,6 +33,26 @@ from .policy import (
     mutate_genome,
     random_genome,
 )
+
+
+_CHECKPOINT_SCHEMA = 1
+# Bump when training semantics change so old cache entries are not reused.
+_TRAINING_PROTOCOL_VERSION = 1
+
+
+def _configuration_digest(config: EvolutionConfig, city_config: CityConfig) -> str:
+    payload = json.dumps(
+        {
+            "protocol": _TRAINING_PROTOCOL_VERSION,
+            "evolution": asdict(config),
+            "city": asdict(city_config),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 def _max_workers(config: EvolutionConfig, task_count: int) -> int:
     cpu_count = getattr(os, "process_cpu_count", os.cpu_count)()
@@ -156,13 +180,54 @@ class EvolutionEngine:
     # Main loop
     # ------------------------------------------------------------------
 
-    def run(self) -> EvolutionResult:
+    def run(
+        self,
+        checkpoint_path: str | Path | None = None,
+        resume: bool = False,
+        checkpoint_every: int = 1,
+        checkpoint_callback: Callable[[Path, int, bool], None] | None = None,
+        allow_config_changes: bool = False,
+        progress_callback: ProgressCallback | None = None,
+        stop_requested: StopRequested | None = None,
+    ) -> EvolutionResult:
+        checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
         try:
-            for gen in range(self.config.generations):
+            if checkpoint_every < 1:
+                raise ValueError("checkpoint_every must be at least one")
+            if resume and checkpoint is None:
+                raise ValueError("resume requires a checkpoint path")
+            if stop_requested is not None and checkpoint is None:
+                raise ValueError("safe stop requires a checkpoint path")
+            start_generation = 0
+            if checkpoint is not None and checkpoint.exists():
+                if not resume:
+                    raise FileExistsError(
+                        f"checkpoint already exists at {checkpoint}; pass resume=True"
+                    )
+                metadata = self._restore_checkpoint(
+                    checkpoint,
+                    allow_config_changes=allow_config_changes,
+                )
+                if metadata["complete"] and (
+                    not allow_config_changes
+                    or self.config.generations
+                    <= int(metadata["next_generation"])
+                ):
+                    return self._result()
+                start_generation = int(metadata["next_generation"])
+                if start_generation >= self.config.generations:
+                    raise ValueError(
+                        "checkpoint generation is not complete but is beyond the "
+                        "configured generation count"
+                    )
+
+            for gen in range(start_generation, self.config.generations):
                 self.generation = gen
                 self._evaluate_generation(gen)
                 row = self._log_generation(gen)
                 self.history.append(row)
+                if progress_callback is not None:
+                    progress_callback(gen, row, self.config.generations)
                 if self.config.verbose and (
                     gen % max(1, self.config.log_every) == 0
                     or gen == self.config.generations - 1
@@ -172,7 +237,16 @@ class EvolutionEngine:
                         f"mean={row['mean']:.4f} div={row['diversity']:.4f} "
                         f"sigma={row['sigma']:.4f} best_ever={row['best_ever']:.4f}"
                     )
+                stopping = bool(stop_requested and stop_requested())
                 if gen == self.config.generations - 1:
+                    if checkpoint is not None:
+                        self._write_checkpoint(
+                            checkpoint,
+                            next_generation=gen + 1,
+                            complete=True,
+                        )
+                        if checkpoint_callback is not None:
+                            checkpoint_callback(checkpoint, gen + 1, True)
                     break
                 self._select()
                 if (
@@ -189,6 +263,18 @@ class EvolutionEngine:
                 self.sigma = max(
                     self.config.min_sigma, self.sigma * self.config.sigma_decay
                 )
+                if checkpoint is not None and (
+                    (gen + 1) % checkpoint_every == 0 or stopping
+                ):
+                    self._write_checkpoint(
+                        checkpoint,
+                        next_generation=gen + 1,
+                        complete=False,
+                    )
+                    if checkpoint_callback is not None:
+                        checkpoint_callback(checkpoint, gen + 1, False)
+                if stopping:
+                    break
 
             if self.best_ever_genome is None:
                 best = max(self.population, key=lambda ind: ind.fitness)
@@ -196,11 +282,15 @@ class EvolutionEngine:
                 self.best_ever_genome = best.genome.copy()
                 self.best_ever_behavior = best.behavior.copy()
                 self.best_ever_generation = self.generation
+            return self._result()
         finally:
             self.episode_executor.shutdown()
             if self.episode_executor.owns_executor:
                 self.executor = None
 
+    def _result(self) -> EvolutionResult:
+        if self.best_ever_genome is None:
+            raise RuntimeError("evolution has no completed generation")
         return EvolutionResult(
             evolution_config=self.config,
             city_config=self.city_config,
@@ -213,6 +303,266 @@ class EvolutionEngine:
             hall_of_fame=list(self.hall_of_fame),
             archive=dict(self.archive),
         )
+
+    def _write_checkpoint(
+        self,
+        path: Path,
+        next_generation: int,
+        complete: bool,
+    ) -> None:
+        from .checkpoint_io import write_checkpoint
+
+        archive_items = sorted(self.archive.items())
+        archive_genomes = (
+            np.stack([item.genome for _, item in archive_items])
+            if archive_items
+            else np.empty((0, self.layout.parameter_count), dtype=np.float64)
+        )
+        archive_behaviors = (
+            np.stack([item.behavior for _, item in archive_items])
+            if archive_items
+            else np.empty((0, BEHAVIOR_DIM), dtype=np.float64)
+        )
+        metadata = {
+            "schema": _CHECKPOINT_SCHEMA,
+            "evolution_config": asdict(self.config),
+            "city_config": asdict(self.city_config),
+            "configuration_digest": _configuration_digest(
+                self.config, self.city_config
+            ),
+            "next_generation": next_generation,
+            "complete": complete,
+            "sigma": self.sigma,
+            "rng_state": self.rng.bit_generator.state,
+            "best_ever": self.best_ever,
+            "best_ever_generation": self.best_ever_generation,
+            "history": self.history,
+            "last_city_metrics": self._last_city_metrics,
+            "hall_of_fame_generations": [
+                generation for generation, _, _ in self.hall_of_fame
+            ],
+            "hall_of_fame_fitness": [
+                fitness for _, fitness, _ in self.hall_of_fame
+            ],
+            "archive_keys": [list(key) for key, _ in archive_items],
+        }
+        arrays = {
+            "population_genomes": np.stack(
+                [individual.genome for individual in self.population]
+            ),
+            "population_behaviors": np.stack(
+                [individual.behavior for individual in self.population]
+            ),
+            "population_islands": np.asarray(
+                [individual.island for individual in self.population], dtype=np.int64
+            ),
+            "population_fitness": np.asarray(
+                [individual.fitness for individual in self.population],
+                dtype=np.float64,
+            ),
+            "population_shaped_fitness": np.asarray(
+                [individual.shaped_fitness for individual in self.population],
+                dtype=np.float64,
+            ),
+            "population_episodes": np.asarray(
+                [individual.episodes for individual in self.population],
+                dtype=np.int64,
+            ),
+            "best_ever_genome": self.best_ever_genome,
+            "best_ever_behavior": self.best_ever_behavior,
+            "hall_of_fame_genomes": (
+                np.stack([genome for _, _, genome in self.hall_of_fame])
+                if self.hall_of_fame
+                else np.empty((0, self.layout.parameter_count), dtype=np.float64)
+            ),
+            "archive_genomes": archive_genomes,
+            "archive_behaviors": archive_behaviors,
+            "archive_islands": np.asarray(
+                [item.island for _, item in archive_items], dtype=np.int64
+            ),
+            "archive_fitness": np.asarray(
+                [item.fitness for _, item in archive_items], dtype=np.float64
+            ),
+            "archive_shaped_fitness": np.asarray(
+                [item.shaped_fitness for _, item in archive_items], dtype=np.float64
+            ),
+        }
+        write_checkpoint(path, metadata, arrays)
+
+    def _restore_checkpoint(
+        self,
+        path: Path,
+        allow_config_changes: bool = False,
+    ) -> dict:
+        from .checkpoint_io import read_checkpoint
+
+        metadata, arrays = read_checkpoint(path)
+        if metadata.get("schema") != _CHECKPOINT_SCHEMA:
+            raise ValueError(f"unsupported checkpoint schema in {path}")
+        city_changed = (
+            allow_config_changes
+            and metadata.get("city_config") != asdict(self.city_config)
+        )
+        expected_digest = _configuration_digest(self.config, self.city_config)
+        config_matches = metadata.get("configuration_digest") == expected_digest
+        if not config_matches and not allow_config_changes:
+            raise ValueError(
+                "checkpoint configuration does not match the requested run"
+            )
+        if not config_matches:
+            self._validate_branch_configuration(metadata, path)
+        if arrays["population_genomes"].shape != (
+            self.config.population_size,
+            self.layout.parameter_count,
+        ):
+            raise ValueError("checkpoint population shape does not match configuration")
+
+        self.population = [
+            Individual(
+                genome=arrays["population_genomes"][index],
+                island=int(arrays["population_islands"][index]),
+                fitness=float(arrays["population_fitness"][index]),
+                shaped_fitness=float(arrays["population_shaped_fitness"][index]),
+                behavior=arrays["population_behaviors"][index],
+                episodes=int(arrays["population_episodes"][index]),
+            )
+            for index in range(self.config.population_size)
+        ]
+        self.generation = int(metadata["next_generation"])
+        self.sigma = float(metadata["sigma"])
+        previous_config = metadata.get("evolution_config", {})
+        if (
+            allow_config_changes
+            and int(previous_config.get("seed", self.config.seed)) != self.config.seed
+        ):
+            self.rng = np.random.default_rng(self.config.seed)
+        else:
+            self.rng.bit_generator.state = metadata["rng_state"]
+        self.history = metadata["history"]
+        self._last_city_metrics = metadata["last_city_metrics"]
+        self.best_ever = float(metadata["best_ever"])
+        self.best_ever_generation = int(metadata["best_ever_generation"])
+        self.best_ever_genome = arrays["best_ever_genome"]
+        self.best_ever_behavior = arrays["best_ever_behavior"]
+
+        self.hall_of_fame = [
+            (
+                int(generation),
+                float(fitness),
+                genome,
+            )
+            for generation, fitness, genome in zip(
+                metadata["hall_of_fame_generations"],
+                metadata["hall_of_fame_fitness"],
+                arrays["hall_of_fame_genomes"],
+            )
+        ]
+        archive_keys = [tuple(int(value) for value in key) for key in metadata["archive_keys"]]
+        self.archive = {
+            key: Individual(
+                genome=arrays["archive_genomes"][index],
+                island=int(arrays["archive_islands"][index]),
+                fitness=float(arrays["archive_fitness"][index]),
+                shaped_fitness=float(arrays["archive_shaped_fitness"][index]),
+                behavior=arrays["archive_behaviors"][index],
+            )
+            for index, key in enumerate(archive_keys)
+        }
+        if city_changed:
+            self.history = []
+            self._last_city_metrics = {}
+            self.best_ever = -1e18
+            self.best_ever_generation = -1
+            self.best_ever_genome = np.zeros(self.layout.parameter_count)
+            self.best_ever_behavior = np.zeros(BEHAVIOR_DIM)
+            self.hall_of_fame = []
+            self.archive = {}
+            for individual in self.population:
+                individual.fitness = -1e18
+                individual.shaped_fitness = -1e18
+                individual.behavior = np.zeros(BEHAVIOR_DIM)
+                individual.episodes = 0
+        return metadata
+
+    def _validate_branch_configuration(self, metadata: dict, path: Path) -> None:
+        previous = metadata.get("evolution_config")
+        if not isinstance(previous, dict):
+            raise ValueError(
+                f"checkpoint at {path} lacks the configuration needed to validate a branch"
+            )
+        architecture = (
+            "hidden_size",
+            "attention_dim",
+            "district_hidden",
+            "global_hidden",
+        )
+        if any(previous.get(key) != getattr(self.config, key) for key in architecture):
+            raise ValueError(
+                "cannot branch with a different neural architecture; "
+                "start a new training run instead"
+            )
+        if previous.get("population_size") != self.config.population_size:
+            raise ValueError(
+                "cannot branch with a different population size; start a new training run"
+            )
+        if any(
+            previous.get(key) != getattr(self.config, key)
+            for key in ("islands", "use_islands", "use_map_elites", "map_elites_bins")
+        ):
+            raise ValueError(
+                "branching cannot change island or MAP-Elites population structure"
+            )
+
+        mutable = {
+            "generations",
+            "mutation_sigma",
+            "sigma_decay",
+            "min_sigma",
+            "tournament_size",
+            "elites",
+            "migration_interval",
+            "fresh_blood_interval",
+            "fresh_blood_count",
+            "use_fitness_sharing",
+            "sharing_lambda",
+            "sharing_radius",
+            "seed",
+            "train_seed_base",
+            "validation_seed_base",
+            "test_seed_base",
+            "verbose",
+            "log_every",
+            "max_workers",
+            "use_parallel",
+        }
+        current = asdict(self.config)
+        changed = [
+            key
+            for key, value in current.items()
+            if key not in mutable and previous.get(key) != value
+        ]
+        if changed:
+            raise ValueError(
+                "branch changes unsupported evolution settings: "
+                + ", ".join(sorted(changed))
+            )
+
+    @classmethod
+    def load_completed(
+        cls,
+        checkpoint_path: str | Path,
+        config: EvolutionConfig,
+        city_config: CityConfig,
+    ) -> EvolutionResult:
+        engine = cls.__new__(cls)
+        engine.config = config
+        engine.city_config = city_config
+        engine.layout = layout_from_config(config)
+        engine.rng = np.random.default_rng(config.seed)
+        metadata = engine._restore_checkpoint(Path(checkpoint_path))
+        if not metadata["complete"]:
+            raise ValueError(f"checkpoint at {checkpoint_path} is not complete")
+        return engine._result()
 
     # ------------------------------------------------------------------
     # Evaluation

@@ -24,7 +24,7 @@ class EpisodeResult:
     type_grid: np.ndarray | None = None
 
 
-ActionCallback = Callable[[int, Action, bool, CityEnvironment], None]
+ActionCallback = Callable[[int, Action, bool, CityEnvironment], bool | None]
 RoundCallback = Callable[[int, CityEnvironment], None]
 
 
@@ -33,7 +33,7 @@ def _apply_winner_actions(
     winners: dict[int, list[tuple[float, int, int, Action]]],
     slots: list[int],
     on_action: ActionCallback | None,
-) -> None:
+) -> bool:
     """Apply up to ``slots[agent]`` winning actions for each agent."""
     for agent_id, proposals in winners.items():
         if slots[agent_id] <= 0:
@@ -49,7 +49,9 @@ def _apply_winner_actions(
             if success:
                 slots[agent_id] -= 1
             if on_action is not None:
-                on_action(agent_id, action, success, env)
+                if on_action(agent_id, action, success, env) is False:
+                    return False
+    return True
 
 
 def _resolve_bids(
@@ -83,7 +85,7 @@ def _run_auction_round(
     rng: np.random.Generator,
     config: CityConfig,
     on_action: ActionCallback | None,
-) -> None:
+) -> bool:
     n = config.n_agents
     slots = [config.buildings_per_action for _ in range(n)]
     active = [i for i, agent in enumerate(env.agents) if not agent.bankrupt]
@@ -96,7 +98,8 @@ def _run_auction_round(
         for i in active
     }
     winners = _resolve_bids(proposals, rng)
-    _apply_winner_actions(env, winners, slots, on_action)
+    if not _apply_winner_actions(env, winners, slots, on_action):
+        return False
 
     # Phase 2: agents that still have a free slot may react to occupied cells.
     active2 = [i for i in active if slots[i] > 0 and not env.agents[i].bankrupt]
@@ -108,7 +111,8 @@ def _run_auction_round(
             for i in active2
         }
         winners2 = _resolve_bids(proposals2, rng)
-        _apply_winner_actions(env, winners2, slots, on_action)
+        if not _apply_winner_actions(env, winners2, slots, on_action):
+            return False
 
     # Unfilled slots are economic skips.
     for i in active:
@@ -116,7 +120,9 @@ def _run_auction_round(
             env._record_pass(i)
             slots[i] -= 1
             if on_action is not None:
-                on_action(i, Action.pass_action(), False, env)
+                if on_action(i, Action.pass_action(), False, env) is False:
+                    return False
+    return True
 
 
 def _run_sequential_round(
@@ -125,7 +131,7 @@ def _run_sequential_round(
     rng: np.random.Generator,
     config: CityConfig,
     on_action: ActionCallback | None,
-) -> None:
+) -> bool:
     order = rng.permutation(config.n_agents)
     for agent_id in order:
         agent_id = int(agent_id)
@@ -135,9 +141,11 @@ def _run_sequential_round(
             action = policies[agent_id].act(env, agent_id, rng)
             success = env.apply_action(agent_id, action)
             if on_action is not None:
-                on_action(agent_id, action, success, env)
+                if on_action(agent_id, action, success, env) is False:
+                    return False
             if not success:
                 break
+    return True
 
 
 def run_round(
@@ -146,13 +154,12 @@ def run_round(
     rng: np.random.Generator,
     config: CityConfig,
     on_action: ActionCallback | None = None,
-) -> None:
+) -> bool:
     """Run one full bidding/building round without ending it."""
     env._current_income = env._income_grid()
     if config.use_auction:
-        _run_auction_round(env, policies, rng, config, on_action)
-    else:
-        _run_sequential_round(env, policies, rng, config, on_action)
+        return _run_auction_round(env, policies, rng, config, on_action)
+    return _run_sequential_round(env, policies, rng, config, on_action)
 
 
 def run_episode(
@@ -171,6 +178,10 @@ def run_episode(
         raise ValueError(
             f"expected {config.n_agents} policies, got {len(policies)}"
         )
+    for policy in policies:
+        reset_state = getattr(policy, "reset_state", None)
+        if callable(reset_state):
+            reset_state()
     env = CityEnvironment(config, seed, record_history=record_history)
     if rng_seed is None:
         rng_seed = (int(seed) * 2_654_435_761 + 0x9E3779B9) % (2**63)
@@ -188,7 +199,8 @@ def run_episode(
                     rng,
                     magnitude=float(shock.get("magnitude", 0.5)),
                 )
-        run_round(env, policies, rng, config, on_action)
+        if not run_round(env, policies, rng, config, on_action):
+            break
         env.end_round()
         if on_round_end is not None:
             on_round_end(round_idx, env)
@@ -215,6 +227,13 @@ def score_breakdown(
     violations = np.array([a.violations for a in result.agents], dtype=np.float64)
     damage = np.array([a.damage_caused for a in result.agents], dtype=np.float64)
     bankrupt = np.array([a.bankrupt for a in result.agents], dtype=np.float64)
+    city_welfare = float(
+        np.clip(
+            0.5 * (result.city.city_quality + result.city.mean_satisfaction),
+            0.0,
+            1.0,
+        )
+    )
     actions = max(
         1,
         result.config.actions_per_agent * result.config.buildings_per_action,
@@ -236,6 +255,7 @@ def score_breakdown(
         - weights.externality_damage * damage_norm
         - weights.skip_penalty * skip_norm
         - weights.bankruptcy * bankrupt
+        + weights.shared_reward * city_welfare
     )
     return {
         "score": scores,
@@ -245,6 +265,8 @@ def score_breakdown(
         "damage_norm": damage_norm,
         "skip_norm": skip_norm,
         "bankruptcy": bankrupt,
+        "city_welfare": np.full_like(scores, city_welfare),
+        "shared_reward": np.full_like(scores, weights.shared_reward * city_welfare),
         "city_quality": np.full_like(scores, result.city.city_quality),
         "satisfaction": np.full_like(scores, result.city.mean_satisfaction),
     }

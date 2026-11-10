@@ -38,8 +38,10 @@ from .experiments import (
     e11_shocks,
     train_evolution,
 )
+from .experiment_support import training_cache
 from .io import ensure_dir, write_csv, write_json
 from .plotting import plot_city, plot_compare_grids
+from .progress import TrainingProgress, TrainingStopped
 from .policy import (
     GenomeLayout,
     GreedyPolicy,
@@ -49,6 +51,7 @@ from .policy import (
     random_genome,
 )
 from .world import CityEnvironment
+from .training_history import DEFAULT_HISTORY_DIR, TrainingHistoryStore
 
 
 def parse_seeds(text: str) -> list[int]:
@@ -79,7 +82,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="maximum CPU worker processes (default: all available CPUs)",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--seeds", type=str, default=None, help="e.g. 0-9 or 0,1,2")
     parser.add_argument("--n-agents", type=int, default=None)
     parser.add_argument("--grid", type=str, default=None, help="HxW, e.g. 8x8")
@@ -93,6 +96,14 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bids", type=int, default=None, help="sealed bids per agent")
     parser.add_argument("--no-auction", action="store_true", help="sequential instead of auction")
     parser.add_argument("--hidden", type=int, default=None, help="neural hidden layer size")
+    parser.add_argument("--attention-dim", type=int, default=None)
+    parser.add_argument("--district-hidden", type=int, default=None)
+    parser.add_argument("--global-hidden", type=int, default=None)
+    parser.add_argument("--mutation-sigma", type=float, default=None)
+    parser.add_argument("--sigma-decay", type=float, default=None)
+    parser.add_argument("--tournament-size", type=int, default=None)
+    parser.add_argument("--elites", type=int, default=None)
+    parser.add_argument("--train-seed-base", type=int, default=None)
     parser.add_argument(
         "--requirements",
         choices=tuple(REQUIREMENT_PROFILES),
@@ -113,10 +124,23 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--live", action="store_true", help="pygame real-time window")
     parser.add_argument("--speed", type=int, default=80, help="ms between actions")
     parser.add_argument("--cell-size", type=int, default=36, help="pixel size of each grid cell")
+    parser.add_argument(
+        "--projection",
+        choices=("isometric", "top-down"),
+        default="isometric",
+        help="map projection for PNG and live visualizations",
+    )
 
 
-def build_configs(args) -> tuple[CityConfig, EvolutionConfig, list[int]]:
-    if args.quick:
+def build_configs(
+    args,
+    base_config: tuple[CityConfig, EvolutionConfig] | None = None,
+) -> tuple[CityConfig, EvolutionConfig, list[int]]:
+    if base_config is not None and not args.quick:
+        city, evo = base_config
+        default_seeds = [0, 1]
+        eval_seeds = 3
+    elif args.quick:
         city = quick_city_config()
         evo = quick_evolution_config()
         default_seeds = [0, 1]
@@ -156,9 +180,22 @@ def build_configs(args) -> tuple[CityConfig, EvolutionConfig, list[int]]:
         evo = replace(evo, max_workers=args.workers)
     if getattr(args, "hidden", None) is not None:
         evo = replace(evo, hidden_size=args.hidden)
+    for argument, field_name in (
+        ("attention_dim", "attention_dim"),
+        ("district_hidden", "district_hidden"),
+        ("global_hidden", "global_hidden"),
+        ("mutation_sigma", "mutation_sigma"),
+        ("sigma_decay", "sigma_decay"),
+        ("tournament_size", "tournament_size"),
+        ("elites", "elites"),
+        ("train_seed_base", "train_seed_base"),
+    ):
+        value = getattr(args, argument, None)
+        if value is not None:
+            evo = replace(evo, **{field_name: value})
     if getattr(args, "map_elites", False):
         evo = replace(evo, use_map_elites=True)
-    if args.seed is not None and args.seeds is None:
+    if getattr(args, "seed", None) is not None and args.seeds is None:
         evo = replace(evo, seed=args.seed)
     evo = replace(evo, verbose=not args.quiet)
     if eval_seeds is not None and args.eval_seeds is None:
@@ -167,21 +204,31 @@ def build_configs(args) -> tuple[CityConfig, EvolutionConfig, list[int]]:
     return city, evo, seeds
 
 
-def _layout(evo: EvolutionConfig, args=None) -> GenomeLayout:
-    if args is not None and getattr(args, "hidden", None) is not None:
-        return GenomeLayout(hidden_size=int(args.hidden))
+def _layout(evo: EvolutionConfig) -> GenomeLayout:
     return layout_from_config(evo)
 
 
 def _load_genome(path: str | None, layout: GenomeLayout, seed: int) -> np.ndarray:
     if path:
-        genome = np.load(path)
-        if genome.shape != (layout.parameter_count,):
+        loaded = np.load(path, allow_pickle=False)
+        if isinstance(loaded, np.lib.npyio.NpzFile):
+            try:
+                if "best_ever_genome" not in loaded.files:
+                    raise ValueError("checkpoint has no best_ever_genome array")
+                genome = loaded["best_ever_genome"].copy()
+            finally:
+                loaded.close()
+        else:
+            genome = loaded
+        try:
+            return layout.normalize(genome)
+        except ValueError as exc:
             raise SystemExit(
                 f"genome {path} has shape {genome.shape}, "
-                f"expected ({layout.parameter_count},)"
-            )
-        return genome
+                f"expected ({layout.parameter_count},) or "
+                f"({layout.previous_parameter_count},) or "
+                f"({layout.legacy_parameter_count},)"
+            ) from exc
     print(
         "no --genome supplied: using a random genome "
         f"({layout.parameter_count} parameters)"
@@ -213,15 +260,38 @@ def _policy_factory(
 
 def command_demo(args) -> None:
     city, evo, _ = build_configs(args)
-    layout = _layout(evo, args)
+    layout = _layout(evo)
     out = ensure_dir(args.out or "runs/demo")
     policy_name = args.policy
     factory = _policy_factory(policy_name, layout, args.genome, args.seed)
     policies = [factory() for _ in range(city.n_agents)]
+    recorder = None
+    state_file = getattr(args, "live_state_file", None)
+    if state_file:
+        from .live_demo import LiveDemoRecorder
+
+        control_file = getattr(args, "control_file", None)
+        if not control_file:
+            raise SystemExit("--live-state-file requires --control-file")
+        recorder = LiveDemoRecorder(
+            state_file,
+            control_file,
+            {
+                "kind": "metadata",
+                "policy": policy_name,
+                "seed": args.seed,
+                "projection": getattr(args, "projection", "isometric"),
+                "config": city,
+            },
+        )
 
     viz = None
     snapshots: list[str] = []
-    should_continue = lambda: viz is None or viz.running  # noqa: E731
+    should_continue = lambda: (  # noqa: E731
+        recorder.wait_until_active()
+        if recorder is not None
+        else viz is None or viz.running
+    )
 
     def on_round_start(round_idx: int, env: CityEnvironment) -> None:
         nonlocal viz
@@ -232,26 +302,36 @@ def command_demo(args) -> None:
                 env,
                 cell_size=getattr(args, "cell_size", 36),
                 speed_ms=getattr(args, "speed", 80),
+                projection=getattr(args, "projection", "isometric"),
             )
         if viz is not None:
             viz.start_round(round_idx)
+        if recorder is not None:
+            recorder.record_state(env, "round_start", round_idx)
 
-    def on_action(agent_id: int, action, success: bool, env: CityEnvironment) -> None:
+    def on_action(agent_id: int, action, success: bool, env: CityEnvironment):
         if viz is not None:
             viz.handle_action(agent_id, action, success)
+        if recorder is not None:
+            return recorder.after_action(agent_id, action, success, env)
+        return None
 
     def on_round_end(round_idx: int, env: CityEnvironment) -> None:
         if viz is not None:
             viz.end_round_pause()
-        snapshots.append(
-            str(
-                plot_city(
-                    env,
-                    out / f"round_{round_idx:02d}.png",
-                    title=f"{policy_name}, round {round_idx + 1}",
+        if recorder is not None:
+            recorder.record_state(env, "round_end", round_idx)
+        else:
+            snapshots.append(
+                str(
+                    plot_city(
+                        env,
+                        out / f"round_{round_idx:02d}.png",
+                        title=f"{policy_name}, round {round_idx + 1}",
+                        projection=getattr(args, "projection", "isometric"),
+                    )
                 )
             )
-        )
 
     shocks = []
     if getattr(args, "shock", None):
@@ -263,20 +343,23 @@ def command_demo(args) -> None:
             {"round": shock_round, "kind": args.shock, "magnitude": magnitude}
         ]
 
-    result = run_episode(
-        city,
-        policies,
-        args.seed,
-        record_history=True,
-        shocks=shocks,
-        on_action=on_action,
-        on_round_start=on_round_start,
-        on_round_end=on_round_end,
-        should_continue=should_continue,
-    )
-
-    if viz is not None:
-        viz.close()
+    try:
+        result = run_episode(
+            city,
+            policies,
+            args.seed,
+            record_history=True,
+            shocks=shocks,
+            on_action=on_action,
+            on_round_start=on_round_start,
+            on_round_end=on_round_end,
+            should_continue=should_continue,
+        )
+    finally:
+        if viz is not None:
+            viz.close()
+        if recorder is not None:
+            recorder.close()
 
     scores = score_episode(result)
     write_csv(out / "history.csv", result.history)
@@ -289,15 +372,18 @@ def command_demo(args) -> None:
             "agents": result.agents,
             "scores": scores,
             "snapshots": snapshots,
+            "state_stream": "frames.jsonl" if state_file else None,
             "shocks": result.shocks,
             "config": city,
         },
     )
-    final = plot_city(
-        type("EnvProxy", (), {"type_grid": result.type_grid, "w": city.width, "h": city.height})(),
-        out / "final.png",
-        title=f"{policy_name}, final city",
-    )
+    if recorder is None:
+        plot_city(
+            type("EnvProxy", (), {"type_grid": result.type_grid, "w": city.width, "h": city.height})(),
+            out / "final.png",
+            title=f"{policy_name}, final city",
+            projection=getattr(args, "projection", "isometric"),
+        )
     print(f"demo saved to {out}")
     print(
         f"built={result.city.built_cells} quality={result.city.city_quality:.3f} "
@@ -312,7 +398,7 @@ def command_demo(args) -> None:
 
 def command_compare(args) -> None:
     city, evo, _ = build_configs(args)
-    layout = _layout(evo, args)
+    layout = _layout(evo)
     out = ensure_dir(args.out or "runs/compare")
     factory_a = _policy_factory(args.policy_a, layout, args.genome_a, args.seed + 1)
     factory_b = _policy_factory(args.policy_b, layout, args.genome_b, args.seed + 2)
@@ -335,6 +421,7 @@ def command_compare(args) -> None:
             args.policy_b,
             cell_size=getattr(args, "cell_size", 30),
             speed_ms=getattr(args, "speed", 60),
+            projection=getattr(args, "projection", "isometric"),
         )
 
     def callback(side: str):
@@ -414,6 +501,7 @@ def command_compare(args) -> None:
         out / "compare_grids.png",
         label_a=f"A: {args.policy_a}",
         label_b=f"B: {args.policy_b}",
+        projection=getattr(args, "projection", "isometric"),
     )
     for row in rows:
         print(
@@ -427,9 +515,36 @@ def command_compare(args) -> None:
 
 
 def command_train(args) -> None:
-    city, evo, _ = build_configs(args)
     out = ensure_dir(args.out or "runs/train")
-    result = train_evolution(evo, city, out_dir=out, tag=args.tag)
+    history_dir = args.history_dir or DEFAULT_HISTORY_DIR
+    history = TrainingHistoryStore(history_dir)
+    branch = args.branch or history.active_branch()
+    base_config = history.config_for_branch(branch) if args.resume else None
+    city, evo, _ = build_configs(args, base_config=base_config)
+    progress = (
+        TrainingProgress(args.progress_file, args.stop_file)
+        if args.progress_file and args.stop_file
+        else None
+    )
+    result = train_evolution(
+        evo,
+        city,
+        out_dir=out,
+        tag=args.tag,
+        resume=args.resume,
+        checkpoint_every=args.checkpoint_every,
+        history_store=history,
+        branch=branch,
+        progress_callback=progress.generation_completed if progress else None,
+        stop_requested=progress.stop_requested if progress else None,
+    )
+    if progress is not None:
+        from .checkpoint_io import read_checkpoint_metadata
+
+        checkpoint_metadata = read_checkpoint_metadata(history.checkpoint_path(branch))
+        progress.finish(
+            "completed" if checkpoint_metadata["complete"] else "stopped"
+        )
     print(f"best fitness: {result.best_fitness:.4f} at generation {result.best_generation}")
     if result.archive:
         print(f"MAP-Elites archive: {len(result.archive)} niches")
@@ -439,6 +554,30 @@ def command_train(args) -> None:
 def command_experiment(args) -> None:
     city, evo, seeds = build_configs(args)
     out = ensure_dir(Path(args.out or f"runs/{args.name}"))
+    cache_dir = args.cache_dir or DEFAULT_HISTORY_DIR
+    progress = (
+        TrainingProgress(args.progress_file, args.stop_file)
+        if args.progress_file and args.stop_file
+        else None
+    )
+    try:
+        with training_cache(
+            cache_dir,
+            resume=args.resume,
+            checkpoint_every=args.checkpoint_every,
+            progress_callback=progress.generation_completed if progress else None,
+            stop_requested=progress.stop_requested if progress else None,
+        ):
+            _run_experiment(args, city, evo, seeds, out)
+            if progress is not None:
+                progress.finish("completed")
+    except TrainingStopped:
+        print("training stopped after saving a generation checkpoint")
+        if progress is not None:
+            progress.finish("stopped")
+
+
+def _run_experiment(args, city, evo, seeds, out: Path) -> None:
     if not args.quiet:
         print(
             f"experiment {args.name}: seeds={seeds} generations={evo.generations} "
@@ -506,6 +645,77 @@ def command_experiment(args) -> None:
     print(f"summary: {out / 'last_summary.json'}")
 
 
+def command_history(args) -> None:
+    history = TrainingHistoryStore(args.history_dir)
+    if args.history_action == "branches":
+        for branch in history.branch_names():
+            generation = branch["generation"]
+            head = branch["commit_id"]
+            suffix = (
+                "no snapshots"
+                if head is None
+                else f"generation {generation}, {head[:12]}"
+            )
+            active = "*" if branch["name"] == history.active_branch() else " "
+            print(f"{active} {branch['name']}: {suffix}")
+        return
+    if args.history_action == "log":
+        branch = args.branch or history.active_branch()
+        try:
+            commits = history.history(branch)
+            head = history.resolve_ref(branch)
+        except ValueError as exc:
+            if str(exc) == f"branch has no snapshots yet: {branch}":
+                print(f"history for {branch}: no snapshots")
+                return
+            raise
+        print(f"history for {branch}:")
+        for commit in commits:
+            pointer = "->" if commit["commit_id"] == head else "  "
+            best = commit["best_fitness"]
+            fitness = "n/a" if best is None else f"{best:.4f}"
+            print(
+                f"{pointer} gen {commit['generation']:>5} "
+                f"{commit['commit_id'][:12]} "
+                f"best={fitness} branch={commit['branch_name']}"
+            )
+        return
+    if args.history_action == "branch-create":
+        parent = history.create_branch(args.name, args.from_ref)
+        print(f"created branch {args.name} from {parent[:12] if parent else 'empty'}")
+        return
+    if args.history_action == "checkout":
+        history.checkout(args.name)
+        print(f"active branch: {args.name}")
+        return
+    if args.history_action == "reset":
+        head = history.reset_branch(args.name, args.to_ref)
+        print(f"moved {args.name} to {head[:12]}")
+
+
+def command_dashboard(args) -> None:
+    from .dashboard import run_dashboard
+
+    run_dashboard(
+        history_dir=args.history_dir,
+        output_dir=args.out,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_browser,
+    )
+
+
+def command_dashboard_compare_worker(args) -> None:
+    from .dashboard_worker import run_compare
+
+    run_compare(
+        args.job_file,
+        args.result_file,
+        args.progress_file,
+        args.stop_file,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="citysim",
@@ -525,6 +735,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     demo.add_argument("--shock-magnitude", type=float, default=0.5)
+    demo.add_argument("--live-state-file", type=str, default=None)
+    demo.add_argument("--control-file", type=str, default=None)
     demo.set_defaults(func=command_demo)
 
     compare = sub.add_parser("compare", help="run two policies on the same seed")
@@ -542,10 +754,51 @@ def build_parser() -> argparse.ArgumentParser:
     train = sub.add_parser("train", help="run one neuroevolution training")
     add_common(train)
     train.add_argument("--tag", type=str, default="train")
+    train.add_argument(
+        "--history-dir",
+        "--cache-dir",
+        dest="history_dir",
+        default=str(DEFAULT_HISTORY_DIR),
+    )
+    train.add_argument("--branch", type=str, default=None)
+    train.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume incomplete generation checkpoints from the training cache",
+    )
+    train.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=10,
+        help="atomically save progress every N generations (default: 10)",
+    )
+    train.add_argument("--progress-file", type=str, default=None)
+    train.add_argument("--stop-file", type=str, default=None)
     train.set_defaults(func=command_train)
 
     exp = sub.add_parser("experiment", help="run experiments E1-E11")
     add_common(exp)
+    exp.add_argument(
+        "--cache-dir",
+        "--history-dir",
+        dest="cache_dir",
+        type=str,
+        default=str(DEFAULT_HISTORY_DIR),
+        help="shared SQLite history and experiment checkpoint store",
+    )
+    exp.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume incomplete training checkpoints and reuse completed trainings",
+    )
+    exp.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=10,
+        help="atomically save progress every N generations (default: 10)",
+    )
+    exp.add_argument("--progress-file", type=str, default=None)
+    exp.add_argument("--stop-file", type=str, default=None)
     exp.add_argument(
         "name",
         choices=[f"e{i}" for i in range(1, 12)] + ["all"],
@@ -554,6 +807,71 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--sweep-grid", type=str, default="12x12")
     exp.add_argument("--paths", type=int, default=10, help="E9 alternative histories")
     exp.set_defaults(func=command_experiment)
+
+    dashboard = sub.add_parser(
+        "dashboard", help="open the local training and history dashboard"
+    )
+    dashboard.add_argument(
+        "--history-dir", type=str, default=str(DEFAULT_HISTORY_DIR)
+    )
+    dashboard.add_argument("--out", type=str, default="runs/train")
+    dashboard.add_argument("--host", choices=("127.0.0.1",), default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--no-browser", action="store_true")
+    dashboard.set_defaults(func=command_dashboard)
+
+    compare_worker = sub.add_parser(
+        "_dashboard-compare-worker",
+        help=argparse.SUPPRESS,
+    )
+    compare_worker.add_argument("job_file")
+    compare_worker.add_argument("result_file")
+    compare_worker.add_argument("progress_file")
+    compare_worker.add_argument("stop_file")
+    compare_worker.set_defaults(func=command_dashboard_compare_worker)
+
+    history = sub.add_parser("history", help="inspect and manage training branches")
+    history_commands = history.add_subparsers(
+        dest="history_action",
+        required=True,
+    )
+    history_log = history_commands.add_parser("log", help="show snapshot ancestry")
+    history_log.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    history_log.add_argument("--branch", type=str, default=None)
+    history_log.set_defaults(func=command_history)
+
+    history_branches = history_commands.add_parser(
+        "branches",
+        help="list branches and their heads",
+    )
+    history_branches.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    history_branches.set_defaults(func=command_history)
+
+    history_create = history_commands.add_parser(
+        "branch-create",
+        help="create a branch from a branch head or branch@generation",
+    )
+    history_create.add_argument("name")
+    history_create.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    history_create.add_argument("--from", dest="from_ref", default=None)
+    history_create.set_defaults(func=command_history)
+
+    history_checkout = history_commands.add_parser(
+        "checkout",
+        help="set the active branch for subsequent training",
+    )
+    history_checkout.add_argument("name")
+    history_checkout.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    history_checkout.set_defaults(func=command_history)
+
+    history_reset = history_commands.add_parser(
+        "reset",
+        help="move a branch pointer without deleting snapshots",
+    )
+    history_reset.add_argument("name")
+    history_reset.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    history_reset.add_argument("--to", dest="to_ref", required=True)
+    history_reset.set_defaults(func=command_history)
     return parser
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +23,7 @@ from citysim.config import (
 from citysim.episode import run_episode, score_breakdown, score_episode
 from citysim.evolution import EvolutionEngine
 from citysim.grid import district_ids
+from citysim.isometric import building_height, cell_center, hit_test
 from citysim.metrics import (
     cluster_counts,
     grid_distance,
@@ -52,13 +55,54 @@ class TestGenome(unittest.TestCase):
         self.assertEqual(N_CELL_FEATURES, 23)
         self.assertEqual(N_GLOBAL_FEATURES, 10)
         self.assertEqual(layout.cell_mlp_input, 44)
-        self.assertEqual(layout.parameter_count, 6491)
+        self.assertEqual(layout.legacy_parameter_count, 6491)
+        self.assertEqual(layout.previous_parameter_count, 6540)
+        self.assertEqual(layout.parameter_count, 22860)
         rng = np.random.default_rng(0)
         genome = random_genome(rng, layout)
-        self.assertEqual(genome.shape, (6491,))
+        self.assertEqual(genome.shape, (22860,))
         policy = NeuralPolicy(genome, layout)
         self.assertEqual(policy.W1.shape, (44, 48))
         self.assertEqual(policy.W_type.shape, (48, 5))
+
+    def test_legacy_genome_disables_demolition_head(self) -> None:
+        legacy_genome = np.zeros(DEFAULT_LAYOUT.legacy_parameter_count)
+        policy = NeuralPolicy(legacy_genome)
+        self.assertEqual(policy.genome.shape, (DEFAULT_LAYOUT.parameter_count,))
+        self.assertEqual(float(policy.b_demolish[0]), -1e6)
+        self.assertTrue(np.all(policy.W_recurrent_out == 0.0))
+        policy._update_recurrent_state(
+            np.ones((4, DEFAULT_LAYOUT.hidden_size)), 2, 2
+        )
+        self.assertIsNone(policy._recurrent_state)
+
+    def test_pre_recurrence_genome_keeps_demolition_and_neutral_gru(self) -> None:
+        previous_genome = np.zeros(DEFAULT_LAYOUT.previous_parameter_count)
+        previous_genome[-1] = -0.5
+        policy = NeuralPolicy(previous_genome)
+        self.assertEqual(float(policy.b_demolish[0]), -0.5)
+        self.assertTrue(np.all(policy.W_recurrent_out == 0.0))
+
+    def test_per_cell_gru_state_updates_and_resets(self) -> None:
+        policy = NeuralPolicy(random_genome(np.random.default_rng(8)))
+        cell_hidden = np.ones((12, DEFAULT_LAYOUT.hidden_size))
+        first = policy._update_recurrent_state(cell_hidden, 3, 4)
+        self.assertEqual(policy._recurrent_state.shape, cell_hidden.shape)
+        policy._update_recurrent_state(cell_hidden * 2.0, 3, 4)
+        self.assertFalse(np.allclose(first, policy._recurrent_state))
+        policy.reset_state()
+        self.assertIsNone(policy._recurrent_state)
+        policy._update_recurrent_state(cell_hidden, 2, 6)
+        self.assertEqual(policy._recurrent_shape, (2, 6))
+
+    def test_episode_reuse_resets_policy_state(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=2)
+        genome = random_genome(np.random.default_rng(9))
+        policies = [NeuralPolicy(genome.copy()) for _ in range(city.n_agents)]
+        first = run_episode(city, policies, seed=10)
+        second = run_episode(city, policies, seed=10)
+        np.testing.assert_array_equal(score_episode(first), score_episode(second))
+        np.testing.assert_array_equal(first.type_grid, second.type_grid)
 
     def test_forward_scores_are_finite(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=1)
@@ -90,12 +134,49 @@ class TestObservationAndEconomy(unittest.TestCase):
         self.assertEqual(obs.global_features.shape, (N_GLOBAL_FEATURES,))
         self.assertEqual(obs.action_mask.shape, (city.n_cells, 5, 3))
         self.assertEqual(obs.demolish_mask.shape, (city.n_cells,))
+        self.assertEqual(obs.demolish_value.shape, (city.n_cells,))
+        self.assertTrue(np.isfinite(obs.demolish_value).all())
         self.assertEqual(obs.cost_table.shape, (city.n_cells, 5, 3))
         self.assertTrue(np.isfinite(obs.cell_features).all())
         self.assertTrue(np.isfinite(obs.global_features).all())
         self.assertEqual(getattr(obs, "_shape_hint"), (city.height, city.width))
         labels, n_districts = district_ids(city.height, city.width, 3)
         self.assertEqual(getattr(obs, "_n_districts"), n_districts)
+
+    def test_isometric_cell_hit_testing(self) -> None:
+        height, width = 4, 5
+        types = np.zeros((height, width), dtype=np.int8)
+        qualities = np.full((height, width), -1, dtype=np.int8)
+        origin = (height * 16.0, 48.0)
+        for row in range(height):
+            for col in range(width):
+                elevation = building_height(
+                    int(types[row, col]), int(qualities[row, col]), 16.0
+                )
+                point = cell_center(
+                    row, col, 32.0, 16.0, *origin, elevation
+                )
+                self.assertEqual(
+                    hit_test(
+                        point, types, qualities, 32.0, 16.0, *origin
+                    ),
+                    row * width + col,
+                )
+        types[2, 3] = 4
+        qualities[2, 3] = 2
+        elevated_center = cell_center(
+            2,
+            3,
+            32.0,
+            16.0,
+            *origin,
+            building_height(4, 2, 16.0),
+        )
+        self.assertEqual(
+            hit_test(elevated_center, types, qualities, 32, 16, *origin),
+            2 * width + 3,
+        )
+        self.assertGreater(building_height(4, 2, 16), building_height(4, 0, 16))
 
     def test_land_value_pollution_and_noise(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=2, initial_budget=2000)
@@ -154,6 +235,46 @@ class TestObservationAndEconomy(unittest.TestCase):
         )
         self.assertAlmostEqual(env.agents[0].refund_received, 0.5 * cost, places=6)
         self.assertAlmostEqual(env.cost_grid[row, col], 0.0, places=6)
+
+    def test_neural_policy_can_demolish_in_sequential_and_auction_actions(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=2, initial_budget=5000)
+        env = CityEnvironment(city, seed=141)
+        cell = first_buildable(env)
+        self.assertTrue(env.apply_action(0, Action(cell=cell, type_id=0, quality=1)))
+        genome = random_genome(np.random.default_rng(142))
+        genome[DEFAULT_LAYOUT.previous_parameter_count - 1] = 100.0
+        policy = NeuralPolicy(genome)
+        action = policy.act(env, 0, np.random.default_rng(143))
+        self.assertTrue(action.demolish)
+        self.assertEqual(action.cell, cell)
+        bids = policy.propose_bids(env, 0, np.random.default_rng(144), count=1)
+        self.assertEqual(len(bids), 1)
+        self.assertTrue(bids[0].demolish)
+        self.assertEqual(bids[0].bid, 0.0)
+
+    def test_baseline_policies_offer_owned_demolitions(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=2, initial_budget=5000)
+        env = CityEnvironment(city, seed=145)
+        cell = first_buildable(env)
+        other_cell = first_buildable(env, skip=1)
+        self.assertTrue(env.apply_action(0, Action(cell=cell, type_id=0, quality=1)))
+        self.assertTrue(env.apply_action(1, Action(cell=other_cell, type_id=0, quality=1)))
+        self.assertFalse(env.observe(0).demolish_mask[other_cell])
+        row, col = divmod(cell, env.w)
+        env.cost_grid[row, col] = 1e6
+        env._income_cache = None
+        env._current_income = None
+        for policy in (GreedyPolicy(), ManualPolicy()):
+            action = policy.act(env, 0, np.random.default_rng(146))
+            self.assertTrue(action.demolish)
+            self.assertEqual(action.cell, cell)
+        for policy in (RandomPolicy(), GreedyPolicy(), ManualPolicy()):
+            actions = policy.propose_bids(
+                env, 0, np.random.default_rng(147), count=env.n_cells
+            )
+            demolitions = [action for action in actions if action.demolish]
+            self.assertTrue(demolitions)
+            self.assertTrue(all(action.cell == cell and action.bid == 0.0 for action in demolitions))
 
     def test_bankruptcy_clears_buildings(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=3, initial_budget=5000)
@@ -236,6 +357,18 @@ class TestCitizensAndMetrics(unittest.TestCase):
         history_row = result.history[-1]
         self.assertIn("mean_satisfaction", history_row)
         self.assertIn("bankrupt_agents", history_row)
+        unshared_config = replace(
+            result.config,
+            fitness=replace(result.config.fitness, shared_reward=0.0),
+        )
+        unshared_result = replace(result, config=unshared_config)
+        expected_bonus = result.config.fitness.shared_reward * 0.5 * (
+            result.city.city_quality + result.city.mean_satisfaction
+        )
+        np.testing.assert_allclose(
+            score_episode(result) - score_episode(unshared_result),
+            expected_bonus,
+        )
 
     def test_citizen_pool_reproducible(self) -> None:
         a = CitizenPool(seed=5)
@@ -374,7 +507,7 @@ class TestEvolution(unittest.TestCase):
     def test_evolution_and_map_elites(self) -> None:
         evo, city = self._config()
         result = EvolutionEngine(evo, city).run()
-        self.assertEqual(result.best_genome.shape, (6491,))
+        self.assertEqual(result.best_genome.shape, (22860,))
         self.assertTrue(np.isfinite(result.best_fitness))
         self.assertEqual(len(result.history), 2)
         row = result.history[-1]
@@ -389,7 +522,7 @@ class TestEvolution(unittest.TestCase):
             for bucket in key:
                 self.assertGreaterEqual(bucket, 0)
                 self.assertLess(bucket, 3)
-            self.assertEqual(individual.genome.shape, (6491,))
+            self.assertEqual(individual.genome.shape, (22860,))
             self.assertTrue(np.isfinite(individual.fitness))
 
 
@@ -408,12 +541,70 @@ class TestCli(unittest.TestCase):
             ]
         )
         city, evo, seeds = build_configs(args)
+        self.assertEqual(args.projection, "isometric")
         self.assertEqual(city.buildings_per_action, 2)
         self.assertFalse(city.use_auction)
         self.assertEqual(city.requirements.name, "hard")
         self.assertEqual(city.regulation.name, "no_tax")
         self.assertEqual(evo.hidden_size, 32)
         self.assertEqual(seeds, [0, 1])
+
+    def test_load_legacy_genome(self) -> None:
+        from citysim.cli import _load_genome
+
+        with tempfile.TemporaryDirectory() as directory:
+            for count, demolition_bias in (
+                (DEFAULT_LAYOUT.legacy_parameter_count, -1e6),
+                (DEFAULT_LAYOUT.previous_parameter_count, -0.5),
+            ):
+                path = Path(directory) / f"legacy-{count}.npy"
+                old_genome = np.zeros(count)
+                if count == DEFAULT_LAYOUT.previous_parameter_count:
+                    old_genome[-1] = -0.5
+                np.save(path, old_genome)
+                genome = _load_genome(str(path), DEFAULT_LAYOUT, seed=0)
+                self.assertEqual(genome.shape, (DEFAULT_LAYOUT.parameter_count,))
+                self.assertEqual(
+                    float(
+                        genome[
+                            DEFAULT_LAYOUT.legacy_parameter_count
+                            + DEFAULT_LAYOUT.hidden_size
+                        ]
+                    ),
+                    demolition_bias,
+                )
+                self.assertTrue(
+                    np.all(
+                        genome[
+                            DEFAULT_LAYOUT.previous_parameter_count :
+                        ]
+                        == 0.0
+                    )
+                )
+
+    def test_isometric_and_top_down_png_renderers(self) -> None:
+        from citysim.plotting import plot_city, plot_compare_grids
+
+        city = quick_city_config(n_agents=2, actions_per_agent=2)
+        env_a = CityEnvironment(city, seed=201)
+        env_b = CityEnvironment(city, seed=202)
+        with tempfile.TemporaryDirectory() as directory:
+            iso_path = plot_city(env_a, Path(directory) / "iso.png")
+            top_down_path = plot_city(
+                env_a,
+                Path(directory) / "top-down.png",
+                projection="top-down",
+            )
+            comparison_path = plot_compare_grids(
+                env_a,
+                env_b,
+                Path(directory) / "compare.png",
+            )
+            self.assertTrue(all(path.is_file() and path.stat().st_size > 0 for path in (
+                iso_path,
+                top_down_path,
+                comparison_path,
+            )))
 
 
 if __name__ == "__main__":

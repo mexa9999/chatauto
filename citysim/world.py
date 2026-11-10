@@ -136,6 +136,7 @@ class Observation:
     remaining_rounds: int
     budget: float
     demolish_mask: np.ndarray | None = None  # (n_cells,) bool
+    demolish_value: np.ndarray | None = None  # (n_cells,) estimated value vs. retention
 
 
 @dataclass
@@ -374,6 +375,38 @@ class CityEnvironment:
         demolish_mask = (self.owner_grid == agent_id) & (self.type_grid > 0)
         if agent.bankrupt:
             demolish_mask[:] = False
+        costs_flat = self.cost_grid.ravel()
+        income_flat = self._income_grid().ravel()
+        type_flat = self.type_grid.ravel()
+        owned_cells = np.flatnonzero(demolish_mask.ravel())
+        if owned_cells.size:
+            owned_types = type_flat[owned_cells]
+            unutilized = np.array(
+                [self.utilization[int(world_type)] <= 0.0 for world_type in owned_types]
+            )
+            if unutilized.any():
+                projected_income = self.projected_income_table(agent_id)
+                unutilized_cells = owned_cells[unutilized]
+                income_flat[unutilized_cells] = projected_income[
+                    unutilized_cells,
+                    owned_types[unutilized] - 1,
+                    self.quality_grid.ravel()[unutilized_cells],
+                ]
+        regulation = self.config.regulation
+        net_income = (
+            income_flat
+            - MAINTENANCE_RATE * costs_flat
+            - regulation.property_tax_rate * costs_flat
+            - regulation.industry_tax_rate * income_flat * (type_flat == 4)
+            + regulation.green_subsidy * (type_flat == 5)
+        )
+        demolish_value = np.where(
+            net_income < 0.0,
+            0.5 * costs_flat
+            - net_income * max(0, self.config.actions_per_agent - self.round),
+            0.0,
+        )
+        demolish_value[~demolish_mask.ravel()] = 0.0
 
         built_fraction = float(built.mean())
         mean_price = float(np.clip(self.price.mean() / MAX_PRICE, 0.0, 1.0))
@@ -403,6 +436,7 @@ class CityEnvironment:
             remaining_rounds=max(0, self.config.actions_per_agent - self.round),
             budget=float(agent.budget),
             demolish_mask=demolish_mask.ravel(),
+            demolish_value=demolish_value,
         )
         # Private shape metadata used by the neural policy's grid convolutions.
         obs._shape_hint = (self.h, self.w)  # type: ignore[attr-defined]

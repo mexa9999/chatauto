@@ -9,9 +9,11 @@ import matplotlib
 matplotlib.use("Agg")  # use non-interactive backend for file output
 import matplotlib.pyplot as plt
 from matplotlib import font_manager  # noqa: F401  (kept for API compat)
+from matplotlib.patches import Polygon
 import numpy as np
 
 from .config import TYPE_NAMES
+from .isometric import building_height, cell_faces, grid_bounds
 from .world import CityEnvironment
 
 TYPE_COLORS = ["#f2f2f2", "#4c78a8", "#f58518", "#9d755d", "#b6423c", "#54a24b"]
@@ -23,18 +25,85 @@ def ensure_dir(path: str | Path) -> Path:
     return out
 
 
-def plot_city(env: CityEnvironment, path: str | Path, title: str = "City") -> Path:
+def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) -> None:
+    type_grid = np.asarray(env.type_grid)
+    height, width = type_grid.shape
+    quality_grid = getattr(
+        env, "quality_grid", np.zeros(type_grid.shape, dtype=np.int8)
+    )
+    max_height = max(
+        building_height(type_id, quality, tile_height)
+        for type_id in range(1, 6)
+        for quality in range(3)
+    )
+    bounds = grid_bounds(height, width, tile_width, tile_height, max_height)
+    origin_x = height * tile_width / 2.0
+    origin_y = max_height + tile_height / 2.0
+    cells = sorted(
+        ((row, col) for row in range(height) for col in range(width)),
+        key=lambda cell: (cell[0] + cell[1], cell[1]),
+    )
+    for row, col in cells:
+        type_id = int(type_grid[row, col])
+        elevation = building_height(
+            type_id, int(quality_grid[row, col]), tile_height
+        )
+        ground, left, right, top = cell_faces(
+            row,
+            col,
+            height,
+            tile_width,
+            tile_height,
+            origin_x,
+            origin_y,
+            elevation,
+        )
+        color = matplotlib.colors.to_rgb(TYPE_COLORS[type_id])
+        faces = [
+            (ground, color),
+            (left, tuple(channel * 0.58 for channel in color)),
+            (right, tuple(channel * 0.76 for channel in color)),
+            (top, color),
+        ]
+        for vertices, face_color in faces:
+            if vertices:
+                ax.add_patch(
+                    Polygon(
+                        vertices,
+                        closed=True,
+                        facecolor=face_color,
+                        edgecolor="#333333",
+                        linewidth=0.35,
+                    )
+                )
+    ax.set_xlim(0, bounds[0])
+    ax.set_ylim(bounds[1], 0)
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+
+
+def plot_city(
+    env: CityEnvironment,
+    path: str | Path,
+    title: str = "City",
+    projection: str = "isometric",
+) -> Path:
+    if projection not in ("isometric", "top-down"):
+        raise ValueError("projection must be 'isometric' or 'top-down'")
     path = Path(path)
     ensure_dir(path.parent)
     fig, ax = plt.subplots(figsize=(6, 5))
     cmap = matplotlib.colors.ListedColormap(TYPE_COLORS)
-    ax.imshow(env.type_grid, cmap=cmap, vmin=-0.5, vmax=5.5)
-    ax.set_xticks(range(env.w))
-    ax.set_yticks(range(env.h))
-    ax.set_xticks(np.arange(-0.5, env.w, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, env.h, 1), minor=True)
-    ax.grid(which="minor", color="white", linewidth=0.8)
-    ax.tick_params(which="both", length=0)
+    if projection == "isometric":
+        _draw_isometric(ax, env)
+    else:
+        ax.imshow(env.type_grid, cmap=cmap, vmin=-0.5, vmax=5.5)
+        ax.set_xticks(range(env.w))
+        ax.set_yticks(range(env.h))
+        ax.set_xticks(np.arange(-0.5, env.w, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, env.h, 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=0.8)
+        ax.tick_params(which="both", length=0)
     ax.set_title(title)
     cbar = fig.colorbar(
         matplotlib.cm.ScalarMappable(cmap=cmap, norm=matplotlib.colors.Normalize(-0.5, 5.5)),
@@ -44,7 +113,12 @@ def plot_city(env: CityEnvironment, path: str | Path, title: str = "City") -> Pa
         pad=0.04,
     )
     cbar.ax.set_yticklabels(TYPE_NAMES)
-    fig.subplots_adjust(left=0.08, right=0.95, top=0.90, bottom=0.12)
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.78 if projection == "isometric" else 0.95,
+        top=0.90,
+        bottom=0.12,
+    )
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -56,13 +130,19 @@ def plot_compare_grids(
     path: str | Path,
     label_a: str = "A",
     label_b: str = "B",
+    projection: str = "isometric",
 ) -> Path:
+    if projection not in ("isometric", "top-down"):
+        raise ValueError("projection must be 'isometric' or 'top-down'")
     path = Path(path)
     ensure_dir(path.parent)
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
     cmap = matplotlib.colors.ListedColormap(TYPE_COLORS)
     for ax, env, label in ((axes[0], env_a, label_a), (axes[1], env_b, label_b)):
-        ax.imshow(env.type_grid, cmap=cmap, vmin=-0.5, vmax=5.5)
+        if projection == "isometric":
+            _draw_isometric(ax, env)
+        else:
+            ax.imshow(env.type_grid, cmap=cmap, vmin=-0.5, vmax=5.5)
         ax.set_title(label)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -73,13 +153,18 @@ def plot_compare_grids(
 
 
 def _history_arrays(histories: Sequence[Sequence[dict]], key: str):
-    max_len = max(len(h) for h in histories)
-    values = np.full((len(histories), max_len), np.nan, dtype=np.float64)
-    gens = np.arange(max_len)
+    generation_indices = sorted(
+        {int(row["gen"]) for history in histories for row in history}
+    )
+    generation_positions = {
+        generation: index for index, generation in enumerate(generation_indices)
+    }
+    values = np.full((len(histories), len(generation_indices)), np.nan, dtype=np.float64)
+    gens = np.asarray(generation_indices, dtype=np.int64)
     for i, hist in enumerate(histories):
         for row in hist:
             if key in row:
-                values[i, int(row["gen"])] = float(row[key])
+                values[i, generation_positions[int(row["gen"])]] = float(row[key])
     return gens, values
 
 

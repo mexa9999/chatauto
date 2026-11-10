@@ -7,7 +7,7 @@ differentiation and no deep-learning framework is used.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
@@ -109,13 +109,39 @@ class GenomeLayout:
             + h * self.n_types + self.n_types
             + h * self.n_qualities + self.n_qualities
             + h + 1                      # bid head
+            + h + 1                      # demolition head
+            + 7 * h * h + 4 * h          # per-cell GRU and recurrent projection
+        )
+
+    @property
+    def previous_parameter_count(self) -> int:
+        return self.parameter_count - 7 * self.hidden_size**2 - 4 * self.hidden_size
+
+    @property
+    def legacy_parameter_count(self) -> int:
+        return self.previous_parameter_count - self.hidden_size - 1
+
+    def normalize(self, vector: np.ndarray) -> np.ndarray:
+        vector = np.asarray(vector, dtype=np.float64)
+        if vector.shape == (self.parameter_count,):
+            return vector
+        if vector.shape in (
+            (self.previous_parameter_count,),
+            (self.legacy_parameter_count,),
+        ):
+            normalized = np.zeros(self.parameter_count, dtype=np.float64)
+            normalized[: vector.size] = vector
+            if vector.size == self.legacy_parameter_count:
+                normalized[self.legacy_parameter_count + self.hidden_size] = -1e6
+            return normalized
+        raise ValueError(
+            f"genome has shape {vector.shape}, expected "
+            f"({self.parameter_count},), ({self.previous_parameter_count},), "
+            f"or ({self.legacy_parameter_count},)"
         )
 
     def unpack(self, vector: np.ndarray):
-        if vector.shape != (self.parameter_count,):
-            raise ValueError(
-                f"genome has shape {vector.shape}, expected ({self.parameter_count},)"
-            )
+        vector = self.normalize(vector)
         f = self.n_cell_features
         g = self.n_global_features
         a = self.attention_dim
@@ -153,6 +179,13 @@ class GenomeLayout:
         b_quality = take((self.n_qualities,))
         w_bid = take((h,))
         b_bid = take((1,))
+        w_demolish = take((h,))
+        b_demolish = take((1,))
+        W_gru_input = take((h, 3 * h))
+        W_gru_state = take((h, 3 * h))
+        b_gru = take((3 * h,))
+        W_recurrent_out = take((h, h))
+        b_recurrent_out = take((h,))
         return (
             Wq, Wk, Wv, b_att,
             Wd, bd, Wd_type, bd_type,
@@ -161,7 +194,8 @@ class GenomeLayout:
             w3, b3,
             W_type, b_type,
             W_quality, b_quality,
-            w_bid, b_bid,
+            w_bid, b_bid, w_demolish, b_demolish,
+            W_gru_input, W_gru_state, b_gru, W_recurrent_out, b_recurrent_out,
         )
 
 
@@ -209,6 +243,13 @@ def random_genome(rng: np.random.Generator, layout: GenomeLayout = DEFAULT_LAYOU
     put(np.zeros(layout.n_qualities))
     normal((h,), 0.02)
     put(np.zeros(1))
+    normal((h,), 0.02)
+    put(np.array([-0.5]))
+    normal((h, 3 * h), np.sqrt(2.0 / h))
+    normal((h, 3 * h), np.sqrt(1.0 / h))
+    put(np.zeros(3 * h))
+    normal((h, h), 0.02)
+    put(np.zeros(h))
     return vector
 
 
@@ -267,8 +308,46 @@ class NeuralPolicy:
             self.w3, self.b3,
             self.W_type, self.b_type,
             self.W_quality, self.b_quality,
-            self.w_bid, self.b_bid,
+            self.w_bid, self.b_bid, self.w_demolish, self.b_demolish,
+            self.W_gru_input, self.W_gru_state, self.b_gru,
+            self.W_recurrent_out, self.b_recurrent_out,
         ) = layout.unpack(self.genome)
+        self.genome = layout.normalize(self.genome)
+        self._recurrent_state: np.ndarray | None = None
+        self._recurrent_shape: tuple[int, int] | None = None
+        self._recurrent_enabled = bool(
+            np.any(self.W_recurrent_out) or np.any(self.b_recurrent_out)
+        )
+
+    def reset_state(self) -> None:
+        self._recurrent_state = None
+        self._recurrent_shape = None
+
+    @staticmethod
+    def _sigmoid(values: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-np.clip(values, -60.0, 60.0)))
+
+    def _update_recurrent_state(
+        self, cell_hidden: np.ndarray, height: int, width: int
+    ) -> np.ndarray:
+        if not self._recurrent_enabled:
+            return np.zeros_like(cell_hidden)
+        if self._recurrent_state is None or self._recurrent_shape != (height, width):
+            previous = np.zeros_like(cell_hidden)
+        else:
+            previous = self._recurrent_state
+
+        input_gates = cell_hidden @ self.W_gru_input + self.b_gru
+        state_gates = previous @ self.W_gru_state
+        input_reset, input_update, input_candidate = np.split(input_gates, 3, axis=1)
+        state_reset, state_update, state_candidate = np.split(state_gates, 3, axis=1)
+        reset = self._sigmoid(input_reset + state_reset)
+        update = self._sigmoid(input_update + state_update)
+        candidate = np.tanh(input_candidate + reset * state_candidate)
+        state = update * previous + (1.0 - update) * candidate
+        self._recurrent_state = state
+        self._recurrent_shape = (height, width)
+        return np.maximum(state @ self.W_recurrent_out + self.b_recurrent_out, 0.0)
 
     # -- low-level forward -------------------------------------------------
 
@@ -398,11 +477,14 @@ class NeuralPolicy:
         h1 = np.maximum(h1, 0.0)
 
         h2 = np.maximum(h1.reshape(n_cells, -1) @ self.W2 + self.b2, 0.0)
+        recurrent = self._update_recurrent_state(h2, h, w)
+        h2 = np.maximum(h2 + recurrent, 0.0)
         scores = h2 @ self.w3 + float(self.b3[0])
         
         type_logits = (h2 @ self.W_type + self.b_type).reshape(h, w, layout.n_types)
         quality_logits = (h2 @ self.W_quality + self.b_quality).reshape(h, w, layout.n_qualities)
         bid_fraction = 1.0 / (1.0 + np.exp(-(h2 @ self.w_bid + float(self.b_bid[0]))))
+        demolish_logits = h2 @ self.w_demolish + float(self.b_demolish[0])
 
         # --- ПРЕДВЫЧИСЛЕНИЕ JOINT LOGITS ---
         joint_all = type_logits[:, :, :, None] + quality_logits[:, :, None, :]
@@ -413,6 +495,7 @@ class NeuralPolicy:
             "scores": scores,
             "joint_all": joint_all,  # <--- НОВОЕ ПОЛЕ
             "bid_fraction": bid_fraction.reshape(h, w),
+            "demolish_logits": demolish_logits,
             "district_type": district_type_cells,
             "district_logits": district_logits_cells,
             "h2": h2,
@@ -463,17 +546,31 @@ class NeuralPolicy:
             priority=int(priority),
         )
 
+    @staticmethod
+    def _demolition_action(cell: int, priority: int = 0) -> Action:
+        return Action(cell=int(cell), demolish=True, priority=int(priority))
+
     def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
         del rng
         obs = env.observe(agent_id)
-        if not obs.valid_cells.any():
-            return Action.pass_action()
         forward = self._forward(obs)
         scores = forward["scores"].copy()
         scores[~obs.valid_cells] = -np.inf
-        cell = int(np.argmax(scores))
-        action = self._action_at(obs, forward, cell)
-        return action if action is not None else Action.pass_action()
+        build_cell = int(np.argmax(scores))
+        build_score = float(scores[build_cell])
+        build_action = (
+            self._action_at(obs, forward, build_cell)
+            if np.isfinite(build_score)
+            else None
+        )
+        demolition_mask = obs.demolish_mask
+        if demolition_mask is not None and demolition_mask.any():
+            demolition_scores = forward["scores"] + forward["demolish_logits"]
+            demolition_scores[~demolition_mask] = -np.inf
+            demolition_cell = int(np.argmax(demolition_scores))
+            if demolition_scores[demolition_cell] > build_score:
+                return self._demolition_action(demolition_cell)
+        return build_action if build_action is not None else Action.pass_action()
 
     def propose_bids(
         self,
@@ -485,7 +582,7 @@ class NeuralPolicy:
     ) -> list[Action]:
         del rng
         obs = env.observe(agent_id)
-        if not obs.valid_cells.any():
+        if count <= 0:
             return []
         forward = self._forward(obs)
         scores = forward["scores"].copy()
@@ -494,36 +591,35 @@ class NeuralPolicy:
             for cell in exclude_cells:
                 if 0 <= int(cell) < scores.size:
                     scores[int(cell)] = -np.inf
-        # Rank cells by cell score plus the best conditioned type/quality.
-        #h, w = (int(x) for x in forward["shape"])
-        candidates: list[tuple[float, int]] = []
-        valid_mask = np.isfinite(scores)
-        valid_indices = np.flatnonzero(valid_mask)
-        if valid_indices.size == 0:
-            return []
-        
-        # Находим top-N быстро
-        k = min(count * 2, valid_indices.size)
-        top_idx = np.argpartition(scores[valid_indices], -k)[-k:]
-        top_cells = valid_indices[top_idx]
-        top_cells = top_cells[np.argsort(scores[top_cells])[::-1]]
-
-        for cell in top_cells:
+        candidates: list[tuple[float, Action]] = []
+        valid_cells = np.flatnonzero(np.isfinite(scores))
+        for cell in valid_cells:
             cell = int(cell)
-            if not np.isfinite(scores[cell]):
-                break
             joint = self._joint_logits(forward, cell, obs.action_mask)
-            if not np.isfinite(joint).any():
-                continue
-            candidates.append((float(scores[cell] + np.max(joint)), cell))
-            if len(candidates) >= count:
-                break
-        actions: list[Action] = []
-        for priority, (_, cell) in enumerate(candidates):
-            action = self._action_at(obs, forward, cell, priority=priority)
-            if action is not None:
-                actions.append(action)
-        return actions
+            if np.isfinite(joint).any():
+                action = self._action_at(obs, forward, cell)
+                if action is not None:
+                    candidates.append(
+                        (float(scores[cell] + np.max(joint)), action)
+                    )
+
+        demolition_mask = obs.demolish_mask
+        if demolition_mask is not None:
+            demolition_scores = forward["scores"] + forward["demolish_logits"]
+            demolition_scores[~demolition_mask] = -np.inf
+            if exclude_cells:
+                for cell in exclude_cells:
+                    if 0 <= int(cell) < demolition_scores.size:
+                        demolition_scores[int(cell)] = -np.inf
+            for cell in np.flatnonzero(np.isfinite(demolition_scores)):
+                action = self._demolition_action(int(cell))
+                candidates.append((float(demolition_scores[cell]), action))
+
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        return [
+            replace(action, priority=priority)
+            for priority, (_, action) in enumerate(candidates[:count])
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +632,18 @@ class RandomPolicy:
 
     def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
         obs = env.observe(agent_id)
-        valid_cells = np.flatnonzero(obs.valid_cells)
-        if valid_cells.size == 0:
+        demolition_mask = obs.demolish_mask
+        demolition_cells = (
+            np.flatnonzero(demolition_mask)
+            if demolition_mask is not None
+            else np.empty(0, dtype=np.int64)
+        )
+        choices = np.concatenate((np.flatnonzero(obs.valid_cells), demolition_cells))
+        if choices.size == 0:
             return Action.pass_action()
-        cell = int(rng.choice(valid_cells))
+        cell = int(rng.choice(choices))
+        if demolition_mask is not None and demolition_mask[cell]:
+            return Action(cell=cell, demolish=True)
         combos = np.argwhere(obs.action_mask[cell])
         if combos.size == 0:
             return Action.pass_action()
@@ -556,8 +660,14 @@ class RandomPolicy:
         exclude_cells: set[int] | None = None,
     ) -> list[Action]:
         obs = env.observe(agent_id)
+        demolition_mask = obs.demolish_mask
+        demolition_cells = (
+            np.flatnonzero(demolition_mask)
+            if demolition_mask is not None
+            else np.empty(0, dtype=np.int64)
+        )
         valid_cells = [
-            int(c) for c in np.flatnonzero(obs.valid_cells)
+            int(c) for c in np.concatenate((np.flatnonzero(obs.valid_cells), demolition_cells))
             if not exclude_cells or int(c) not in exclude_cells
         ]
         if not valid_cells:
@@ -567,6 +677,9 @@ class RandomPolicy:
         )
         actions: list[Action] = []
         for priority, cell in enumerate(int(c) for c in np.atleast_1d(chosen)):
+            if demolition_mask is not None and demolition_mask[cell]:
+                actions.append(Action(cell=cell, demolish=True, priority=priority))
+                continue
             combos = np.argwhere(obs.action_mask[cell])
             if combos.size == 0:
                 continue
@@ -594,18 +707,39 @@ class GreedyPolicy:
     def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
         del rng
         obs = env.observe(agent_id)
-        if not obs.valid_cells.any() or obs.remaining_rounds <= 0:
+        if obs.remaining_rounds <= 0:
             return Action.pass_action()
-        income = env.projected_income_table(agent_id)
-        value = income * float(obs.remaining_rounds) - obs.cost_table
-        value[~obs.action_mask] = -np.inf
-        flat = int(np.argmax(value))
-        if not np.isfinite(value.ravel()[flat]) or value.ravel()[flat] <= 0.0:
-            return Action.pass_action()
-        cell, type_id, quality = np.unravel_index(flat, value.shape)
-        cell, type_id, quality = int(cell), int(type_id), int(quality)
-        cost = float(obs.cost_table[cell, type_id, quality])
-        return Action(cell=cell, type_id=type_id, quality=quality, cost=cost)
+        best_build_value = 0.0
+        best_build_action = Action.pass_action()
+        if obs.valid_cells.any():
+            income = env.projected_income_table(agent_id)
+            value = income * float(obs.remaining_rounds) - obs.cost_table
+            value[~obs.action_mask] = -np.inf
+            flat = int(np.argmax(value))
+            if np.isfinite(value.ravel()[flat]) and value.ravel()[flat] > 0.0:
+                best_build_value = float(value.ravel()[flat])
+                cell, type_id, quality = np.unravel_index(flat, value.shape)
+                best_build_action = Action(
+                    cell=int(cell),
+                    type_id=int(type_id),
+                    quality=int(quality),
+                    cost=float(obs.cost_table[cell, type_id, quality]),
+                )
+        demolition = self._best_demolition(obs)
+        if demolition is not None and demolition[0] > best_build_value:
+            return demolition[1]
+        return best_build_action
+
+    @staticmethod
+    def _best_demolition(obs: "Observation") -> tuple[float, Action] | None:
+        if obs.demolish_mask is None or obs.demolish_value is None:
+            return None
+        values = np.asarray(obs.demolish_value).copy()
+        values[~obs.demolish_mask] = -np.inf
+        cell = int(np.argmax(values))
+        if not np.isfinite(values[cell]) or values[cell] <= 0.0:
+            return None
+        return float(values[cell]), Action(cell=cell, demolish=True)
 
     def propose_bids(
         self,
@@ -617,38 +751,69 @@ class GreedyPolicy:
     ) -> list[Action]:
         del rng
         obs = env.observe(agent_id)
-        if not obs.valid_cells.any():
+        if count <= 0:
             return []
-        income = env.projected_income_table(agent_id)
-        value = income * float(max(1, obs.remaining_rounds)) - obs.cost_table
-        value[~obs.action_mask] = -np.inf
-        order = np.argsort(value, axis=None)[::-1]
-        actions: list[Action] = []
+        candidates: list[tuple[float, Action]] = []
         used: set[int] = set(exclude_cells or set())
-        for flat in order:
-            if not np.isfinite(value.ravel()[flat]) or value.ravel()[flat] <= 0.0:
-                break
-            cell, type_id, quality = np.unravel_index(int(flat), value.shape)
-            cell, type_id, quality = int(cell), int(type_id), int(quality)
-            if cell in used:
-                continue
-            used.add(cell)
-            cost = float(obs.cost_table[cell, type_id, quality])
-            actions.append(
-                Action(
-                    cell=cell,
-                    type_id=type_id,
-                    quality=quality,
-                    cost=cost,
-                    bid=strategic_bid(
-                        float(value[cell, type_id, quality]), cost, obs.budget
-                    ),
-                    priority=len(actions),
+        if obs.valid_cells.any():
+            income = env.projected_income_table(agent_id)
+            value = income * float(max(1, obs.remaining_rounds)) - obs.cost_table
+            value[~obs.action_mask] = -np.inf
+            order = np.argsort(value, axis=None)[::-1]
+            for flat in order:
+                if not np.isfinite(value.ravel()[flat]) or value.ravel()[flat] <= 0.0:
+                    break
+                cell, type_id, quality = np.unravel_index(int(flat), value.shape)
+                cell, type_id, quality = int(cell), int(type_id), int(quality)
+                if cell in used:
+                    continue
+                used.add(cell)
+                cost = float(obs.cost_table[cell, type_id, quality])
+                candidates.append(
+                    (
+                        float(value[cell, type_id, quality]),
+                        Action(
+                            cell=cell,
+                            type_id=type_id,
+                            quality=quality,
+                            cost=cost,
+                            bid=strategic_bid(
+                                float(value[cell, type_id, quality]), cost, obs.budget
+                            ),
+                        ),
+                    )
                 )
-            )
-            if len(actions) >= count:
+                if len(candidates) >= count:
+                    break
+        demolition_values = self._demolition_values(obs)
+        demolition_order = np.argsort(demolition_values)[::-1]
+        demolition_count = 0
+        for cell in demolition_order:
+            if not np.isfinite(demolition_values[cell]):
                 break
-        return actions
+            if int(cell) in used:
+                continue
+            used.add(int(cell))
+            candidates.append(
+                (float(demolition_values[cell]), Action(cell=int(cell), demolish=True))
+            )
+            demolition_count += 1
+            if demolition_count >= count:
+                break
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        return [
+            replace(action, priority=priority)
+            for priority, (_, action) in enumerate(candidates[:count])
+        ]
+
+    @staticmethod
+    def _demolition_values(obs: "Observation") -> np.ndarray:
+        if obs.demolish_mask is None or obs.demolish_value is None:
+            return np.full(obs.valid_cells.shape, -np.inf)
+        values = np.asarray(obs.demolish_value).copy()
+        values[~obs.demolish_mask] = -np.inf
+        values[values <= 0.0] = -np.inf
+        return values
 
 
 # ---------------------------------------------------------------------------
@@ -759,9 +924,9 @@ class ManualPolicy:
     def act(self, env: "CityEnvironment", agent_id: int, rng: np.random.Generator) -> Action:
         del rng
         obs, base_scores, economic_value = self._score_table(env, agent_id)
-        if not obs.valid_cells.any():
-            return Action.pass_action()
         max_cells = env.n_cells
+        build_action = Action.pass_action()
+        build_value = 0.0
         for quality in self._quality_order():
             mask = obs.action_mask[:, :, quality].T  # (5, cells)
             mask = mask & (economic_value[:, :, quality].T > 0.0)
@@ -772,8 +937,15 @@ class ManualPolicy:
             flat = int(np.argmax(scores))
             type_id, cell = divmod(flat, max_cells)
             cost = float(obs.cost_table[cell, type_id, quality])
-            return Action(cell=cell, type_id=type_id, quality=quality, cost=cost)
-        return Action.pass_action()
+            build_action = Action(
+                cell=cell, type_id=type_id, quality=quality, cost=cost
+            )
+            build_value = float(economic_value[cell, type_id, quality])
+            break
+        demolition = GreedyPolicy._best_demolition(obs)
+        if demolition is not None and demolition[0] > build_value:
+            return demolition[1]
+        return build_action
 
     def propose_bids(
         self,
@@ -785,20 +957,20 @@ class ManualPolicy:
     ) -> list[Action]:
         del rng
         obs, base_scores, economic_value = self._score_table(env, agent_id)
-        if not obs.valid_cells.any():
+        if count <= 0:
             return []
         max_cells = env.n_cells
-        actions: list[Action] = []
+        candidates: list[tuple[float, Action]] = []
         used: set[int] = set(exclude_cells or set())
         for quality in self._quality_order():
-            if len(actions) >= count:
+            if len(candidates) >= count:
                 break
             mask = obs.action_mask[:, :, quality].T
             mask = mask & (economic_value[:, :, quality].T > 0.0)
             for cell in used:
                 if 0 <= cell < max_cells:
                     mask[:, cell] = False
-            while mask.any() and len(actions) < count:
+            while mask.any() and len(candidates) < count:
                 scores = base_scores.copy()
                 scores[~mask] = -np.inf
                 flat = int(np.argmax(scores))
@@ -807,22 +979,42 @@ class ManualPolicy:
                 type_id = int(type_id)
                 used.add(cell)
                 cost = float(obs.cost_table[cell, type_id, quality])
-                actions.append(
-                    Action(
-                        cell=cell,
-                        type_id=type_id,
-                        quality=quality,
-                        cost=cost,
-                        bid=strategic_bid(
-                            float(economic_value[cell, type_id, quality]),
-                            cost,
-                            obs.budget,
+                surplus = float(economic_value[cell, type_id, quality])
+                candidates.append(
+                    (
+                        surplus,
+                        Action(
+                            cell=cell,
+                            type_id=type_id,
+                            quality=quality,
+                            cost=cost,
+                            bid=strategic_bid(surplus, cost, obs.budget),
                         ),
-                        priority=len(actions),
                     )
                 )
                 mask[:, cell] = False
-        return actions
+        demolition_values = GreedyPolicy._demolition_values(obs)
+        demolition_order = np.argsort(demolition_values)[::-1]
+        demolition_count = 0
+        for cell in demolition_order:
+            if not np.isfinite(demolition_values[cell]):
+                break
+            if int(cell) in used:
+                continue
+            candidates.append(
+                (
+                    float(demolition_values[cell]),
+                    Action(cell=int(cell), demolish=True),
+                )
+            )
+            demolition_count += 1
+            if demolition_count >= count:
+                break
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        return [
+            replace(action, priority=priority)
+            for priority, (_, action) in enumerate(candidates[:count])
+        ]
 
 
 def homogeneous_policies(
