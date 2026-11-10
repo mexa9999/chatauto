@@ -20,6 +20,8 @@ TYPE_NAMES = ("empty", "housing", "commercial", "mixed", "industry", "green")
 TYPE_IDS = {name: idx for idx, name in enumerate(TYPE_NAMES)}
 ACTION_TYPE_NAMES = TYPE_NAMES[1:]  # 5 buildable types, policy indices 0..4
 QUALITY_NAMES = ("low", "medium", "high")
+MAX_FLOORS_BY_ACTION = (12, 20, 12, 8, 3)
+N_ROOF_QUALITIES = 4
 
 # Arrays are indexed by world type id (0 = empty).
 BUILD_COST = np.array([0.0, 80.0, 110.0, 100.0, 85.0, 25.0], dtype=np.float64)
@@ -119,6 +121,7 @@ FEATURE_NAMES = (
     "local_saturation",        # 20 built share within SATURATION_RADIUS
     "district_type",           # 21 dominant type in the 3x3 district / 5
     "district_util",           # 22 mean utilisation in the district
+    "district_synergy",        # 23 lagged neighbourhood complementarity
 )
 
 GLOBAL_FEATURE_NAMES = (
@@ -136,7 +139,7 @@ GLOBAL_FEATURE_NAMES = (
 
 N_CELL_FEATURES = len(FEATURE_NAMES)
 N_GLOBAL_FEATURES = len(GLOBAL_FEATURE_NAMES)
-assert N_CELL_FEATURES == 23
+assert N_CELL_FEATURES == 24
 assert N_GLOBAL_FEATURES == 10
 
 # Behaviour descriptor length used by diversity and MAP-Elites.
@@ -263,13 +266,15 @@ REQUIREMENT_PROFILES: dict[str, Requirements] = {
 class CityConfig:
     """One episode of the city simulation."""
 
-    height: int = 8
-    width: int = 8
+    height: int = 16
+    width: int = 16
     n_agents: int = 10
-    actions_per_agent: int = 6
+    actions_per_agent: int = 20
     initial_budget: float = 600.0
     buildings_per_action: int = 1
     enable_externalities: bool = True
+    enable_extended_actions: bool = True
+    enable_district_synergy: bool = True
     use_auction: bool = True
     bids_per_agent: int = BIDS_PER_AGENT
     requirements: Requirements = field(default_factory=lambda: REQUIREMENT_PROFILES["medium"])
@@ -303,6 +308,8 @@ class CityConfig:
             "initial_budget": self.initial_budget,
             "buildings_per_action": self.buildings_per_action,
             "enable_externalities": self.enable_externalities,
+            "enable_extended_actions": self.enable_extended_actions,
+            "enable_district_synergy": self.enable_district_synergy,
             "use_auction": self.use_auction,
             "bids_per_agent": self.bids_per_agent,
             "requirements": self.requirements.as_dict(),

@@ -55,8 +55,12 @@ class TestLiveDemo(unittest.TestCase):
             state = first["frames"][1]
             self.assertEqual(state["type_grid"], [[0, 1, 2], [3, 4, 5]])
             self.assertEqual(state["quality_grid"], [[-1, 0, 1], [2, 0, 1]])
+            self.assertEqual(state["floors_grid"], [[0, 1, 1], [1, 1, 1]])
+            self.assertEqual(state["roof_quality_grid"], [[0, 0, 0], [0, 0, 0]])
             self.assertEqual(state["owner_grid"], [[-1, 0, 1], [2, 3, 4]])
             self.assertEqual(state["action"]["cell"], 2)
+            self.assertEqual(state["action"]["floors"], 1)
+            self.assertEqual(state["action"]["roof_quality"], 0)
             self.assertEqual(read_live_frame(state_path, 1)["round"], 1)
 
             next_batch = read_live_frames(state_path, first["next_offset"])

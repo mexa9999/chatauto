@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -10,12 +11,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from fastapi import HTTPException
+from starlette.requests import Request
 from citysim.config import EvolutionConfig, quick_city_config
 from citysim.dashboard import (
     BranchRequest,
+    BranchRenameRequest,
     CheckoutRequest,
+    FastForwardRequest,
     GCRequest,
+    GenomeCloneRequest,
+    GenomeCompareRequest,
+    GenomeMetadataRequest,
     JobManager,
+    StorageSelectionRequest,
     StartJobRequest,
     _pid_is_running,
     create_app,
@@ -24,6 +33,10 @@ from citysim.dashboard_worker import run_compare
 from citysim.experiment_support import train_evolution
 from citysim.live_demo import update_control_file
 from citysim.training_history import TrainingHistoryStore
+
+
+async def _collect_response(response) -> bytes:
+    return b"".join([chunk async for chunk in response.body_iterator])
 
 
 class TestDashboard(unittest.TestCase):
@@ -164,6 +177,80 @@ class TestDashboard(unittest.TestCase):
                 str(Path(history).resolve()),
             )
 
+    def test_storage_api_manages_branches_and_genomes_with_trash_and_npz_import(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            history = self._create_history(str(Path(output) / "history"))
+            app = create_app(history.root, str(Path(output) / "out"), port=18766)
+            routes = {
+                (route.path, method): route.endpoint
+                for route in app.routes
+                if hasattr(route, "endpoint")
+                for method in getattr(route, "methods", ())
+            }
+
+            routes[("/api/branches", "POST")](BranchRequest(name="feature", from_ref="main@1"))
+            routes[("/api/branches/{name}/fast-forward", "POST")](
+                "feature", FastForwardRequest(to_ref="main@2")
+            )
+            routes[("/api/branches/{name}", "PUT")](
+                "feature", BranchRenameRequest(new_name="renamed")
+            )
+            routes[("/api/branches/{name}", "DELETE")]("renamed")
+            trash = routes[("/api/data/trash", "GET")]()["items"]
+            self.assertTrue(any(item["entity_type"] == "branch" for item in trash))
+            routes[("/api/data/restore", "POST")](
+                StorageSelectionRequest(entity_type="branch", ids=["renamed"])
+            )
+
+            genomes = routes[("/api/genomes", "GET")](
+                branch=None, query="", include_deleted=False
+            )["genomes"]
+            self.assertTrue(genomes)
+            genome_id = genomes[0]["genome_id"]
+            details = routes[("/api/genomes/{genome_id}", "GET")](genome_id)
+            self.assertGreater(details["vector_summary"]["parameter_count"], 0)
+            routes[("/api/genomes/{genome_id}", "PUT")](
+                genome_id, GenomeMetadataRequest(updates={"name": "Reviewed genome"})
+            )
+            clone = routes[("/api/genomes/{genome_id}/clone", "POST")](
+                genome_id, GenomeCloneRequest(name="Clone")
+            )
+            clone_id = clone["genome_id"]
+            comparison = routes[("/api/genomes/compare", "POST")](
+                GenomeCompareRequest(left_id=genome_id, right_id=clone_id)
+            )
+            self.assertEqual(comparison["max_absolute_difference"], 0)
+
+            export_response = routes[("/api/genomes/{genome_id}/export", "GET")](genome_id)
+            chunks = asyncio.run(_collect_response(export_response))
+
+            async def receive():
+                return {"type": "http.request", "body": chunks, "more_body": False}
+
+            request = Request(
+                {"type": "http", "method": "POST", "path": "/api/genomes/import", "headers": []},
+                receive,
+            )
+            imported = asyncio.run(
+                routes[("/api/genomes/import", "POST")](request, name="roundtrip")
+            )
+            self.assertEqual(imported["metadata"]["name"], "roundtrip")
+
+            routes[("/api/data/trash", "POST")](
+                StorageSelectionRequest(entity_type="genome", ids=[clone_id])
+            )
+            routes[("/api/data/restore", "POST")](
+                StorageSelectionRequest(entity_type="genome", ids=[clone_id])
+            )
+            routes[("/api/data/trash", "POST")](
+                StorageSelectionRequest(entity_type="genome", ids=[clone_id])
+            )
+            routes[("/api/data/purge", "POST")](
+                StorageSelectionRequest(entity_type="genome", ids=[clone_id])
+            )
+            with self.assertRaises(HTTPException):
+                routes[("/api/genomes/{genome_id}", "GET")](clone_id)
+
     def test_demo_job_command_uses_isolated_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as output:
             root = Path(output)
@@ -192,6 +279,73 @@ class TestDashboard(unittest.TestCase):
             self.assertIn(str(job_dir / "artifacts" / "frames.jsonl"), command)
             self.assertIn("--control-file", command)
             self.assertNotIn("--stop-file", command)
+
+    def test_round_count_is_passed_to_demo_training_and_experiment_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            root = Path(output)
+            manager = JobManager(root / "history", root / "out")
+
+            for kind in ("demo", "train", "experiment"):
+                job_dir = root / kind
+                request = StartJobRequest(
+                    kind=kind,
+                    quick=True,
+                    rounds=13,
+                    policy="greedy",
+                )
+                command = manager._command(
+                    request.model_dump(),
+                    job_dir,
+                    job_dir / "progress.json",
+                    job_dir / "stop.request",
+                )
+                actions_index = command.index("--actions")
+                self.assertEqual(command[actions_index + 1], "13", kind)
+
+    def test_history_api_returns_empty_commits_for_empty_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            app = create_app(
+                str(Path(output) / "history"),
+                str(Path(output) / "out"),
+                port=18769,
+            )
+            routes = {
+                (route.path, method): route.endpoint
+                for route in app.routes
+                if hasattr(route, "endpoint")
+                for method in getattr(route, "methods", ())
+            }
+
+            self.assertEqual(
+                routes[("/api/history", "GET")]("main"),
+                {"branch": "main", "commits": []},
+            )
+            with self.assertRaises(HTTPException) as raised:
+                routes[("/api/history", "GET")]("missing")
+            self.assertEqual(raised.exception.status_code, 404)
+
+    def test_job_history_reports_exited_worker_as_failed_when_progress_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            root = Path(output)
+            manager = JobManager(root / "history", root / "out")
+            job_id = "a" * 32
+            job_dir = manager.jobs_dir / job_id
+            job_dir.mkdir()
+            (job_dir / "request.json").write_text(
+                json.dumps({"kind": "train", "created_at": 1}),
+                encoding="utf-8",
+            )
+            (job_dir / "progress.json").write_text(
+                json.dumps({"state": "running", "generation": 5}),
+                encoding="utf-8",
+            )
+            process = subprocess.Popen([sys.executable, "-c", "pass"])
+            process.wait(timeout=10)
+            (job_dir / "pid.txt").write_text(str(process.pid), encoding="ascii")
+
+            jobs = manager.list_jobs()
+
+            self.assertEqual(jobs[0]["state"], "failed")
 
     def test_neural_demo_resolves_selected_history_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as output:

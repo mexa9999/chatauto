@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import replace
 from pathlib import Path
 import os
@@ -22,7 +23,8 @@ from .config import (
     quick_city_config,
     quick_evolution_config,
 )
-from .episode import run_episode, run_round, score_episode
+from .analytics import AnalyticsRecorder, write_training_analytics
+from .episode import run_episode, run_round, score_breakdown, score_episode
 from .evolution import layout_from_config
 from .experiments import (
     e1_learning_curve,
@@ -36,6 +38,7 @@ from .experiments import (
     e9_path_dependence,
     e10_regulation,
     e11_shocks,
+    e12_factorial_actions,
     train_evolution,
 )
 from .experiment_support import training_cache
@@ -65,10 +68,21 @@ def parse_seeds(text: str) -> list[int]:
 
 
 def parse_grid(text: str) -> tuple[int, int]:
-    parts = text.lower().replace(" ", "").split("x")
+    normalized = text.translate(str.maketrans({"х": "x", "Х": "x", "×": "x"}))
+    parts = normalized.lower().replace(" ", "").split("x")
     if len(parts) != 2:
         raise argparse.ArgumentTypeError("grid must look like 8x8")
-    return int(parts[0]), int(parts[1])
+    try:
+        height, width = map(int, parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "grid dimensions must be positive integers, e.g. 8x8"
+        ) from exc
+    if height < 1 or width < 1:
+        raise argparse.ArgumentTypeError(
+            "grid dimensions must be positive integers, e.g. 8x8"
+        )
+    return height, width
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -225,9 +239,8 @@ def _load_genome(path: str | None, layout: GenomeLayout, seed: int) -> np.ndarra
         except ValueError as exc:
             raise SystemExit(
                 f"genome {path} has shape {genome.shape}, "
-                f"expected ({layout.parameter_count},) or "
-                f"({layout.previous_parameter_count},) or "
-                f"({layout.legacy_parameter_count},)"
+                f"expected ({layout.parameter_count},); old genome layouts "
+                "are incompatible with the expanded action space"
             ) from exc
     print(
         "no --genome supplied: using a random genome "
@@ -262,6 +275,7 @@ def command_demo(args) -> None:
     city, evo, _ = build_configs(args)
     layout = _layout(evo)
     out = ensure_dir(args.out or "runs/demo")
+    analytics = AnalyticsRecorder(out, "demo", args.seed)
     policy_name = args.policy
     factory = _policy_factory(policy_name, layout, args.genome, args.seed)
     policies = [factory() for _ in range(city.n_agents)]
@@ -310,6 +324,7 @@ def command_demo(args) -> None:
             recorder.record_state(env, "round_start", round_idx)
 
     def on_action(agent_id: int, action, success: bool, env: CityEnvironment):
+        analytics.record_action(agent_id, action, success, env)
         if viz is not None:
             viz.handle_action(agent_id, action, success)
         if recorder is not None:
@@ -317,6 +332,7 @@ def command_demo(args) -> None:
         return None
 
     def on_round_end(round_idx: int, env: CityEnvironment) -> None:
+        analytics.record_round(round_idx, env)
         if viz is not None:
             viz.end_round_pause()
         if recorder is not None:
@@ -356,12 +372,16 @@ def command_demo(args) -> None:
             should_continue=should_continue,
         )
     finally:
+        analytics.close()
         if viz is not None:
             viz.close()
         if recorder is not None:
             recorder.close()
 
     scores = score_episode(result)
+    analytics_summary = analytics.finish(
+        result, scores, score_breakdown(result)
+    )
     write_csv(out / "history.csv", result.history)
     write_json(
         out / "metrics.json",
@@ -375,6 +395,7 @@ def command_demo(args) -> None:
             "state_stream": "frames.jsonl" if state_file else None,
             "shocks": result.shocks,
             "config": city,
+            "analytics": "analytics_summary.json",
         },
     )
     if recorder is None:
@@ -521,6 +542,7 @@ def command_train(args) -> None:
     branch = args.branch or history.active_branch()
     base_config = history.config_for_branch(branch) if args.resume else None
     city, evo, _ = build_configs(args, base_config=base_config)
+    layout = _layout(evo)
     progress = (
         TrainingProgress(args.progress_file, args.stop_file)
         if args.progress_file and args.stop_file
@@ -537,6 +559,38 @@ def command_train(args) -> None:
         branch=branch,
         progress_callback=progress.generation_completed if progress else None,
         stop_requested=progress.stop_requested if progress else None,
+    )
+    training_metadata = {
+        "branch": branch,
+        "seed": evo.seed,
+        "evolution_config": evo.as_dict(),
+        "city_config": city.as_dict(),
+    }
+    write_training_analytics(out, result.history, training_metadata)
+    evaluation_seed = evo.validation_seed_base + 777
+    evaluation_policies = [
+        NeuralPolicy(result.best_genome, layout)
+        for _ in range(city.n_agents)
+    ]
+    evaluation = AnalyticsRecorder(
+        out / "final_evaluation", "training-final-evaluation", evaluation_seed
+    )
+    try:
+        evaluation_result = run_episode(
+            city,
+            evaluation_policies,
+            evaluation_seed,
+            record_history=True,
+            on_action=evaluation.record_action,
+            on_round_end=evaluation.record_round,
+        )
+    finally:
+        evaluation.close()
+    evaluation_scores = score_episode(evaluation_result)
+    evaluation.finish(
+        evaluation_result,
+        evaluation_scores,
+        score_breakdown(evaluation_result),
     )
     if progress is not None:
         from .checkpoint_io import read_checkpoint_metadata
@@ -569,6 +623,31 @@ def command_experiment(args) -> None:
             stop_requested=progress.stop_requested if progress else None,
         ):
             _run_experiment(args, city, evo, seeds, out)
+            series = []
+            for history_path in sorted(out.glob("*_history.csv")):
+                with history_path.open(encoding="utf-8", newline="") as stream:
+                    for row in csv.DictReader(stream):
+                        numeric = {}
+                        for key, value in row.items():
+                            if value is None:
+                                continue
+                            try:
+                                numeric[key] = float(value)
+                            except ValueError:
+                                numeric[key] = value
+                        numeric["series"] = history_path.stem
+                        series.append(numeric)
+            if series:
+                write_training_analytics(
+                    out,
+                    series,
+                    {
+                        "experiment": args.name,
+                        "seeds": seeds,
+                        "evolution_config": evo.as_dict(),
+                        "city_config": city.as_dict(),
+                    },
+                )
             if progress is not None:
                 progress.finish("completed")
     except TrainingStopped:
@@ -616,6 +695,10 @@ def _run_experiment(args, city, evo, seeds, out: Path) -> None:
         summary = e10_regulation(evo, city, seeds, out, eval_seed_count=args.eval_seeds)
     elif name == "e11":
         summary = e11_shocks(evo, city, seeds, out, eval_seed_count=args.eval_seeds)
+    elif name == "e12":
+        summary = e12_factorial_actions(
+            evo, city, seeds, out, eval_seed_count=args.eval_seeds
+        )
     elif name == "all":
         summaries = {}
         summaries["e1"] = e1_learning_curve(evo, city, seeds, out / "e1", args.eval_seeds)
@@ -637,6 +720,9 @@ def _run_experiment(args, city, evo, seeds, out: Path) -> None:
         summaries["e9"] = e9_path_dependence(evo, city, seeds, out / "e9", args.paths)
         summaries["e10"] = e10_regulation(evo, city, seeds, out / "e10", args.eval_seeds)
         summaries["e11"] = e11_shocks(evo, city, seeds, out / "e11", args.eval_seeds)
+        summaries["e12"] = e12_factorial_actions(
+            evo, city, seeds, out / "e12", args.eval_seeds
+        )
         write_json(out / "all_summary.json", summaries)
         summary = {"experiments": list(summaries)}
     else:
@@ -776,7 +862,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--stop-file", type=str, default=None)
     train.set_defaults(func=command_train)
 
-    exp = sub.add_parser("experiment", help="run experiments E1-E11")
+    exp = sub.add_parser("experiment", help="run experiments E1-E12")
     add_common(exp)
     exp.add_argument(
         "--cache-dir",
@@ -801,7 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--stop-file", type=str, default=None)
     exp.add_argument(
         "name",
-        choices=[f"e{i}" for i in range(1, 12)] + ["all"],
+        choices=[f"e{i}" for i in range(1, 13)] + ["all"],
     )
     exp.add_argument("--n-values", type=str, default="5,10,15")
     exp.add_argument("--sweep-grid", type=str, default="12x12")

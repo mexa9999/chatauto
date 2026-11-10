@@ -85,7 +85,14 @@ class TrainingProgress:
                 json.dump(payload, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            for attempt in range(5):
+                try:
+                    os.replace(temporary, self.path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.025 * (2**attempt))
         finally:
             if temporary.exists():
                 temporary.unlink()

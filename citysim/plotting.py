@@ -31,10 +31,21 @@ def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) 
     quality_grid = getattr(
         env, "quality_grid", np.zeros(type_grid.shape, dtype=np.int8)
     )
+    floors_grid = getattr(
+        env, "floors_grid", np.where(type_grid > 0, 1, 0).astype(np.int8)
+    )
+    roof_quality_grid = getattr(
+        env, "roof_quality_grid", np.zeros(type_grid.shape, dtype=np.int8)
+    )
     max_height = max(
-        building_height(type_id, quality, tile_height)
-        for type_id in range(1, 6)
-        for quality in range(3)
+        building_height(
+            int(type_grid[row, col]),
+            int(quality_grid[row, col]),
+            tile_height,
+            int(floors_grid[row, col]),
+        )
+        for row in range(height)
+        for col in range(width)
     )
     bounds = grid_bounds(height, width, tile_width, tile_height, max_height)
     origin_x = height * tile_width / 2.0
@@ -46,7 +57,10 @@ def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) 
     for row, col in cells:
         type_id = int(type_grid[row, col])
         elevation = building_height(
-            type_id, int(quality_grid[row, col]), tile_height
+            type_id,
+            int(quality_grid[row, col]),
+            tile_height,
+            int(floors_grid[row, col]),
         )
         ground, left, right, top = cell_faces(
             row,
@@ -59,11 +73,19 @@ def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) 
             elevation,
         )
         color = matplotlib.colors.to_rgb(TYPE_COLORS[type_id])
+        roof_blend = min(
+            0.6,
+            max(0.0, int(roof_quality_grid[row, col]) / 3.0 * 0.6),
+        )
+        roof_color = tuple(
+            channel * (1.0 - roof_blend) + green * roof_blend
+            for channel, green in zip(color, matplotlib.colors.to_rgb("#54a24b"))
+        )
         faces = [
             (ground, color),
             (left, tuple(channel * 0.58 for channel in color)),
             (right, tuple(channel * 0.76 for channel in color)),
-            (top, color),
+            (top, roof_color),
         ]
         for vertices, face_color in faces:
             if vertices:

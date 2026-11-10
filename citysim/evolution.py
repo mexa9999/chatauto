@@ -35,9 +35,9 @@ from .policy import (
 )
 
 
-_CHECKPOINT_SCHEMA = 1
+_CHECKPOINT_SCHEMA = 2
 # Bump when training semantics change so old cache entries are not reused.
-_TRAINING_PROTOCOL_VERSION = 1
+_TRAINING_PROTOCOL_VERSION = 2
 
 
 def _configuration_digest(config: EvolutionConfig, city_config: CityConfig) -> str:

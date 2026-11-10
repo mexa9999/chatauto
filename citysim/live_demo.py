@@ -77,6 +77,18 @@ class LiveDemoRecorder:
                 "width": env.w,
                 "type_grid": _encode_grid(env.type_grid, "i1"),
                 "quality_grid": _encode_grid(env.quality_grid, "i1"),
+                "floors_grid": _encode_grid(
+                    getattr(env, "floors_grid", np.where(env.type_grid > 0, 1, 0)),
+                    "i1",
+                ),
+                "roof_quality_grid": _encode_grid(
+                    getattr(
+                        env,
+                        "roof_quality_grid",
+                        np.zeros_like(env.type_grid),
+                    ),
+                    "i1",
+                ),
                 "owner_grid": _encode_grid(env.owner_grid, "<i2"),
             }
         )
@@ -158,9 +170,14 @@ def read_live_frames(
                 for name, dtype in (
                     ("type_grid", "i1"),
                     ("quality_grid", "i1"),
+                    ("floors_grid", "i1"),
+                    ("roof_quality_grid", "i1"),
                     ("owner_grid", "<i2"),
                 ):
-                    frame[name] = _decode_grid(frame[name], dtype, height, width)
+                    if name in frame:
+                        frame[name] = _decode_grid(
+                            frame[name], dtype, height, width
+                        )
             frames.append(frame)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ValueError(f"invalid live state frame: {exc}") from exc
@@ -186,11 +203,14 @@ def read_live_frame(path: str | Path, sequence: int) -> dict[str, Any]:
                     for name, dtype in (
                         ("type_grid", "i1"),
                         ("quality_grid", "i1"),
+                        ("floors_grid", "i1"),
+                        ("roof_quality_grid", "i1"),
                         ("owner_grid", "<i2"),
                     ):
-                        frame[name] = _decode_grid(
-                            frame[name], dtype, height, width
-                        )
+                        if name in frame:
+                            frame[name] = _decode_grid(
+                                frame[name], dtype, height, width
+                            )
                 return frame
     raise ValueError(f"unknown live state frame: {sequence}")
 

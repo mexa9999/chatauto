@@ -44,12 +44,16 @@ def diamond(
     ]
 
 
-def building_height(type_id: int, quality: int, tile_height: float) -> float:
-    if type_id <= 0 or type_id == 5:
+def building_height(
+    type_id: int, quality: int, tile_height: float, floors: int = 1
+) -> float:
+    if type_id <= 0:
         return 0.0
+    if type_id == 5:
+        return float(tile_height * 0.25 * max(0, int(floors) - 1))
     type_scale = (0.90, 1.20, 1.05, 1.45)[min(type_id - 1, 3)]
     quality_scale = 0.75 + 0.15 * (int(np.clip(quality, 0, 2)) + 1)
-    return float(tile_height * type_scale * quality_scale)
+    return float(tile_height * type_scale * quality_scale * np.sqrt(max(1, floors)))
 
 
 def cell_faces(
@@ -116,8 +120,11 @@ def hit_test(
     tile_height: float,
     origin_x: float,
     origin_y: float,
+    floors_grid: np.ndarray | None = None,
 ) -> int | None:
     height, width = type_grid.shape
+    if floors_grid is None:
+        floors_grid = np.ones(type_grid.shape, dtype=np.int8)
     for row, col in sorted(
         ((r, c) for r in range(height) for c in range(width)),
         key=lambda cell: (cell[0] + cell[1], cell[1]),
@@ -125,7 +132,10 @@ def hit_test(
     ):
         type_id = int(type_grid[row, col])
         elevation = building_height(
-            type_id, int(quality_grid[row, col]), tile_height
+            type_id,
+            int(quality_grid[row, col]),
+            tile_height,
+            int(floors_grid[row, col]),
         )
         ground, left, right, top = cell_faces(
             row,

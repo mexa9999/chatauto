@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sqlite3
+import io
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -15,6 +16,8 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+import numpy as np
 
 from .checkpoint_io import read_checkpoint_metadata
 from .config import CityConfig, EvolutionConfig, FitnessWeights, Regulation, Requirements
@@ -70,7 +73,9 @@ class TrainingHistoryStore:
                 CREATE TABLE IF NOT EXISTS branches (
                     name TEXT PRIMARY KEY,
                     head_commit TEXT REFERENCES commits(commit_id),
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT,
+                    deleted_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -89,8 +94,43 @@ class TrainingHistoryStore:
                     ON commits(parent_id);
                 CREATE INDEX IF NOT EXISTS commits_branch_generation_idx
                     ON commits(branch_name, generation);
+                CREATE TABLE IF NOT EXISTS genomes (
+                    genome_id TEXT PRIMARY KEY,
+                    source_kind TEXT NOT NULL CHECK (source_kind IN ('checkpoint', 'import')),
+                    commit_id TEXT REFERENCES commits(commit_id) ON DELETE CASCADE,
+                    checkpoint_hash TEXT,
+                    member_kind TEXT,
+                    member_index INTEGER,
+                    object_hash TEXT,
+                    parent_genome_id TEXT,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    deleted_at TEXT,
+                    CHECK (
+                        (source_kind = 'checkpoint' AND commit_id IS NOT NULL
+                            AND checkpoint_hash IS NOT NULL AND member_kind IS NOT NULL
+                            AND member_index IS NOT NULL AND object_hash IS NULL)
+                        OR
+                        (source_kind = 'import' AND commit_id IS NULL
+                            AND checkpoint_hash IS NULL AND member_kind IS NULL
+                            AND member_index IS NULL AND object_hash IS NOT NULL)
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS genomes_commit_idx ON genomes(commit_id);
+                CREATE INDEX IF NOT EXISTS genomes_deleted_idx ON genomes(deleted_at);
+                CREATE TABLE IF NOT EXISTS indexed_genome_commits (
+                    commit_id TEXT PRIMARY KEY REFERENCES commits(commit_id) ON DELETE CASCADE,
+                    indexed_at TEXT NOT NULL
+                );
                 """
             )
+            branch_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(branches)")
+            }
+            if "archived_at" not in branch_columns:
+                connection.execute("ALTER TABLE branches ADD COLUMN archived_at TEXT")
+            if "deleted_at" not in branch_columns:
+                connection.execute("ALTER TABLE branches ADD COLUMN deleted_at TEXT")
             now = datetime.now(timezone.utc).isoformat()
             connection.execute(
                 "INSERT OR IGNORE INTO branches (name, head_commit, created_at) "
@@ -113,9 +153,11 @@ class TrainingHistoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT b.name, b.head_commit, c.generation, c.commit_id
+                SELECT b.name, b.head_commit, c.generation, c.commit_id,
+                       b.archived_at, b.deleted_at
                 FROM branches AS b
                 LEFT JOIN commits AS c ON c.commit_id = b.head_commit
+                WHERE b.deleted_at IS NULL
                 ORDER BY b.name
                 """
             ).fetchall()
@@ -133,14 +175,233 @@ class TrainingHistoryStore:
     def checkout(self, name: str) -> None:
         with self._connect() as connection:
             exists = connection.execute(
-                "SELECT 1 FROM branches WHERE name = ?", (name,)
+                "SELECT archived_at FROM branches WHERE name = ? AND deleted_at IS NULL",
+                (name,),
             ).fetchone()
             if exists is None:
                 raise ValueError(f"unknown branch: {name}")
+            if exists["archived_at"] is not None:
+                raise ValueError(f"branch is archived: {name}")
             connection.execute(
                 "UPDATE settings SET value = ? WHERE key = 'active_branch'",
                 (name,),
             )
+
+    def rename_branch(self, name: str, new_name: str) -> None:
+        self._validate_branch_name(new_name)
+        old_work = self.work_path(name)
+        new_work = self.work_path(new_name)
+        if old_work.exists() and new_work.exists():
+            raise FileExistsError(f"branch work file already exists: {new_work}")
+        moved_work = old_work.is_file()
+        if moved_work:
+            os.replace(old_work, new_work)
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT 1 FROM branches WHERE name = ? AND deleted_at IS NULL",
+                    (name,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"unknown branch: {name}")
+                if connection.execute(
+                    "SELECT 1 FROM branches WHERE name = ?", (new_name,)
+                ).fetchone():
+                    raise ValueError(f"branch already exists: {new_name}")
+                connection.execute(
+                    "UPDATE branches SET name = ? WHERE name = ?", (new_name, name)
+                )
+                connection.execute(
+                    "UPDATE settings SET value = ? "
+                    "WHERE key = 'active_branch' AND value = ?",
+                    (new_name, name),
+                )
+        except Exception:
+            if moved_work and new_work.exists():
+                os.replace(new_work, old_work)
+            raise
+
+    def archive_branch(self, name: str, archived: bool = True) -> None:
+        if name == self.active_branch() and archived:
+            raise ValueError("checkout another branch before archiving the active branch")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE branches SET archived_at = ? "
+                "WHERE name = ? AND deleted_at IS NULL",
+                (
+                    datetime.now(timezone.utc).isoformat() if archived else None,
+                    name,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"unknown branch: {name}")
+
+    def delete_branch(self, name: str) -> None:
+        self.delete_branches([name])
+
+    def delete_branches(self, names: list[str]) -> int:
+        if not names:
+            raise ValueError("select at least one branch")
+        unique_names = list(dict.fromkeys(names))
+        if self.active_branch() in unique_names:
+            raise ValueError("checkout another branch before deleting the active branch")
+        placeholders = ",".join("?" for _ in unique_names)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT name FROM branches WHERE name IN ({placeholders}) "
+                "AND deleted_at IS NULL",
+                unique_names,
+            ).fetchall()
+            if len(rows) != len(unique_names):
+                raise ValueError("one or more branches are unknown or already in the trash")
+            live_count = connection.execute(
+                "SELECT COUNT(*) FROM branches WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            if live_count <= len(unique_names):
+                raise ValueError("cannot delete the last active branch")
+            cursor = connection.execute(
+                f"UPDATE branches SET deleted_at = ? WHERE name IN ({placeholders}) "
+                "AND deleted_at IS NULL",
+                (datetime.now(timezone.utc).isoformat(), *unique_names),
+            )
+            return cursor.rowcount
+
+    def restore_branch(self, name: str) -> None:
+        self.restore_branches([name])
+
+    def restore_branches(self, names: list[str]) -> int:
+        if not names:
+            raise ValueError("select at least one branch")
+        unique_names = list(dict.fromkeys(names))
+        placeholders = ",".join("?" for _ in unique_names)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT name FROM branches WHERE name IN ({placeholders}) "
+                "AND deleted_at IS NOT NULL",
+                unique_names,
+            ).fetchall()
+            if len(rows) != len(unique_names):
+                raise ValueError("one or more branches are not in the trash")
+            cursor = connection.execute(
+                f"UPDATE branches SET deleted_at = NULL WHERE name IN ({placeholders}) "
+                "AND deleted_at IS NOT NULL",
+                unique_names,
+            )
+            return cursor.rowcount
+
+    def trash_branches(self) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT name, head_commit, deleted_at FROM branches "
+                "WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def purge_branch(self, name: str) -> None:
+        if name == self.active_branch():
+            raise ValueError("the active branch cannot be permanently deleted")
+        with self._connect() as connection:
+            live_count = connection.execute(
+                "SELECT COUNT(*) FROM branches WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            cursor = connection.execute(
+                "DELETE FROM branches WHERE name = ? AND deleted_at IS NOT NULL",
+                (name,),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"branch is not in the trash: {name}")
+            if live_count == 0:
+                raise RuntimeError("training history must keep at least one branch")
+
+    def trash_genomes(self) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT genome_id, metadata_json, deleted_at
+                FROM genomes WHERE deleted_at IS NOT NULL
+                ORDER BY deleted_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "genome_id": row["genome_id"],
+                "metadata": json.loads(row["metadata_json"]),
+                "deleted_at": row["deleted_at"],
+            }
+            for row in rows
+        ]
+
+    def purge_genomes(self, genome_ids: list[str]) -> int:
+        if not genome_ids:
+            raise ValueError("select at least one genome")
+        placeholders = ",".join("?" for _ in genome_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT genome_id FROM genomes WHERE genome_id IN ({placeholders}) "
+                "AND deleted_at IS NOT NULL",
+                genome_ids,
+            ).fetchall()
+            if len(rows) != len(set(genome_ids)):
+                raise ValueError("one or more genomes are not in the trash")
+            connection.execute(
+                f"DELETE FROM genomes WHERE genome_id IN ({placeholders})", genome_ids
+            )
+        return len(rows)
+
+    def purge_branches(self, names: list[str]) -> int:
+        if not names:
+            raise ValueError("select at least one branch")
+        if self.active_branch() in names:
+            raise ValueError("the active branch cannot be permanently deleted")
+        placeholders = ",".join("?" for _ in names)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT name FROM branches WHERE name IN ({placeholders}) "
+                "AND deleted_at IS NOT NULL",
+                names,
+            ).fetchall()
+            if len(rows) != len(set(names)):
+                raise ValueError("one or more branches are not in the trash")
+            total_live = connection.execute(
+                "SELECT COUNT(*) FROM branches WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            connection.execute(
+                f"DELETE FROM branches WHERE name IN ({placeholders})", names
+            )
+            if total_live < 1:
+                raise ValueError("training history must keep at least one branch")
+        return len(rows)
+
+    def fast_forward_branch(self, name: str, to_ref: str) -> str:
+        target = self.resolve_ref(to_ref)
+        with self._connect() as connection:
+            branch = connection.execute(
+                "SELECT head_commit FROM branches "
+                "WHERE name = ? AND deleted_at IS NULL AND archived_at IS NULL",
+                (name,),
+            ).fetchone()
+            if branch is None:
+                raise ValueError(f"unknown or archived branch: {name}")
+            current = branch["head_commit"]
+            if current is not None:
+                row = connection.execute(
+                    """
+                    WITH RECURSIVE ancestry(commit_id, parent_id) AS (
+                        SELECT commit_id, parent_id FROM commits WHERE commit_id = ?
+                        UNION ALL
+                        SELECT c.commit_id, c.parent_id
+                        FROM commits c JOIN ancestry a ON c.commit_id = a.parent_id
+                    )
+                    SELECT 1 FROM ancestry WHERE commit_id = ? LIMIT 1
+                    """,
+                    (target, current),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("fast-forward target is not a descendant of the branch head")
+            connection.execute(
+                "UPDATE branches SET head_commit = ? WHERE name = ?", (target, name)
+            )
+        return target
 
     def config_for_branch(self, branch: str) -> tuple[CityConfig, EvolutionConfig]:
         commit_id = self.resolve_ref(branch)
@@ -264,6 +525,367 @@ class TrainingHistoryStore:
         if not path.is_file():
             raise FileNotFoundError(f"checkpoint object is missing: {path}")
         return path
+
+    def list_genomes(
+        self,
+        *,
+        branch: str | None = None,
+        query: str = "",
+        include_deleted: bool = False,
+    ) -> list[dict]:
+        self._index_missing_genomes()
+        with self._connect() as connection:
+            branch_names = (
+                [branch]
+                if branch is not None
+                else [
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM branches WHERE deleted_at IS NULL"
+                    )
+                ]
+            )
+            visible_commits: set[str] = set()
+            for name in branch_names:
+                row = connection.execute(
+                    "SELECT head_commit FROM branches "
+                    "WHERE name = ? AND deleted_at IS NULL",
+                    (name,),
+                ).fetchone()
+                if row is None:
+                    if branch is not None:
+                        raise ValueError(f"unknown branch: {name}")
+                    continue
+                commit_id = row["head_commit"]
+                while commit_id and commit_id not in visible_commits:
+                    visible_commits.add(commit_id)
+                    parent = connection.execute(
+                        "SELECT parent_id FROM commits WHERE commit_id = ?",
+                        (commit_id,),
+                    ).fetchone()
+                    commit_id = parent["parent_id"] if parent else None
+            deleted_filter = "" if include_deleted else "AND g.deleted_at IS NULL"
+            rows = connection.execute(
+                f"""
+                SELECT g.*, c.generation, c.branch_name
+                FROM genomes g
+                LEFT JOIN commits c ON c.commit_id = g.commit_id
+                WHERE 1 = 1 {deleted_filter}
+                ORDER BY g.created_at DESC, g.genome_id
+                """
+            ).fetchall()
+        needle = query.casefold().strip()
+        results = []
+        for row in rows:
+            item = dict(row)
+            metadata = json.loads(item.pop("metadata_json"))
+            item["metadata"] = metadata
+            if item["source_kind"] == "checkpoint" and item["commit_id"] not in visible_commits:
+                continue
+            if branch is not None and item["source_kind"] == "import":
+                if metadata.get("branch") != branch:
+                    continue
+            if needle and needle not in " ".join(
+                str(value)
+                for value in (
+                    item["genome_id"],
+                    item["member_kind"],
+                    item["branch_name"],
+                    item["generation"],
+                    metadata,
+                )
+            ).casefold():
+                continue
+            results.append(item)
+        return results
+
+    def genome(self, genome_id: str) -> tuple[dict, np.ndarray]:
+        self._index_missing_genomes()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT g.*, c.generation, c.branch_name
+                FROM genomes g LEFT JOIN commits c ON c.commit_id = g.commit_id
+                WHERE g.genome_id = ?
+                """,
+                (genome_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown genome: {genome_id}")
+        item = dict(row)
+        item["metadata"] = json.loads(item.pop("metadata_json"))
+        if item["source_kind"] == "checkpoint":
+            path = self.objects / f"{item['checkpoint_hash']}.npz"
+            key = {
+                "best": "best_ever_genome",
+                "population": "population_genomes",
+                "hall_of_fame": "hall_of_fame_genomes",
+                "map_elites": "archive_genomes",
+            }[item["member_kind"]]
+            with np.load(path, allow_pickle=False) as archive:
+                vector = archive[key]
+                if vector.ndim == 2:
+                    vector = vector[int(item["member_index"])]
+                vector = np.asarray(vector, dtype=np.float64).copy()
+        else:
+            path = self.genome_objects / f"{item['object_hash']}.npy"
+            with path.open("rb") as stream:
+                vector = np.load(stream, allow_pickle=False)
+            vector = np.asarray(vector, dtype=np.float64)
+        if vector.ndim != 1 or not np.isfinite(vector).all():
+            raise ValueError(f"stored genome has invalid numeric data: {genome_id}")
+        return item, vector
+
+    @property
+    def genome_objects(self) -> Path:
+        path = self.root / "genome_objects"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def import_genome(self, metadata: dict, vector: np.ndarray) -> dict:
+        vector = np.asarray(vector, dtype=np.float64)
+        if vector.ndim != 1 or vector.size < 1 or not np.isfinite(vector).all():
+            raise ValueError("genome must be a non-empty finite one-dimensional vector")
+        if metadata.get("format") != "citysim-genome" or metadata.get("version") != 1:
+            raise ValueError("unsupported genome file; expected CitySim genome format v1")
+        if int(metadata.get("parameter_count", -1)) != vector.size:
+            raise ValueError("genome parameter_count does not match the vector size")
+        buffer = io.BytesIO()
+        np.save(buffer, vector, allow_pickle=False)
+        payload = buffer.getvalue()
+        object_hash = hashlib.sha256(payload).hexdigest()
+        object_path = self.genome_objects / f"{object_hash}.npy"
+        if not object_path.exists():
+            temporary = object_path.with_name(f".{object_hash}.{uuid.uuid4().hex}.tmp")
+            try:
+                with temporary.open("wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, object_path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+        genome_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        clean_metadata = dict(metadata)
+        clean_metadata.setdefault("name", "Imported genome")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO genomes (
+                    genome_id, source_kind, object_hash, parent_genome_id,
+                    metadata_json, created_at
+                ) VALUES (?, 'import', ?, NULL, ?, ?)
+                """,
+                (
+                    genome_id,
+                    object_hash,
+                    json.dumps(clean_metadata, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+        return {"genome_id": genome_id, "metadata": clean_metadata}
+
+    def update_genome_metadata(self, genome_id: str, updates: dict) -> dict:
+        allowed = {"name", "notes", "tags"}
+        if set(updates) - allowed:
+            raise ValueError(f"only these metadata fields can be edited: {', '.join(sorted(allowed))}")
+        if "name" in updates:
+            name = str(updates["name"]).strip()
+            if not name or len(name) > 100:
+                raise ValueError("genome name must contain 1-100 characters")
+            updates["name"] = name
+        if "notes" in updates and len(str(updates["notes"])) > 2000:
+            raise ValueError("genome notes must not exceed 2000 characters")
+        if "tags" in updates:
+            tags = updates["tags"]
+            if not isinstance(tags, list) or any(
+                not isinstance(tag, str) or len(tag) > 40 for tag in tags
+            ):
+                raise ValueError("genome tags must be a list of strings up to 40 characters")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM genomes WHERE genome_id = ? AND deleted_at IS NULL",
+                (genome_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown active genome: {genome_id}")
+            metadata = json.loads(row["metadata_json"])
+            metadata.update(updates)
+            connection.execute(
+                "UPDATE genomes SET metadata_json = ? WHERE genome_id = ?",
+                (json.dumps(metadata, ensure_ascii=False, sort_keys=True), genome_id),
+            )
+        return metadata
+
+    def clone_genome(self, genome_id: str, name: str | None = None) -> dict:
+        source, vector = self.genome(genome_id)
+        metadata = dict(source["metadata"])
+        if source["source_kind"] == "checkpoint":
+            checkpoint_metadata = read_checkpoint_metadata(
+                self.objects / f"{source['checkpoint_hash']}.npz"
+            )
+            metadata["architecture"] = checkpoint_metadata["evolution_config"]
+        metadata.update(
+            {
+                "format": "citysim-genome",
+                "version": 1,
+                "parameter_count": int(vector.size),
+            }
+        )
+        metadata["name"] = (name or f"{metadata.get('name', 'Genome')} copy").strip()
+        if not metadata["name"] or len(metadata["name"]) > 100:
+            raise ValueError("genome name must contain 1-100 characters")
+        metadata["cloned_from"] = genome_id
+        result = self.import_genome(metadata, vector)
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE genomes SET parent_genome_id = ? WHERE genome_id = ?",
+                (genome_id, result["genome_id"]),
+            )
+        return result
+
+    def delete_genomes(self, genome_ids: list[str]) -> int:
+        if not genome_ids:
+            raise ValueError("select at least one genome")
+        unique_ids = list(dict.fromkeys(genome_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT genome_id FROM genomes WHERE genome_id IN ({placeholders}) "
+                "AND deleted_at IS NULL",
+                unique_ids,
+            ).fetchall()
+            if len(rows) != len(unique_ids):
+                raise ValueError("one or more genomes are unknown or already in the trash")
+            cursor = connection.execute(
+                f"UPDATE genomes SET deleted_at = ? WHERE genome_id IN ({placeholders}) "
+                "AND deleted_at IS NULL",
+                (datetime.now(timezone.utc).isoformat(), *unique_ids),
+            )
+            return cursor.rowcount
+
+    def restore_genome(self, genome_id: str) -> None:
+        self.restore_genomes([genome_id])
+
+    def restore_genomes(self, genome_ids: list[str]) -> int:
+        if not genome_ids:
+            raise ValueError("select at least one genome")
+        unique_ids = list(dict.fromkeys(genome_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT genome_id FROM genomes WHERE genome_id IN ({placeholders}) "
+                "AND deleted_at IS NOT NULL",
+                unique_ids,
+            ).fetchall()
+            if len(rows) != len(unique_ids):
+                raise ValueError("one or more genomes are not in the trash")
+            cursor = connection.execute(
+                f"UPDATE genomes SET deleted_at = NULL WHERE genome_id IN ({placeholders}) "
+                "AND deleted_at IS NOT NULL",
+                unique_ids,
+            )
+            return cursor.rowcount
+
+    def compare_genomes(self, left_id: str, right_id: str) -> dict:
+        left_meta, left = self.genome(left_id)
+        right_meta, right = self.genome(right_id)
+        if left.shape != right.shape:
+            raise ValueError("genomes use different parameter counts and cannot be compared")
+        left_norm = float(np.linalg.norm(left))
+        right_norm = float(np.linalg.norm(right))
+        cosine = (
+            float(np.dot(left, right) / (left_norm * right_norm))
+            if left_norm and right_norm
+            else None
+        )
+        difference = left - right
+        return {
+            "left": {"genome_id": left_id, "metadata": left_meta["metadata"]},
+            "right": {"genome_id": right_id, "metadata": right_meta["metadata"]},
+            "parameter_count": int(left.size),
+            "mean_absolute_difference": float(np.mean(np.abs(difference))),
+            "max_absolute_difference": float(np.max(np.abs(difference))),
+            "l2_distance": float(np.linalg.norm(difference)),
+            "cosine_similarity": cosine,
+        }
+
+    def _index_missing_genomes(self) -> None:
+        with self._connect() as connection:
+            commits = connection.execute(
+                """
+                SELECT c.commit_id, c.checkpoint_hash, c.generation, c.branch_name
+                FROM commits c LEFT JOIN indexed_genome_commits i ON i.commit_id = c.commit_id
+                WHERE i.commit_id IS NULL ORDER BY c.created_at
+                """
+            ).fetchall()
+        for commit in commits:
+            checkpoint_path = self.objects / f"{commit['checkpoint_hash']}.npz"
+            records = []
+            with np.load(checkpoint_path, allow_pickle=False) as archive:
+                for kind, array_name in (
+                    ("best", "best_ever_genome"),
+                    ("population", "population_genomes"),
+                    ("hall_of_fame", "hall_of_fame_genomes"),
+                    ("map_elites", "archive_genomes"),
+                ):
+                    if array_name not in archive.files:
+                        continue
+                    genomes = archive[array_name]
+                    if genomes.ndim == 1:
+                        genomes = genomes.reshape(1, -1)
+                    fitness_name = {
+                        "population": "population_fitness",
+                        "hall_of_fame": "hall_of_fame_fitness",
+                        "map_elites": "archive_fitness",
+                    }.get(kind)
+                    fitness = archive[fitness_name] if fitness_name in archive.files else None
+                    for index, vector in enumerate(genomes):
+                        if vector.ndim != 1 or not np.isfinite(vector).all():
+                            raise ValueError(
+                                f"invalid {kind} genome in checkpoint {commit['commit_id']}"
+                            )
+                        genome_id = hashlib.sha256(
+                            f"{commit['commit_id']}:{kind}:{index}".encode("ascii")
+                        ).hexdigest()
+                        metadata = {
+                            "name": f"{kind.replace('_', ' ').title()} · gen {commit['generation']} · {index + 1}",
+                            "kind": kind,
+                            "generation": int(commit["generation"]),
+                            "branch": str(commit["branch_name"]),
+                            "parameter_count": int(vector.size),
+                        }
+                        if fitness is not None and index < len(fitness):
+                            metadata["fitness"] = float(fitness[index])
+                        records.append(
+                            (
+                                genome_id,
+                                commit["commit_id"],
+                                commit["checkpoint_hash"],
+                                kind,
+                                index,
+                                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                            )
+                        )
+            with self._connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO genomes (
+                        genome_id, source_kind, commit_id, checkpoint_hash,
+                        member_kind, member_index, metadata_json, created_at
+                    ) VALUES (?, 'checkpoint', ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (*record, datetime.now(timezone.utc).isoformat())
+                        for record in records
+                    ],
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO indexed_genome_commits (commit_id, indexed_at) VALUES (?, ?)",
+                    (commit["commit_id"], datetime.now(timezone.utc).isoformat()),
+                )
 
     def restore_experiment_checkpoint(
         self, configuration_digest: str, destination: str | Path
@@ -507,7 +1129,7 @@ class TrainingHistoryStore:
 
         removed_objects = []
         for name in plan["objects"]:
-            path = self.objects / name
+            path = self.root / name
             if path.exists():
                 path.unlink()
                 removed_objects.append(name)
@@ -549,13 +1171,27 @@ class TrainingHistoryStore:
         ).fetchall()
         referenced_objects.update(row["checkpoint_hash"] for row in cached_objects)
         orphan_objects = sorted(
-            path.name
+            f"objects/{path.name}"
             for path in self.objects.glob("*.npz")
             if path.is_file()
             and re.fullmatch(r"[a-f0-9]{64}", path.stem)
             and path.stem not in referenced_objects
         )
-        total_bytes = sum((self.objects / name).stat().st_size for name in orphan_objects)
+        referenced_genomes = {
+            row["object_hash"]
+            for row in connection.execute(
+                "SELECT object_hash FROM genomes WHERE object_hash IS NOT NULL"
+            )
+        }
+        orphan_objects.extend(
+            f"genome_objects/{path.name}"
+            for path in self.genome_objects.glob("*.npy")
+            if path.is_file()
+            and re.fullmatch(r"[a-f0-9]{64}", path.stem)
+            and path.stem not in referenced_genomes
+        )
+        orphan_objects.sort()
+        total_bytes = sum((self.root / name).stat().st_size for name in orphan_objects)
         payload = json.dumps(
             {"commits": unreachable, "objects": orphan_objects},
             sort_keys=True,

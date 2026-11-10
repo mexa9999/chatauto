@@ -75,7 +75,8 @@ class ExperimentStore:
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
                     request_json TEXT NOT NULL,
-                    directory TEXT NOT NULL
+                    directory TEXT NOT NULL,
+                    deleted_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS datasets (
                     dataset_id TEXT PRIMARY KEY,
@@ -85,7 +86,8 @@ class ExperimentStore:
                     source_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     manifest_json TEXT NOT NULL,
-                    directory TEXT NOT NULL
+                    directory TEXT NOT NULL,
+                    deleted_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS import_previews (
                     token TEXT PRIMARY KEY,
@@ -97,6 +99,13 @@ class ExperimentStore:
                 );
                 """
             )
+            for table in ("runs", "datasets"):
+                columns = {
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                if "deleted_at" not in columns:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN deleted_at TEXT")
             connection.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES ('source_id', ?)",
                 (uuid.uuid4().hex,),
@@ -151,7 +160,7 @@ class ExperimentStore:
             rows = connection.execute(
                 """
                 SELECT run_id, kind, state, created_at, completed_at, request_json
-                FROM runs ORDER BY created_at DESC
+                FROM runs WHERE deleted_at IS NULL ORDER BY created_at DESC
                 """
             ).fetchall()
         result = []
@@ -168,12 +177,68 @@ class ExperimentStore:
             )
         return result
 
+    def analytics_sources(self) -> list[dict]:
+        with self._connect() as connection:
+            runs = connection.execute(
+                """
+                SELECT run_id, kind, state, created_at, directory
+                FROM runs WHERE deleted_at IS NULL ORDER BY created_at DESC
+                """
+            ).fetchall()
+            datasets = connection.execute(
+                """
+                SELECT dataset_id, name, created_at, manifest_json, directory
+                FROM datasets WHERE deleted_at IS NULL ORDER BY created_at DESC
+                """
+            ).fetchall()
+        sources = [
+            {
+                "source_id": row["run_id"],
+                "source_type": "run",
+                "label": f"{row['kind']} · {row['run_id'][:8]}",
+                "kind": row["kind"],
+                "state": row["state"],
+                "created_at": row["created_at"],
+                "available": _has_analytics(Path(row["directory"])),
+            }
+            for row in runs
+        ]
+        for row in datasets:
+            run = json.loads(row["manifest_json"]).get("run", {})
+            run_directory = Path(row["directory"]) / "run"
+            sources.append(
+                {
+                    "source_id": row["dataset_id"],
+                    "source_type": "dataset",
+                    "label": row["name"],
+                    "kind": run.get("kind", "imported"),
+                    "state": run.get("state", "imported"),
+                    "created_at": row["created_at"],
+                    "available": _has_analytics(run_directory),
+                }
+            )
+        return sources
+
+    def analytics_directory(self, source_type: str, source_id: str) -> Path | None:
+        if source_type == "run":
+            query = "SELECT directory FROM runs WHERE run_id = ?"
+        elif source_type == "dataset":
+            query = "SELECT directory FROM datasets WHERE dataset_id = ?"
+        else:
+            raise ValueError(f"Unknown analytics source type: {source_type}")
+        with self._connect() as connection:
+            row = connection.execute(query, (source_id,)).fetchone()
+        if row is None:
+            return None
+        directory = Path(row["directory"])
+        return directory if source_type == "run" else directory / "run"
+
     def list_datasets(self) -> list[dict]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT dataset_id, name, mode, source_id, created_at, manifest_json
-                FROM datasets ORDER BY created_at DESC
+                FROM datasets WHERE deleted_at IS NULL ORDER BY created_at DESC
                 """
             ).fetchall()
             active = connection.execute(
@@ -199,6 +264,130 @@ class ExperimentStore:
                 }
             )
         return datasets
+
+    def trash(self) -> list[dict]:
+        with self._connect() as connection:
+            runs = connection.execute(
+                """
+                SELECT run_id AS id, kind AS name, 'run' AS entity_type, deleted_at
+                FROM runs WHERE deleted_at IS NOT NULL
+                """
+            ).fetchall()
+            datasets = connection.execute(
+                """
+                SELECT dataset_id AS id, name, 'dataset' AS entity_type, deleted_at
+                FROM datasets WHERE deleted_at IS NOT NULL
+                """
+            ).fetchall()
+        return sorted(
+            [dict(row) for row in (*runs, *datasets)],
+            key=lambda row: row["deleted_at"],
+            reverse=True,
+        )
+
+    def trash_entities(self, entity_type: str, ids: list[str]) -> int:
+        if entity_type not in {"run", "dataset"}:
+            raise ValueError("entity_type must be run or dataset")
+        if not ids:
+            raise ValueError("select at least one item")
+        placeholders = ",".join("?" for _ in ids)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            if entity_type == "run":
+                rows = connection.execute(
+                    f"SELECT run_id, state FROM runs WHERE run_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                if len(rows) != len(set(ids)):
+                    raise ValueError("one or more runs do not exist")
+                if any(row["state"] in {"running", "stopping"} for row in rows):
+                    raise ValueError("running tasks cannot be moved to the trash")
+                cursor = connection.execute(
+                    f"UPDATE runs SET deleted_at = ? WHERE run_id IN ({placeholders}) "
+                    "AND deleted_at IS NULL",
+                    (now, *ids),
+                )
+            else:
+                rows = connection.execute(
+                    f"SELECT dataset_id, directory FROM datasets "
+                    f"WHERE dataset_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                if len(rows) != len(set(ids)):
+                    raise ValueError("one or more datasets do not exist")
+                active_path = self.active_history_dir()
+                if any(
+                    active_path == (Path(row["directory"]) / "history").resolve()
+                    for row in rows
+                ):
+                    raise ValueError("switch away from the active dataset before deleting it")
+                cursor = connection.execute(
+                    f"UPDATE datasets SET deleted_at = ? "
+                    f"WHERE dataset_id IN ({placeholders}) AND deleted_at IS NULL",
+                    (now, *ids),
+                )
+            return cursor.rowcount
+
+    def restore_entities(self, entity_type: str, ids: list[str]) -> int:
+        if entity_type not in {"run", "dataset"}:
+            raise ValueError("entity_type must be run or dataset")
+        if not ids:
+            raise ValueError("select at least one item")
+        table, key = (
+            ("runs", "run_id") if entity_type == "run" else ("datasets", "dataset_id")
+        )
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE {table} SET deleted_at = NULL "
+                f"WHERE {key} IN ({placeholders}) AND deleted_at IS NOT NULL",
+                ids,
+            )
+            if cursor.rowcount != len(set(ids)):
+                raise ValueError("one or more items are not in the trash")
+            return cursor.rowcount
+
+    def purge_entities(self, entity_type: str, ids: list[str]) -> int:
+        if entity_type not in {"run", "dataset"}:
+            raise ValueError("entity_type must be run or dataset")
+        if not ids:
+            raise ValueError("select at least one item")
+        table, key, root = (
+            ("runs", "run_id", self.root.parent / "jobs")
+            if entity_type == "run"
+            else ("datasets", "dataset_id", self.datasets)
+        )
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {key}, directory, state FROM {table} "
+                f"WHERE {key} IN ({placeholders}) AND deleted_at IS NOT NULL",
+                ids,
+            ).fetchall()
+            if len(rows) != len(set(ids)):
+                raise ValueError("one or more items are not in the trash")
+            if entity_type == "run" and any(
+                row["state"] in {"running", "stopping"} for row in rows
+            ):
+                raise ValueError("running tasks cannot be permanently deleted")
+            if entity_type == "dataset":
+                active_path = self.active_history_dir()
+                if any(
+                    active_path == (Path(row["directory"]) / "history").resolve()
+                    for row in rows
+                ):
+                    raise ValueError("switch away from the active dataset before deleting it")
+            paths = [Path(row["directory"]).resolve() for row in rows]
+            root = root.resolve()
+            if any(not path.is_relative_to(root) for path in paths):
+                raise ValueError("refusing to delete data outside the managed storage root")
+            for path in paths:
+                if path.exists():
+                    shutil.rmtree(path)
+            connection.execute(
+                f"DELETE FROM {table} WHERE {key} IN ({placeholders})", ids
+            )
+        return len(rows)
 
     def dataset_details(self, dataset_id: str) -> dict:
         with self._connect() as connection:
@@ -569,6 +758,18 @@ class ExperimentStore:
 def _validate_name(name: str) -> None:
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name.strip()):
         raise ValueError("Dataset name must be 1-100 characters without path characters")
+
+
+def _has_analytics(directory: Path) -> bool:
+    return any(
+        (directory / name).is_file()
+        for name in (
+            "analytics_summary.json",
+            "training_metrics.json",
+            "history.csv",
+            "metrics.json",
+        )
+    ) or any(directory.glob("*_history.csv"))
 
 
 def _read_manifest(archive_path: Path) -> dict:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +15,7 @@ from citysim.citizens import CitizenPool
 from citysim.config import (
     BID_MAX,
     EvolutionConfig,
+    MAX_FLOORS_BY_ACTION,
     N_CELL_FEATURES,
     N_GLOBAL_FEATURES,
     REGULATION_SCENARIOS,
@@ -52,36 +54,24 @@ def first_buildable(env: CityEnvironment, skip: int = 0) -> int:
 class TestGenome(unittest.TestCase):
     def test_parameter_count_and_shapes(self) -> None:
         layout = DEFAULT_LAYOUT
-        self.assertEqual(N_CELL_FEATURES, 23)
+        self.assertEqual(N_CELL_FEATURES, 24)
         self.assertEqual(N_GLOBAL_FEATURES, 10)
-        self.assertEqual(layout.cell_mlp_input, 44)
-        self.assertEqual(layout.legacy_parameter_count, 6491)
-        self.assertEqual(layout.previous_parameter_count, 6540)
-        self.assertEqual(layout.parameter_count, 22860)
+        self.assertEqual(layout.cell_mlp_input, 45)
+        self.assertEqual(layout.parameter_count, 24136)
+        self.assertLessEqual(layout.parameter_count, 5 * 22860)
         rng = np.random.default_rng(0)
         genome = random_genome(rng, layout)
-        self.assertEqual(genome.shape, (22860,))
+        self.assertEqual(genome.shape, (24136,))
         policy = NeuralPolicy(genome, layout)
-        self.assertEqual(policy.W1.shape, (44, 48))
+        self.assertEqual(policy.W1.shape, (45, 48))
         self.assertEqual(policy.W_type.shape, (48, 5))
+        self.assertEqual(policy.W_floors.shape, (48, 20))
+        self.assertEqual(policy.W_roof.shape, (48, 4))
 
-    def test_legacy_genome_disables_demolition_head(self) -> None:
-        legacy_genome = np.zeros(DEFAULT_LAYOUT.legacy_parameter_count)
-        policy = NeuralPolicy(legacy_genome)
-        self.assertEqual(policy.genome.shape, (DEFAULT_LAYOUT.parameter_count,))
-        self.assertEqual(float(policy.b_demolish[0]), -1e6)
-        self.assertTrue(np.all(policy.W_recurrent_out == 0.0))
-        policy._update_recurrent_state(
-            np.ones((4, DEFAULT_LAYOUT.hidden_size)), 2, 2
-        )
-        self.assertIsNone(policy._recurrent_state)
-
-    def test_pre_recurrence_genome_keeps_demolition_and_neutral_gru(self) -> None:
-        previous_genome = np.zeros(DEFAULT_LAYOUT.previous_parameter_count)
-        previous_genome[-1] = -0.5
-        policy = NeuralPolicy(previous_genome)
-        self.assertEqual(float(policy.b_demolish[0]), -0.5)
-        self.assertTrue(np.all(policy.W_recurrent_out == 0.0))
+    def test_old_genome_layouts_are_rejected(self) -> None:
+        for size in (22860, 6540, 6491):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                DEFAULT_LAYOUT.normalize(np.zeros(size))
 
     def test_per_cell_gru_state_updates_and_resets(self) -> None:
         policy = NeuralPolicy(random_genome(np.random.default_rng(8)))
@@ -124,6 +114,26 @@ class TestGenome(unittest.TestCase):
             self.assertLessEqual(action.bid, BID_MAX * city.initial_budget + 1e-9)
             self.assertLessEqual(action.bid, city.initial_budget / 10.0 + 1e-9)
 
+    def test_neural_heads_choose_factorized_dimensions(self) -> None:
+        city = quick_city_config(
+            n_agents=1, actions_per_agent=2, initial_budget=50_000
+        )
+        env = CityEnvironment(city, seed=5)
+        policy = NeuralPolicy(np.zeros(DEFAULT_LAYOUT.parameter_count))
+        policy.b_floors[11] = 100.0
+        policy.b_roof[3] = 100.0
+        action = policy.act(env, 0, np.random.default_rng(6))
+        self.assertFalse(action.is_pass)
+        self.assertEqual(action.floors, 12)
+        self.assertEqual(action.roof_quality, 3)
+
+        old_space = CityEnvironment(
+            replace(city, enable_extended_actions=False), seed=5
+        )
+        neutral = policy.act(old_space, 0, np.random.default_rng(6))
+        self.assertEqual(neutral.floors, 1)
+        self.assertEqual(neutral.roof_quality, 0)
+
 
 class TestObservationAndEconomy(unittest.TestCase):
     def test_observation_contract(self) -> None:
@@ -142,6 +152,133 @@ class TestObservationAndEconomy(unittest.TestCase):
         self.assertEqual(getattr(obs, "_shape_hint"), (city.height, city.width))
         labels, n_districts = district_ids(city.height, city.width, 3)
         self.assertEqual(getattr(obs, "_n_districts"), n_districts)
+
+    def test_factorized_action_dimensions_change_cost_and_city_capacity(self) -> None:
+        city = quick_city_config(
+            n_agents=1, actions_per_agent=2, initial_budget=50_000
+        )
+        env = CityEnvironment(city, seed=111)
+        cell = first_buildable(env)
+        base_cost = env.cost_of(cell, type_id=1, quality=1)
+        self.assertAlmostEqual(
+            base_cost,
+            float(env.observe(0).cost_table[cell, 1, 1]),
+        )
+        self.assertGreater(
+            env.cost_of(cell, 1, 1, floors=8)
+            - env.cost_of(cell, 1, 1, floors=1),
+            env.cost_of(cell, 1, 1, floors=2)
+            - env.cost_of(cell, 1, 1, floors=1),
+        )
+        self.assertTrue(
+            env.apply_action(
+                0,
+                Action(
+                    cell=cell,
+                    type_id=1,
+                    quality=1,
+                    floors=MAX_FLOORS_BY_ACTION[1],
+                    roof_quality=3,
+                ),
+            )
+        )
+        row, col = divmod(cell, env.w)
+        self.assertEqual(int(env.floors_grid[row, col]), 20)
+        self.assertEqual(int(env.roof_quality_grid[row, col]), 3)
+        self.assertEqual(env.jobs, 20 * 8.0)
+        self.assertGreater(float(env.cost_grid[row, col]), base_cost)
+        self.assertEqual(env.actions[-1].floors, 20)
+        self.assertEqual(env.actions[-1].roof_quality, 3)
+
+        stable_city = replace(
+            city,
+            enable_externalities=False,
+            enable_district_synergy=False,
+        )
+        lowrise = CityEnvironment(stable_city, seed=111)
+        highrise = CityEnvironment(stable_city, seed=111)
+        test_cell = first_buildable(lowrise)
+        self.assertTrue(
+            lowrise.apply_action(
+                0, Action(cell=test_cell, type_id=1, quality=1, floors=1)
+            )
+        )
+        self.assertTrue(
+            highrise.apply_action(
+                0, Action(cell=test_cell, type_id=1, quality=1, floors=9)
+            )
+        )
+        lowrise_income = float(lowrise._income_grid().ravel()[test_cell])
+        highrise_income = float(highrise._income_grid().ravel()[test_cell])
+        self.assertAlmostEqual(highrise_income / lowrise_income, 3.0, places=6)
+
+        invalid_env = CityEnvironment(city, seed=112)
+        self.assertFalse(
+            invalid_env.apply_action(
+                0,
+                Action(
+                    cell=first_buildable(invalid_env),
+                    type_id=1,
+                    floors=MAX_FLOORS_BY_ACTION[1] + 1,
+                ),
+            )
+        )
+
+    def test_greedy_actions_keep_neutral_extended_dimensions(self) -> None:
+        city = quick_city_config(
+            n_agents=1, actions_per_agent=2, initial_budget=5000
+        )
+        env = CityEnvironment(city, seed=113)
+        action = GreedyPolicy().act(env, 0, np.random.default_rng(114))
+        if not action.is_pass and not action.demolish:
+            self.assertEqual(action.floors, 1)
+            self.assertEqual(action.roof_quality, 0)
+
+    def test_district_synergy_accumulates_and_decays(self) -> None:
+        city = replace(
+            quick_city_config(
+                n_agents=1, actions_per_agent=3, initial_budget=50_000
+            ),
+            enable_externalities=False,
+        )
+        env = CityEnvironment(city, seed=115)
+        district_cells = np.flatnonzero(
+            (env.district_labels.ravel() == env.district_labels.ravel()[first_buildable(env)])
+            & env.buildable.ravel()
+        )
+        first, second = (int(cell) for cell in district_cells[:2])
+        self.assertTrue(
+            env.apply_action(0, Action(cell=first, type_id=0, quality=1))
+        )
+        self.assertTrue(
+            env.apply_action(0, Action(cell=second, type_id=1, quality=1))
+        )
+        district = int(env.district_labels.ravel()[first])
+        self.assertGreater(float(env.district_synergy_target[district]), 0.0)
+        income_without_lag = env._income_grid().copy()
+        greedy_projection = env.projected_income_table(0).copy()
+        env.end_round()
+        accumulated = float(env.district_synergy_state[district])
+        self.assertGreater(accumulated, 0.0)
+        income_with_lag = env._income_grid()
+        self.assertGreater(
+            float(income_with_lag.ravel()[first]),
+            float(income_without_lag.ravel()[first]),
+        )
+        np.testing.assert_array_equal(
+            env.projected_income_table(0),
+            greedy_projection,
+        )
+
+        env._clear_cell(*divmod(second, env.w))
+        env._refresh_layers(advance_population=False)
+        env.end_round()
+        self.assertLess(float(env.district_synergy_state[district]), accumulated)
+
+        disabled = CityEnvironment(
+            replace(city, enable_district_synergy=False), seed=115
+        )
+        self.assertTrue(np.all(disabled.district_synergy == 0.0))
 
     def test_isometric_cell_hit_testing(self) -> None:
         height, width = 4, 5
@@ -177,6 +314,10 @@ class TestObservationAndEconomy(unittest.TestCase):
             2 * width + 3,
         )
         self.assertGreater(building_height(4, 2, 16), building_height(4, 0, 16))
+        self.assertGreater(
+            building_height(4, 2, 16, floors=12),
+            building_height(4, 2, 16, floors=1),
+        )
 
     def test_land_value_pollution_and_noise(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=2, initial_budget=2000)
@@ -242,8 +383,8 @@ class TestObservationAndEconomy(unittest.TestCase):
         cell = first_buildable(env)
         self.assertTrue(env.apply_action(0, Action(cell=cell, type_id=0, quality=1)))
         genome = random_genome(np.random.default_rng(142))
-        genome[DEFAULT_LAYOUT.previous_parameter_count - 1] = 100.0
         policy = NeuralPolicy(genome)
+        policy.b_demolish[0] = 100.0
         action = policy.act(env, 0, np.random.default_rng(143))
         self.assertTrue(action.demolish)
         self.assertEqual(action.cell, cell)
@@ -507,7 +648,7 @@ class TestEvolution(unittest.TestCase):
     def test_evolution_and_map_elites(self) -> None:
         evo, city = self._config()
         result = EvolutionEngine(evo, city).run()
-        self.assertEqual(result.best_genome.shape, (22860,))
+        self.assertEqual(result.best_genome.shape, (24136,))
         self.assertTrue(np.isfinite(result.best_fitness))
         self.assertEqual(len(result.history), 2)
         row = result.history[-1]
@@ -522,7 +663,7 @@ class TestEvolution(unittest.TestCase):
             for bucket in key:
                 self.assertGreaterEqual(bucket, 0)
                 self.assertLess(bucket, 3)
-            self.assertEqual(individual.genome.shape, (22860,))
+            self.assertEqual(individual.genome.shape, (24136,))
             self.assertTrue(np.isfinite(individual.fitness))
 
 
@@ -531,11 +672,15 @@ class TestCli(unittest.TestCase):
         from citysim.cli import build_configs, build_parser, parse_grid, parse_seeds
 
         self.assertEqual(parse_grid("12x9"), (12, 9))
+        self.assertEqual(parse_grid("12х9"), (12, 9))
+        self.assertEqual(parse_grid("12×9"), (12, 9))
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_grid("12-by-9")
         self.assertEqual(parse_seeds("0-2"), [0, 1, 2])
         parser = build_parser()
         args = parser.parse_args(
             [
-                "experiment", "e8", "--quick", "--buildings-per-action", "2",
+                "experiment", "e12", "--quick", "--buildings-per-action", "2",
                 "--requirements", "hard", "--regulation", "no_tax",
                 "--no-auction", "--hidden", "32",
             ]
@@ -549,38 +694,14 @@ class TestCli(unittest.TestCase):
         self.assertEqual(evo.hidden_size, 32)
         self.assertEqual(seeds, [0, 1])
 
-    def test_load_legacy_genome(self) -> None:
+    def test_load_old_genome_layout_is_rejected(self) -> None:
         from citysim.cli import _load_genome
 
         with tempfile.TemporaryDirectory() as directory:
-            for count, demolition_bias in (
-                (DEFAULT_LAYOUT.legacy_parameter_count, -1e6),
-                (DEFAULT_LAYOUT.previous_parameter_count, -0.5),
-            ):
-                path = Path(directory) / f"legacy-{count}.npy"
-                old_genome = np.zeros(count)
-                if count == DEFAULT_LAYOUT.previous_parameter_count:
-                    old_genome[-1] = -0.5
-                np.save(path, old_genome)
-                genome = _load_genome(str(path), DEFAULT_LAYOUT, seed=0)
-                self.assertEqual(genome.shape, (DEFAULT_LAYOUT.parameter_count,))
-                self.assertEqual(
-                    float(
-                        genome[
-                            DEFAULT_LAYOUT.legacy_parameter_count
-                            + DEFAULT_LAYOUT.hidden_size
-                        ]
-                    ),
-                    demolition_bias,
-                )
-                self.assertTrue(
-                    np.all(
-                        genome[
-                            DEFAULT_LAYOUT.previous_parameter_count :
-                        ]
-                        == 0.0
-                    )
-                )
+            path = Path(directory) / "old-genome.npy"
+            np.save(path, np.zeros(22860))
+            with self.assertRaises(SystemExit):
+                _load_genome(str(path), DEFAULT_LAYOUT, seed=0)
 
     def test_isometric_and_top_down_png_renderers(self) -> None:
         from citysim.plotting import plot_city, plot_compare_grids

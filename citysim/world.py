@@ -30,6 +30,7 @@ from .config import (
     LAND_VALUE_MAX,
     LAND_VALUE_MIN,
     MAINTENANCE_RATE,
+    MAX_FLOORS_BY_ACTION,
     MAX_DEMAND,
     MAX_PRICE,
     MIXED_CAPACITY,
@@ -43,6 +44,7 @@ from .config import (
     POPULATION_INERTIA,
     QUALITY_COST_MULT,
     QUALITY_INCOME_MULT,
+    N_ROOF_QUALITIES,
     SATURATION_ALPHA,
     SATURATION_RADIUS,
     TYPE_NAMES,
@@ -74,6 +76,8 @@ class Action:
     bid: float = 0.0
     demolish: bool = False
     priority: int = 0
+    floors: int = 1
+    roof_quality: int = 0
 
     @property
     def is_pass(self) -> bool:
@@ -96,6 +100,8 @@ class ActionRecord:
     accepted: bool
     bid: float = 0.0
     demolish: bool = False
+    floors: int = 1
+    roof_quality: int = 0
 
 
 @dataclass
@@ -225,6 +231,8 @@ class CityEnvironment:
 
         self.type_grid = np.zeros((self.h, self.w), dtype=np.int8)
         self.quality_grid = np.full((self.h, self.w), -1, dtype=np.int8)
+        self.floors_grid = np.zeros((self.h, self.w), dtype=np.int8)
+        self.roof_quality_grid = np.zeros((self.h, self.w), dtype=np.int8)
         self.owner_grid = np.full((self.h, self.w), -1, dtype=np.int16)
         self.cost_grid = np.zeros((self.h, self.w), dtype=np.float64)
 
@@ -249,6 +257,9 @@ class CityEnvironment:
         self.mean_utilization = 0.0
         self.district_util = np.zeros((self.h, self.w), dtype=np.float64)
         self.district_type = np.zeros((self.h, self.w), dtype=np.float64)
+        self.district_synergy = np.zeros((self.h, self.w), dtype=np.float64)
+        self.district_synergy_target = np.zeros(self.n_districts, dtype=np.float64)
+        self.district_synergy_state = np.zeros(self.n_districts, dtype=np.float64)
         self.land_value = np.zeros((self.h, self.w), dtype=np.float64)
         self.pollution = np.zeros((self.h, self.w), dtype=np.float64)
         self.noise = np.zeros((self.h, self.w), dtype=np.float64)
@@ -288,15 +299,36 @@ class CityEnvironment:
             * cell_mult
         )
 
-    def cost_of(self, cell: int, type_id: int, quality: int) -> float:
+    def cost_of(
+        self,
+        cell: int,
+        type_id: int,
+        quality: int,
+        floors: int = 1,
+        roof_quality: int = 0,
+    ) -> float:
+        if not 0 <= type_id < len(MAX_FLOORS_BY_ACTION):
+            raise ValueError("type_id must be in [0, 4]")
+        if not 0 <= quality < len(QUALITY_COST_MULT):
+            raise ValueError("quality is outside the configured range")
         c = int(np.clip(cell, 0, self.n_cells - 1))
         land = float(self.land_value.ravel()[c])
         soil = float(self.static["soil"].ravel()[c])
+        floors = int(floors) if self.config.enable_extended_actions else 1
+        roof_quality = int(roof_quality) if self.config.enable_extended_actions else 0
+        if not 1 <= floors <= MAX_FLOORS_BY_ACTION[type_id]:
+            raise ValueError("floors exceed the selected building type's limit")
+        if not 0 <= roof_quality < N_ROOF_QUALITIES:
+            raise ValueError("roof_quality is outside the configured range")
+        floor_multiplier = 1.0 + 0.10 * (floors - 1) ** 1.15
+        roof_multiplier = 1.0 + 0.06 * roof_quality**1.5
         return float(
             BUILD_COST[type_id + 1]
             * QUALITY_COST_MULT[quality]
             * (0.4 + 1.6 * land)
             * (0.9 + 0.2 * soil)
+            * floor_multiplier
+            * roof_multiplier
         )
 
     def observe(self, agent_id: int) -> Observation:
@@ -332,6 +364,7 @@ class CityEnvironment:
         f[..., 20] = self.local_saturation
         f[..., 21] = self.district_type / 5.0
         f[..., 22] = self.district_util
+        f[..., 23] = self.district_synergy
 
         if not self.config.enable_externalities:
             # Ablation: the policy does not see any neighbour-dependent signal.
@@ -343,6 +376,8 @@ class CityEnvironment:
             f[..., 19] = 0.0
             f[..., 20] = 0.0
             f[..., 22] = 0.0
+        if not self.config.enable_district_synergy:
+            f[..., 23] = 0.0
 
         costs = self.cost_table()
         affordable = costs <= agent.budget + 1e-9
@@ -471,6 +506,8 @@ class CityEnvironment:
             refund = 0.5 * float(self.cost_grid[row, col])
             self.type_grid[row, col] = 0
             self.quality_grid[row, col] = -1
+            self.floors_grid[row, col] = 0
+            self.roof_quality_grid[row, col] = 0
             self.owner_grid[row, col] = -1
             self.cost_grid[row, col] = 0.0
             agent.budget += refund
@@ -495,14 +532,29 @@ class CityEnvironment:
         if self.type_grid[row, col] != 0 or not self.buildable[row, col]:
             self._record_pass(agent_id)
             return False
-        if not 0 <= action.type_id < 5 or not 0 <= action.quality < 3:
+        if (
+            not 0 <= action.type_id < 5
+            or not 0 <= action.quality < 3
+            or not 1 <= action.floors <= MAX_FLOORS_BY_ACTION[action.type_id]
+            or not 0 <= action.roof_quality < N_ROOF_QUALITIES
+            or (
+                not self.config.enable_extended_actions
+                and (action.floors != 1 or action.roof_quality != 0)
+            )
+        ):
             self._record_pass(agent_id)
             return False
         if self._violates_industry_buffer(row, col, action.type_id):
             self._record_pass(agent_id)
             return False
 
-        cost = self.cost_of(cell, action.type_id, action.quality)
+        cost = self.cost_of(
+            cell,
+            action.type_id,
+            action.quality,
+            action.floors,
+            action.roof_quality,
+        )
         bid = max(0.0, float(action.bid))
         if cost + bid > agent.budget + 1e-9:
             self._record_pass(agent_id)
@@ -513,6 +565,8 @@ class CityEnvironment:
 
         self.type_grid[row, col] = action.type_id + 1
         self.quality_grid[row, col] = action.quality
+        self.floors_grid[row, col] = action.floors
+        self.roof_quality_grid[row, col] = action.roof_quality
         self.owner_grid[row, col] = agent_id
         self.cost_grid[row, col] = cost
         agent.budget -= cost + bid
@@ -547,6 +601,8 @@ class CityEnvironment:
                 damage=total_damage,
                 accepted=True,
                 bid=bid,
+                floors=action.floors,
+                roof_quality=action.roof_quality,
             )
         )
         return True
@@ -590,6 +646,7 @@ class CityEnvironment:
 
     def end_round(self) -> None:
         self._refresh_layers(advance_population=True)
+        self._advance_district_synergy()
         incomes = self._income_grid()
         maintenance = MAINTENANCE_RATE * self.cost_grid
         regulation = self.config.regulation
@@ -657,6 +714,8 @@ class CityEnvironment:
                 mask = self.owner_grid == agent.agent_id
                 self.type_grid[mask] = 0
                 self.quality_grid[mask] = -1
+                self.floors_grid[mask] = 0
+                self.roof_quality_grid[mask] = 0
                 self.owner_grid[mask] = -1
                 self.cost_grid[mask] = 0.0
                 agent.budget = 0.0
@@ -737,6 +796,16 @@ class CityEnvironment:
         )
         self.attractiveness = (
             0.32 * box_mean((self.type_grid == 5).astype(np.float64), 1)
+            + 0.12
+            * box_mean(
+                np.where(
+                    built_bool,
+                    self.roof_quality_grid.astype(np.float64)
+                    / (N_ROOF_QUALITIES - 1),
+                    0.0,
+                ),
+                1,
+            )
             + 0.20 * self.static["water"]
             + 0.20 * (1.0 - self.static["dist_center"])
             + 0.15 * self.static["road"]
@@ -792,7 +861,18 @@ class CityEnvironment:
             t: int(np.sum(self.type_grid == t)) for t in range(1, 6)
         }
         built_count = sum(counts.values())
-        housing_capacity = counts[1] * HOUSING_CAPACITY + counts[3] * MIXED_CAPACITY
+        floors = self.floors_grid.astype(np.float64)
+        if not self.config.enable_extended_actions:
+            floors = np.where(self.type_grid > 0, 1.0, 0.0)
+        floor_counts = np.bincount(
+            self.type_grid.ravel(),
+            weights=floors.ravel(),
+            minlength=6,
+        )
+        housing_capacity = (
+            floor_counts[1] * HOUSING_CAPACITY
+            + floor_counts[3] * MIXED_CAPACITY
+        )
         target_population = min(
             self.base_population + self.population_extra, housing_capacity
         )
@@ -806,23 +886,23 @@ class CityEnvironment:
             self.population = min(self.population, target_population)
 
         self.jobs = (
-            counts[2] * COMMERCIAL_JOBS
-            + counts[3] * MIXED_JOBS
-            + counts[4] * INDUSTRY_JOBS
+            floor_counts[2] * COMMERCIAL_JOBS
+            + floor_counts[3] * MIXED_JOBS
+            + floor_counts[4] * INDUSTRY_JOBS
         )
-        self.goods_supply = counts[4] * INDUSTRY_GOODS_SUPPLY
+        self.goods_supply = floor_counts[4] * INDUSTRY_GOODS_SUPPLY
         self.goods_demand = (
             CITIZEN_GOODS_DEMAND * self.population
-            + counts[2] * COMMERCIAL_GOODS_DEMAND
+            + floor_counts[2] * COMMERCIAL_GOODS_DEMAND
         )
         self.goods_balance = float(
             (self.goods_supply - self.goods_demand)
             / max(1.0, self.goods_supply + self.goods_demand)
         )
 
-        housing_capacity = max(1e-9, counts[1] * HOUSING_CAPACITY)
-        commercial_capacity = max(1e-9, counts[2] * COMMERCIAL_CUSTOMERS)
-        mixed_capacity = max(1e-9, counts[3] * MIXED_CAPACITY)
+        housing_capacity = max(1e-9, floor_counts[1] * HOUSING_CAPACITY)
+        commercial_capacity = max(1e-9, floor_counts[2] * COMMERCIAL_CUSTOMERS)
+        mixed_capacity = max(1e-9, floor_counts[3] * MIXED_CAPACITY)
         self.utilization = {
             1: min(1.0, self.population / housing_capacity) if counts[1] else 0.0,
             2: min(1.0, self.population / commercial_capacity) if counts[2] else 0.0,
@@ -855,11 +935,62 @@ class CityEnvironment:
             )
         dominant = np.argmax(type_scores, axis=1)
         self.district_type = dominant[labels].reshape(self.h, self.w).astype(np.float64)
+        if self.config.enable_district_synergy:
+            cell_counts = np.bincount(labels, minlength=self.n_districts)
+            housing = type_scores[:, 1] + 0.5 * type_scores[:, 3]
+            commercial = type_scores[:, 2] + 0.5 * type_scores[:, 3]
+            mixed_market = housing + commercial
+            balance = np.divide(
+                4.0 * housing * commercial,
+                mixed_market**2,
+                out=np.zeros_like(mixed_market),
+                where=mixed_market > 0.0,
+            )
+            roof_green = np.bincount(
+                labels,
+                weights=(
+                    self.roof_quality_grid.ravel().astype(np.float64)
+                    / (N_ROOF_QUALITIES - 1)
+                    * built
+                ),
+                minlength=self.n_districts,
+            )
+            green_share = np.divide(
+                type_scores[:, 5] + roof_green,
+                built_counts,
+                out=np.zeros_like(built_counts),
+                where=built_counts > 0.0,
+            )
+            green_share = np.clip(green_share, 0.0, 1.0)
+            occupancy = built_counts / np.maximum(1.0, cell_counts)
+            self.district_synergy_target = np.clip(
+                occupancy * balance * (0.6 + 0.4 * green_share),
+                0.0,
+                1.0,
+            )
+        else:
+            self.district_synergy_target.fill(0.0)
+            self.district_synergy_state.fill(0.0)
+        self.district_synergy = self.district_synergy_state[labels].reshape(
+            self.h, self.w
+        )
         util_sums = np.bincount(
             labels, weights=self.util_grid.ravel(), minlength=self.n_districts
         )
         district_util = util_sums / np.maximum(1.0, built_counts)
         self.district_util = district_util[labels].reshape(self.h, self.w)
+
+    def _advance_district_synergy(self) -> None:
+        if not self.config.enable_district_synergy:
+            return
+        self.district_synergy_state = (
+            0.70 * self.district_synergy_state
+            + 0.30 * self.district_synergy_target
+        )
+        self.district_synergy = self.district_synergy_state[
+            self.district_labels
+        ]
+        self._income_cache = None
 
     # ------------------------------------------------------------------
     # Income and externalities
@@ -922,9 +1053,17 @@ class CityEnvironment:
         world_type = self.type_grid.astype(np.int64)
         quality = np.clip(self.quality_grid.astype(np.int64), 0, 2)
         type_for_index = np.clip(world_type - 1, 0, 4)
+        floors = np.maximum(1, self.floors_grid.astype(np.float64))
+        roof_quality = self.roof_quality_grid.astype(np.float64)
+        if not self.config.enable_extended_actions:
+            floors = np.ones_like(floors)
+            roof_quality = np.zeros_like(roof_quality)
 
         type_income = INCOME_BASE[world_type]
         quality_income = QUALITY_INCOME_MULT[quality]
+        floor_income = np.sqrt(floors)
+        roof_income = 1.0 + 0.015 * roof_quality
+        district_synergy_income = 1.0 + 0.20 * self.district_synergy
         demand_factor = 0.5 + 0.7 * (self.demand / MAX_DEMAND)
         road_factor = 0.7 + 0.6 * self.static["road"]
         access_fit = 1.0 - np.abs(
@@ -962,6 +1101,9 @@ class CityEnvironment:
         income = (
             type_income
             * quality_income
+            * floor_income
+            * roof_income
+            * district_synergy_income
             * demand_factor
             * road_factor
             * access_factor
@@ -1076,6 +1218,8 @@ class CityEnvironment:
     def _clear_cell(self, row: int, col: int) -> None:
         self.type_grid[row, col] = 0
         self.quality_grid[row, col] = -1
+        self.floors_grid[row, col] = 0
+        self.roof_quality_grid[row, col] = 0
         self.owner_grid[row, col] = -1
         self.cost_grid[row, col] = 0.0
 

@@ -49,7 +49,7 @@
       <section>
         <h2>Обучение и эксперименты</h2>
         <label for="job-kind">Задача</label>
-        <select id="job-kind"><option value="train">Обучать ветку</option><option value="experiment">Эксперимент E1–E11</option></select>
+        <select id="job-kind"><option value="train">Обучать ветку</option><option value="experiment">Эксперимент E1–E12</option></select>
         <div id="branch-options">
           <label for="branch">Ветка</label><select id="branch"></select>
           <label><input id="resume" type="checkbox">Продолжить выбранную ветку</label>
@@ -59,7 +59,7 @@
           <select id="experiment">
             <option>e1</option><option>e2</option><option>e3</option><option>e4</option>
             <option>e5</option><option>e6</option><option>e7</option><option>e8</option>
-            <option>e9</option><option>e10</option><option>e11</option><option>all</option>
+            <option>e9</option><option>e10</option><option>e11</option><option>e12</option><option>all</option>
           </select>
           <label for="seeds">Обучающие сиды (например, 0-2)</label><input id="seeds" value="0-2">
         </div>
@@ -76,7 +76,7 @@
         <button id="stop" class="danger" disabled>Остановить после поколения</button>
         <div id="job-status" class="status">Нет активной задачи</div>
         <progress id="progress" max="1" value="0"></progress>
-        <div id="progress-detail" class="hint">ETA — оценка до конца текущего обучения; для пакета E1–E11 это не прогноз всего пакета.</div>
+        <div id="progress-detail" class="hint">ETA — оценка до конца текущего обучения; для пакета E1–E12 это не прогноз всего пакета.</div>
       </section>
 
       <section>
@@ -221,7 +221,7 @@
         $("progress-detail").textContent = `${progress.phase || `Запуск ${progress.run_index || 1}`} · поколение ${current}/${total} · лучший fitness ${Number(progress.best_fitness || 0).toFixed(4)} · ${eta}`;
       } else {
         $("progress").value = 0;
-        $("progress-detail").textContent = "ETA — оценка до конца текущего обучения; для пакета E1–E11 это не прогноз всего пакета.";
+        $("progress-detail").textContent = "ETA — оценка до конца текущего обучения; для пакета E1–E12 это не прогноз всего пакета.";
       }
       if (status.result) $("comparison").textContent = JSON.stringify({
         refs: status.result.refs,

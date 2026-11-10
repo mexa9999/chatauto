@@ -9,7 +9,7 @@ except ImportError:  # pragma: no cover - pygame is optional
 
 import numpy as np
 
-from .config import TYPE_NAMES
+from .config import MAX_FLOORS_BY_ACTION, TYPE_NAMES
 from .isometric import (
     building_height,
     cell_center,
@@ -43,6 +43,15 @@ GRID_BG = (28, 28, 28)
 TEXT = (210, 210, 210)
 TEXT_DIM = (150, 150, 150)
 ACCENT = (90, 190, 255)
+GREEN_ROOF = (84, 162, 75)
+
+
+def _roof_color(color: tuple[int, int, int], quality: int) -> tuple[int, int, int]:
+    blend = float(np.clip(quality, 0, 3)) / 3.0 * 0.6
+    return tuple(
+        int(base * (1.0 - blend) + green * blend)
+        for base, green in zip(color, GREEN_ROOF)
+    )
 
 
 def _mean(values) -> float:
@@ -217,7 +226,12 @@ class CityVisualizer(_BaseVisualizer):
         self.header_h = 42
         self.footer_h = 26
         self.max_building_height = max(
-            building_height(type_id, quality, self.tile_height)
+            building_height(
+                type_id,
+                quality,
+                self.tile_height,
+                MAX_FLOORS_BY_ACTION[type_id - 1],
+            )
             for type_id in range(1, 6)
             for quality in range(3)
         )
@@ -315,6 +329,7 @@ class CityVisualizer(_BaseVisualizer):
                 type_id,
                 int(self.env.quality_grid[row, col]),
                 self.tile_height,
+                int(self.env.floors_grid[row, col]),
             )
             ground, left, right, top = cell_faces(
                 row,
@@ -356,7 +371,12 @@ class CityVisualizer(_BaseVisualizer):
                     1,
                 )
             pygame.draw.polygon(
-                self.screen, TYPE_COLORS[type_id], [(int(x), int(y)) for x, y in top]
+                self.screen,
+                _roof_color(
+                    TYPE_COLORS[type_id],
+                    int(self.env.roof_quality_grid[row, col]),
+                ),
+                [(int(x), int(y)) for x, y in top],
             )
             pygame.draw.polygon(
                 self.screen, (55, 55, 55), [(int(x), int(y)) for x, y in top], 1
@@ -462,6 +482,9 @@ class CityVisualizer(_BaseVisualizer):
             f"Cell {cell} ({row},{col})  district {district}",
             f"type {TYPE_NAMES[type_id]}  owner {owner if owner >= 0 else '-'}"
             f"  quality {quality if quality >= 0 else '-'}",
+            f"floors {int(self.env.floors_grid[row, col])}"
+            f"  roof {int(self.env.roof_quality_grid[row, col])}/3"
+            f"  synergy {self.env.district_synergy[row, col]:.2f}",
             f"cost {cost:.1f}  land {self.env.land_value[row, col]:.2f}",
             f"pollution {self.env.pollution[row, col]:.2f}"
             f"  noise {self.env.noise[row, col]:.2f}",
@@ -574,6 +597,7 @@ class CityVisualizer(_BaseVisualizer):
                 self.tile_height,
                 origin_x,
                 origin_y,
+                self.env.floors_grid,
             )
             if cell is not None:
                 self.selected_cell = cell
@@ -600,9 +624,14 @@ class CityVisualizer(_BaseVisualizer):
             else:
                 action_name = TYPE_NAMES[action.type_id + 1][:4].upper()
             bid = f" bid{action.bid:.0f}" if action.bid else ""
+            dimensions = (
+                ""
+                if action.demolish
+                else f" f{action.floors} r{action.roof_quality}"
+            )
             self.action_log.append(
                 f"R{self.round_idx + 1} A{agent_id:02d} {action_name:>4}"
-                f" q{action.quality} @{action.cell}{bid}"
+                f" q{action.quality}{dimensions} @{action.cell}{bid}"
             )
         else:
             self.agent_skips[agent_id] += 1
@@ -689,7 +718,12 @@ class ComparisonVisualizer(_BaseVisualizer):
         self.header_h = 40
         self.footer_h = 24
         self.max_building_height = max(
-            building_height(type_id, quality, self.tile_height)
+            building_height(
+                type_id,
+                quality,
+                self.tile_height,
+                MAX_FLOORS_BY_ACTION[type_id - 1],
+            )
             for type_id in range(1, 6)
             for quality in range(3)
         )
@@ -781,7 +815,10 @@ class ComparisonVisualizer(_BaseVisualizer):
         ):
             type_id = int(env.type_grid[row, col])
             elevation = building_height(
-                type_id, int(env.quality_grid[row, col]), self.tile_height
+                type_id,
+                int(env.quality_grid[row, col]),
+                self.tile_height,
+                int(env.floors_grid[row, col]),
             )
             ground, left, right, top = cell_faces(
                 row,
@@ -797,7 +834,13 @@ class ComparisonVisualizer(_BaseVisualizer):
                 (ground, TYPE_COLORS[type_id]),
                 (left, darken(TYPE_COLORS[type_id], 0.58)),
                 (right, darken(TYPE_COLORS[type_id], 0.76)),
-                (top, TYPE_COLORS[type_id]),
+                (
+                    top,
+                    _roof_color(
+                        TYPE_COLORS[type_id],
+                        int(env.roof_quality_grid[row, col]),
+                    ),
+                ),
             )
             for face_index, (polygon, color) in enumerate(faces):
                 if polygon:
@@ -966,6 +1009,7 @@ class ComparisonVisualizer(_BaseVisualizer):
                 self.tile_height,
                 self.h * self.tile_width / 2.0,
                 self.header_h + self.max_building_height + self.tile_height / 2.0,
+                self.envs[side].floors_grid,
             )
             if cell is not None:
                 self.selected[side] = cell

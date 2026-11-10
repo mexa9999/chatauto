@@ -15,6 +15,8 @@ import numpy as np
 from .config import (
     BID_MAX,
     BID_MIN,
+    MAX_FLOORS_BY_ACTION,
+    N_ROOF_QUALITIES,
     N_CELL_FEATURES,
     N_GLOBAL_FEATURES,
 )
@@ -75,6 +77,8 @@ class GenomeLayout:
     global_hidden: int = 8
     n_types: int = 5
     n_qualities: int = 3
+    n_floors: int = max(MAX_FLOORS_BY_ACTION)
+    n_roof_qualities: int = N_ROOF_QUALITIES
     n_district_types: int = 5
 
     @property
@@ -108,36 +112,19 @@ class GenomeLayout:
             + h + 1                      # cell score head
             + h * self.n_types + self.n_types
             + h * self.n_qualities + self.n_qualities
+            + h * self.n_floors + self.n_floors
+            + h * self.n_roof_qualities + self.n_roof_qualities
             + h + 1                      # bid head
             + h + 1                      # demolition head
             + 7 * h * h + 4 * h          # per-cell GRU and recurrent projection
         )
 
-    @property
-    def previous_parameter_count(self) -> int:
-        return self.parameter_count - 7 * self.hidden_size**2 - 4 * self.hidden_size
-
-    @property
-    def legacy_parameter_count(self) -> int:
-        return self.previous_parameter_count - self.hidden_size - 1
-
     def normalize(self, vector: np.ndarray) -> np.ndarray:
         vector = np.asarray(vector, dtype=np.float64)
         if vector.shape == (self.parameter_count,):
             return vector
-        if vector.shape in (
-            (self.previous_parameter_count,),
-            (self.legacy_parameter_count,),
-        ):
-            normalized = np.zeros(self.parameter_count, dtype=np.float64)
-            normalized[: vector.size] = vector
-            if vector.size == self.legacy_parameter_count:
-                normalized[self.legacy_parameter_count + self.hidden_size] = -1e6
-            return normalized
         raise ValueError(
-            f"genome has shape {vector.shape}, expected "
-            f"({self.parameter_count},), ({self.previous_parameter_count},), "
-            f"or ({self.legacy_parameter_count},)"
+            f"genome has shape {vector.shape}, expected ({self.parameter_count},)"
         )
 
     def unpack(self, vector: np.ndarray):
@@ -177,6 +164,10 @@ class GenomeLayout:
         b_type = take((self.n_types,))
         W_quality = take((h, self.n_qualities))
         b_quality = take((self.n_qualities,))
+        W_floors = take((h, self.n_floors))
+        b_floors = take((self.n_floors,))
+        W_roof = take((h, self.n_roof_qualities))
+        b_roof = take((self.n_roof_qualities,))
         w_bid = take((h,))
         b_bid = take((1,))
         w_demolish = take((h,))
@@ -194,6 +185,8 @@ class GenomeLayout:
             w3, b3,
             W_type, b_type,
             W_quality, b_quality,
+            W_floors, b_floors,
+            W_roof, b_roof,
             w_bid, b_bid, w_demolish, b_demolish,
             W_gru_input, W_gru_state, b_gru, W_recurrent_out, b_recurrent_out,
         )
@@ -241,6 +234,10 @@ def random_genome(rng: np.random.Generator, layout: GenomeLayout = DEFAULT_LAYOU
     put(np.zeros(layout.n_types))
     normal((h, layout.n_qualities), 0.02)
     put(np.zeros(layout.n_qualities))
+    normal((h, layout.n_floors), 0.02)
+    put(np.zeros(layout.n_floors))
+    normal((h, layout.n_roof_qualities), 0.02)
+    put(np.zeros(layout.n_roof_qualities))
     normal((h,), 0.02)
     put(np.zeros(1))
     normal((h,), 0.02)
@@ -308,6 +305,8 @@ class NeuralPolicy:
             self.w3, self.b3,
             self.W_type, self.b_type,
             self.W_quality, self.b_quality,
+            self.W_floors, self.b_floors,
+            self.W_roof, self.b_roof,
             self.w_bid, self.b_bid, self.w_demolish, self.b_demolish,
             self.W_gru_input, self.W_gru_state, self.b_gru,
             self.W_recurrent_out, self.b_recurrent_out,
@@ -483,6 +482,12 @@ class NeuralPolicy:
         
         type_logits = (h2 @ self.W_type + self.b_type).reshape(h, w, layout.n_types)
         quality_logits = (h2 @ self.W_quality + self.b_quality).reshape(h, w, layout.n_qualities)
+        floor_logits = (h2 @ self.W_floors + self.b_floors).reshape(
+            h, w, layout.n_floors
+        )
+        roof_logits = (h2 @ self.W_roof + self.b_roof).reshape(
+            h, w, layout.n_roof_qualities
+        )
         bid_fraction = 1.0 / (1.0 + np.exp(-(h2 @ self.w_bid + float(self.b_bid[0]))))
         demolish_logits = h2 @ self.w_demolish + float(self.b_demolish[0])
 
@@ -494,6 +499,8 @@ class NeuralPolicy:
         return {
             "scores": scores,
             "joint_all": joint_all,  # <--- НОВОЕ ПОЛЕ
+            "floor_logits": floor_logits,
+            "roof_logits": roof_logits,
             "bid_fraction": bid_fraction.reshape(h, w),
             "demolish_logits": demolish_logits,
             "district_type": district_type_cells,
@@ -519,6 +526,7 @@ class NeuralPolicy:
 
     def _action_at(
         self,
+        env: "CityEnvironment",
         obs: "Observation",
         forward: dict[str, np.ndarray],
         cell: int,
@@ -529,12 +537,26 @@ class NeuralPolicy:
             return None
         flat = int(np.argmax(joint))
         type_id, quality = divmod(flat, self.layout.n_qualities)
-        cost = float(obs.cost_table[cell, type_id, quality])
         h, w = (int(x) for x in forward["shape"])
         row, col = divmod(int(cell), w)
         budget = max(0.0, float(obs.budget))
         bid_cap = max(0.0, min(BID_MAX * budget, budget / 10.0))
         bid = float(min(max(forward["bid_fraction"][row, col] * budget, BID_MIN), bid_cap))
+        floors = 1
+        roof_quality = 0
+        if env.config.enable_extended_actions:
+            floor_limit = MAX_FLOORS_BY_ACTION[type_id]
+            floors = int(
+                np.argmax(forward["floor_logits"][row, col, :floor_limit]) + 1
+            )
+            roof_quality = int(np.argmax(forward["roof_logits"][row, col]))
+        cost = env.cost_of(cell, type_id, quality, floors, roof_quality)
+        while cost + bid > budget + 1e-9 and (roof_quality > 0 or floors > 1):
+            if roof_quality > 0:
+                roof_quality -= 1
+            else:
+                floors -= 1
+            cost = env.cost_of(cell, type_id, quality, floors, roof_quality)
         if cost + bid > budget + 1e-9:
             return None
         return Action(
@@ -544,6 +566,8 @@ class NeuralPolicy:
             cost=cost,
             bid=bid,
             priority=int(priority),
+            floors=floors,
+            roof_quality=roof_quality,
         )
 
     @staticmethod
@@ -559,7 +583,7 @@ class NeuralPolicy:
         build_cell = int(np.argmax(scores))
         build_score = float(scores[build_cell])
         build_action = (
-            self._action_at(obs, forward, build_cell)
+            self._action_at(env, obs, forward, build_cell)
             if np.isfinite(build_score)
             else None
         )
@@ -597,7 +621,7 @@ class NeuralPolicy:
             cell = int(cell)
             joint = self._joint_logits(forward, cell, obs.action_mask)
             if np.isfinite(joint).any():
-                action = self._action_at(obs, forward, cell)
+                action = self._action_at(env, obs, forward, cell)
                 if action is not None:
                     candidates.append(
                         (float(scores[cell] + np.max(joint)), action)

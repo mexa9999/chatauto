@@ -1,4 +1,4 @@
-"""Public experiment API, backed by focused E1-E11 modules."""
+"""Public experiment API, backed by focused E1-E12 modules."""
 
 from concurrent.futures import ProcessPoolExecutor
 
@@ -33,6 +33,7 @@ from .experiments_robustness import (
     e10_regulation,
     e11_shocks,
 )
+from .experiments_actions import e12_factorial_actions
 
 __all__ = [
     "train_evolution",
@@ -47,6 +48,7 @@ __all__ = [
     "e9_path_dependence",
     "e10_regulation",
     "e11_shocks",
+    "e12_factorial_actions",
     "_aggregate_history",
     "_ensure_evolution_feasible",
     "_eval_seeds",
