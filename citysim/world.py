@@ -75,6 +75,12 @@ from .grid import (
     road_network_fields,
     type_entropy,
 )
+from .shocks import (
+    FLOOD_DURATION,
+    RECESSION_DURATION,
+    RECESSION_INCOME_MULTIPLIER,
+    TECHNOLOGY_SHIFT_INCOME_MULTIPLIER,
+)
 
 
 @dataclass(frozen=True)
@@ -287,6 +293,12 @@ class CityEnvironment:
         self.actions: list[ActionRecord] = []
         self.history: list[dict] = []
         self.shock_events: list[dict] = []
+        self.flooded_grid = np.zeros((self.h, self.w), dtype=bool)
+        self.flood_rounds_remaining = 0
+        self.recession_rounds_remaining = 0
+        self.recession_income_multiplier = 1.0
+        self.technology_sector: int | None = None
+        self.technology_income_multiplier = 1.0
 
         self.base_population = float(N_CITIZENS)
         self.population_extra = 0.0
@@ -447,6 +459,7 @@ class CityEnvironment:
         f[..., 26] = self.infra_wait_rounds
         f[..., 27] = self.travel_time_center_norm
         f[..., 28] = self.travel_time_jobs_norm
+        f[..., 29] = self.flooded_grid.astype(np.float64)
 
         if not self.config.enable_externalities:
             # Ablation: the policy does not see any neighbour-dependent signal.
@@ -539,6 +552,11 @@ class CityEnvironment:
                 self.net_migration_rate,
                 np.clip(agent.debt_ratio, 0.0, 3.0),
                 self.local_goods_coverage,
+                self.recession_income_multiplier,
+                float(self.technology_sector == 1),
+                float(self.technology_sector == 2),
+                float(self.technology_sector == 3),
+                float(self.technology_sector == 4),
             ],
             dtype=np.float64,
         )
@@ -816,8 +834,12 @@ class CityEnvironment:
                     "bankrupt_agents": city.bankrupt_agents,
                     "total_debt": city.total_debt,
                     "mean_debt_ratio": city.mean_debt_ratio,
+                    "recession_multiplier": self.recession_income_multiplier,
+                    "flooded_cells": int(self.flooded_grid.sum()),
+                    "technology_sector": self.technology_sector,
                 }
             )
+        self._advance_shock_durations()
         self.round += 1
 
     # ------------------------------------------------------------------
@@ -941,23 +963,23 @@ class CityEnvironment:
         )
 
         if self.config.enable_externalities:
-            self.demand =np.minimum(np.maximum(
+            self.demand = np.clip(
                 self.static["base_demand"]
                 + 0.10 * self.static["road"]
                 - 0.05 * self.load
                 - 0.15 * self.share_industry
                 + 0.15 * self.attractiveness
                 - 0.10 * self.local_saturation,
-                0.10),
+                0.10,
                 MAX_DEMAND,
             )
-            self.price = np.minimum(np.maximum(
+            self.price = np.clip(
                 0.55 * self.static["land_price"]
                 + 0.35 * (self.demand / MAX_DEMAND)
                 + 0.10 * (1.0 - self.density)
                 + 0.10 * self.land_value
                 - 0.10 * self.pollution,
-                0.0),
+                0.0,
                 MAX_PRICE,
             )
         else:
@@ -1256,6 +1278,7 @@ class CityEnvironment:
             (self.static["road_mask"] > 0.0) | self.player_road_grid
         ) & ~built & ~pending & ~water
         costs[road_cells] = ROAD_TRAVEL_COST * congestion[road_cells]
+        costs[self.flooded_grid] = np.inf
         costs[water] = np.inf
         return costs
 
@@ -1391,6 +1414,13 @@ class CityEnvironment:
             * saturation
             * soil_factor
         )
+        technology_multiplier = np.ones((self.h, self.w), dtype=np.float64)
+        if self.technology_sector is not None:
+            technology_multiplier[world_type == self.technology_sector] = (
+                self.technology_income_multiplier
+            )
+        income *= technology_multiplier * self.recession_income_multiplier
+        income[self.flooded_grid] = 0.0
         income[~built] = 0.0
         self._income_cache = np.maximum(income, 0.0)
         return self._income_cache
@@ -1427,6 +1457,9 @@ class CityEnvironment:
                 base *= 1.0 - GOODS_IMPORT_MARKUP * (
                     1.0 - self.local_goods_coverage
                 )
+            if self.technology_sector == world_type:
+                base *= self.technology_income_multiplier
+            base *= self.recession_income_multiplier
             if self.config.enable_externalities:
                 sector_penalty = self._sector_quality_penalty(action_type)
                 util = self.utilization[world_type]
@@ -1448,15 +1481,27 @@ class CityEnvironment:
                     * util
                     * saturation
                 ).ravel()
+        out[self.flooded_grid.ravel(), :, :] = 0.0
         return out
 
     # ------------------------------------------------------------------
     # Shocks
     # ------------------------------------------------------------------
 
-    def apply_shock(self, kind: str, rng: np.random.Generator, magnitude: float = 0.5) -> dict:
+    def apply_shock(
+        self,
+        kind: str,
+        rng: np.random.Generator,
+        magnitude: float = 0.5,
+        duration: int | None = None,
+    ) -> dict:
         """Apply an exogenous shock and return a short description."""
         cleared = 0
+        event: dict[str, int | float | str] = {
+            "round": self.round,
+            "kind": kind,
+            "magnitude": float(magnitude),
+        }
         if kind == "industry_removal":
             cells = np.flatnonzero(self.type_grid == 4)
             if cells.size:
@@ -1470,10 +1515,7 @@ class CityEnvironment:
             self.population_extra += float(magnitude)
             self._refresh_layers(advance_population=False)
             self._travel_time_dirty = True
-            self.shock_events.append(
-                {"round": self.round, "kind": kind, "magnitude": float(magnitude), "cleared": 0}
-            )
-            return self.shock_events[-1]
+            event["cleared"] = 0
         elif kind == "earthquake":
             cells = np.flatnonzero(self.type_grid > 0)
             if cells.size:
@@ -1483,18 +1525,69 @@ class CityEnvironment:
                     row, col = divmod(int(cell), self.w)
                     self._clear_cell(row, col)
                     cleared += 1
+        elif kind == "recession":
+            recession_duration = (
+                RECESSION_DURATION if duration is None else int(duration)
+            )
+            if not np.isfinite(magnitude) or magnitude <= 0.0:
+                raise ValueError("recession income multiplier must be positive")
+            if recession_duration < 1:
+                raise ValueError("recession duration must be at least one round")
+            self.recession_income_multiplier = float(magnitude)
+            self.recession_rounds_remaining = max(
+                self.recession_rounds_remaining, recession_duration
+            )
+            event["duration"] = recession_duration
+            self._income_cache = None
+        elif kind == "flood":
+            if not np.isfinite(magnitude) or not 0.0 < magnitude <= 1.0:
+                raise ValueError("flood magnitude must be in (0, 1]")
+            flood_duration = FLOOD_DURATION if duration is None else int(duration)
+            if flood_duration < 1:
+                raise ValueError("flood duration must be at least one round")
+            candidates = np.flatnonzero(self.buildable.ravel())
+            self.flooded_grid.fill(False)
+            if candidates.size:
+                flooded_count = max(1, int(np.ceil(magnitude * candidates.size)))
+                flooded = rng.choice(
+                    candidates, size=min(flooded_count, candidates.size), replace=False
+                )
+                self.flooded_grid.ravel()[flooded] = True
+            self.flood_rounds_remaining = flood_duration
+            event["duration"] = flood_duration
+            event["flooded_cells"] = int(self.flooded_grid.sum())
+            self._income_cache = None
+            self._travel_time_dirty = True
+        elif kind == "technology_shift":
+            if not np.isfinite(magnitude) or magnitude <= 0.0:
+                raise ValueError("technology income multiplier must be positive")
+            self.technology_sector = int(rng.integers(1, 5))
+            self.technology_income_multiplier = float(magnitude)
+            event["sector"] = TYPE_NAMES[self.technology_sector]
         else:
             raise ValueError(f"unknown shock kind: {kind}")
-        self._refresh_layers(advance_population=False)
-        self._travel_time_dirty = True
-        event = {
-            "round": self.round,
-            "kind": kind,
-            "magnitude": float(magnitude),
-            "cleared": int(cleared),
-        }
+        if kind in ("industry_removal", "earthquake"):
+            event["cleared"] = cleared
+        if kind in ("industry_removal", "earthquake"):
+            self._refresh_layers(advance_population=False)
+            self._travel_time_dirty = True
+        elif kind == "technology_shift":
+            self._income_cache = None
         self.shock_events.append(event)
         return event
+
+    def _advance_shock_durations(self) -> None:
+        if self.recession_rounds_remaining > 0:
+            self.recession_rounds_remaining -= 1
+            if self.recession_rounds_remaining == 0:
+                self.recession_income_multiplier = 1.0
+                self._income_cache = None
+        if self.flood_rounds_remaining > 0:
+            self.flood_rounds_remaining -= 1
+            if self.flood_rounds_remaining == 0:
+                self.flooded_grid.fill(False)
+                self._income_cache = None
+                self._travel_time_dirty = True
 
     def _clear_cell(self, row: int, col: int) -> None:
         self.type_grid[row, col] = 0

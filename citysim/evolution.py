@@ -37,7 +37,7 @@ from .policy import (
 
 _CHECKPOINT_SCHEMA = 3
 # Bump when training semantics change so old cache entries are not reused.
-_TRAINING_PROTOCOL_VERSION = 10
+_TRAINING_PROTOCOL_VERSION = 11
 SIGMA_STAGNATION_GENERATIONS = 8
 SIGMA_SIGNIFICANCE_Z = 2.0
 SIGMA_BOOST_FACTOR = 1.5

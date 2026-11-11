@@ -31,6 +31,7 @@ from citysim.training_history import TrainingHistoryStore
 
 class TestEpisodeExecution(unittest.TestCase):
     def test_evolution_protocol_defaults_and_quick_preset(self) -> None:
+        self.assertEqual(_TRAINING_PROTOCOL_VERSION, 11)
         config = EvolutionConfig()
         self.assertEqual(config.generations, 125)
         self.assertEqual(config.episodes_per_generation, 16)
@@ -39,6 +40,21 @@ class TestEpisodeExecution(unittest.TestCase):
         quick = quick_evolution_config()
         self.assertEqual(quick.generations, 20)
         self.assertEqual(quick.episodes_per_generation, 4)
+
+    def test_final_evaluation_aggregates_five_seed_metrics(self) -> None:
+        from citysim.cli import _aggregate_evaluation_rows
+
+        rows = [
+            {"seed": seed, "metrics": {"fitness_mean": float(seed)}}
+            for seed in range(5)
+        ]
+        summary = _aggregate_evaluation_rows(rows)
+        self.assertEqual(summary["seed_count"], 5)
+        self.assertEqual(summary["aggregate"]["fitness_mean"]["mean"], 2.0)
+        self.assertAlmostEqual(
+            summary["aggregate"]["fitness_mean"]["std"],
+            np.std(np.arange(5), ddof=1),
+        )
 
     def test_sigma_controller_uses_uncertainty_and_caps_boost(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=1)

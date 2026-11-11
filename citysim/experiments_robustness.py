@@ -231,6 +231,7 @@ def e11_shocks(
                     int(eval_seed),
                     record_history=True,
                     shocks=shocks,
+                    include_automatic_shocks=False,
                 )
                 resilience = resilience_metrics(episode.history, shock_round)
                 metrics.append(

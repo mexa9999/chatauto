@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import CityConfig, FitnessWeights
 from .policy import Policy, cap_bid
+from .shocks import automatic_shocks, shock_rng
 from .world import Action, ActionRecord, AgentMetrics, CityMetrics, CityEnvironment
 
 
@@ -197,6 +198,7 @@ def run_episode(
     on_round_start: RoundCallback | None = None,
     on_round_end: RoundCallback | None = None,
     should_continue: Callable[[], bool] | None = None,
+    include_automatic_shocks: bool = True,
 ) -> EpisodeResult:
     if len(policies) != config.n_agents:
         raise ValueError(
@@ -210,19 +212,31 @@ def run_episode(
     if rng_seed is None:
         rng_seed = (int(seed) * 2_654_435_761 + 0x9E3779B9) % (2**63)
     rng = np.random.default_rng(int(rng_seed))
-    shocks = list(shocks or [])
+    scheduled_shocks = (
+        [shock.as_dict() for shock in automatic_shocks(config.actions_per_agent)]
+        if include_automatic_shocks
+        else []
+    )
+    scheduled_shocks.extend(dict(shock) for shock in shocks or [])
+    shocks_by_round: dict[int, list[tuple[int, dict]]] = {}
+    for event_index, shock in enumerate(scheduled_shocks):
+        round_index = int(shock.get("round", -1))
+        shocks_by_round.setdefault(round_index, []).append((event_index, shock))
     for round_idx in range(config.actions_per_agent):
         if should_continue is not None and not should_continue():
             break
+        for event_index, shock in shocks_by_round.get(round_idx, []):
+            kind = str(shock.get("kind", "earthquake"))
+            env.apply_shock(
+                kind,
+                shock_rng(seed, round_idx, event_index, kind),
+                magnitude=float(shock.get("magnitude", 0.5)),
+                duration=(
+                    int(shock["duration"]) if shock.get("duration") is not None else None
+                ),
+            )
         if on_round_start is not None:
             on_round_start(round_idx, env)
-        for shock in shocks:
-            if int(shock.get("round", -1)) == round_idx:
-                env.apply_shock(
-                    str(shock.get("kind", "earthquake")),
-                    rng,
-                    magnitude=float(shock.get("magnitude", 0.5)),
-                )
         if not run_round(env, policies, rng, config, on_action):
             break
         env.end_round()

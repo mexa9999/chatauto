@@ -18,6 +18,7 @@ from citysim.config import (
     CITIZEN_GOODS_DEMAND,
     COMMERCIAL_GOODS_DEMAND,
     EvolutionConfig,
+    FEATURE_NAMES,
     GLOBAL_FEATURE_NAMES,
     GOODS_IMPORT_MARKUP,
     INDUSTRY_INCOME_MULTIPLIER,
@@ -63,6 +64,7 @@ from citysim.policy import (
     random_genome,
     strategic_bid,
 )
+from citysim.shocks import automatic_shocks, shock_rng
 from citysim.world import Action, CityEnvironment
 
 
@@ -74,14 +76,14 @@ def first_buildable(env: CityEnvironment, skip: int = 0) -> int:
 class TestGenome(unittest.TestCase):
     def test_parameter_count_and_shapes(self) -> None:
         layout = DEFAULT_LAYOUT
-        self.assertEqual(N_CELL_FEATURES, 29)
-        self.assertEqual(N_GLOBAL_FEATURES, 16)
-        self.assertEqual(layout.cell_mlp_input, 50)
+        self.assertEqual(N_CELL_FEATURES, 30)
+        self.assertEqual(N_GLOBAL_FEATURES, 21)
+        self.assertEqual(layout.cell_mlp_input, 51)
         rng = np.random.default_rng(0)
         genome = random_genome(rng, layout)
         self.assertEqual(genome.shape, (layout.parameter_count,))
         policy = NeuralPolicy(genome, layout)
-        self.assertEqual(policy.W1.shape, (50, 48))
+        self.assertEqual(policy.W1.shape, (51, 48))
         self.assertEqual(policy.W_type.shape, (48, len(ACTION_TYPE_NAMES)))
         self.assertEqual(policy.W_floors.shape, (48, 20))
         self.assertEqual(policy.W_roof.shape, (48, 4))
@@ -208,7 +210,7 @@ class TestRoadInfrastructure(unittest.TestCase):
         observation = env.observe(0)
 
         self.assertEqual(env.travel_time_jobs[row, col], 0.0)
-        self.assertEqual(observation.cell_features.shape[1], 29)
+        self.assertEqual(observation.cell_features.shape[1], 30)
         self.assertEqual(observation.cell_features[row * env.w + col, 28], 0.0)
 
     def test_congestion_is_quadratic_and_relieved_by_active_roads(self) -> None:
@@ -675,7 +677,7 @@ class TestObservationAndEconomy(unittest.TestCase):
 
         observation = env.observe(0)
         global_features = dict(zip(GLOBAL_FEATURE_NAMES, observation.global_features))
-        self.assertEqual(N_GLOBAL_FEATURES, 16)
+        self.assertEqual(N_GLOBAL_FEATURES, 21)
         self.assertAlmostEqual(
             global_features["housing_vacancy_rate"],
             env.housing_vacancies / env.housing_capacity,
@@ -1203,6 +1205,122 @@ class TestShocksAndRegulation(unittest.TestCase):
         event3 = env3.apply_shock("earthquake", np.random.default_rng(2), 0.5)
         self.assertEqual(event3["cleared"], 2)
         self.assertEqual(int(np.sum(env3.type_grid > 0)), 2)
+
+    def test_automatic_shocks_are_reproducible_and_duration_is_exact(self) -> None:
+        schedule = automatic_shocks(20)
+        self.assertEqual(
+            [(shock.round_index, shock.kind) for shock in schedule],
+            [
+                (9, "recession"),
+                (10, "flood"),
+                (10, "technology_shift"),
+                (19, "recession"),
+            ],
+        )
+        first = shock_rng(81, 10, 0, "flood").choice(100, size=10, replace=False)
+        second = shock_rng(81, 10, 0, "flood").choice(100, size=10, replace=False)
+        np.testing.assert_array_equal(first, second)
+
+        recession_city = replace(
+            quick_city_config(
+                n_agents=1, actions_per_agent=2, initial_budget=5000
+            ),
+            enable_externalities=False,
+        )
+        env = CityEnvironment(recession_city, seed=81)
+        cell = first_buildable(env)
+        self.assertTrue(env.apply_action(0, Action(cell=cell, type_id=0, quality=1)))
+        row, col = divmod(cell, env.w)
+        base_income = float(env._income_grid()[row, col])
+        env.apply_shock(
+            "recession", shock_rng(81, 0, 0, "recession"), 0.8, duration=2
+        )
+        self.assertAlmostEqual(float(env._income_grid()[row, col]), base_income * 0.8)
+        self.assertAlmostEqual(
+            env.observe(0).global_features[
+                GLOBAL_FEATURE_NAMES.index("recession_multiplier")
+            ],
+            0.8,
+        )
+        env._advance_shock_durations()
+        self.assertAlmostEqual(float(env._income_grid()[row, col]), base_income * 0.8)
+        env._advance_shock_durations()
+        self.assertAlmostEqual(float(env._income_grid()[row, col]), base_income)
+
+    def test_flood_temporarily_disables_income_and_technology_is_persistent(self) -> None:
+        city = replace(
+            quick_city_config(
+                n_agents=1, actions_per_agent=2, initial_budget=5000
+            ),
+            enable_externalities=False,
+        )
+        env = CityEnvironment(city, seed=82)
+        event = env.apply_shock(
+            "flood", shock_rng(82, 0, 0, "flood"), 0.1, duration=2
+        )
+        self.assertEqual(
+            event["flooded_cells"],
+            max(1, int(np.ceil(0.1 * env.buildable.sum()))),
+        )
+        flooded_cell = int(np.flatnonzero(env.flooded_grid.ravel())[0])
+        row, col = divmod(flooded_cell, env.w)
+        env.type_grid[row, col] = 1
+        env.quality_grid[row, col] = 1
+        env.floors_grid[row, col] = 1
+        env.owner_grid[row, col] = 0
+        env._refresh_layers(advance_population=False)
+        self.assertEqual(float(env._income_grid()[row, col]), 0.0)
+        self.assertTrue(np.isinf(env._travel_cell_costs()[row, col]))
+        self.assertEqual(
+            env.observe(0).cell_features[
+                flooded_cell, FEATURE_NAMES.index("flooded")
+            ],
+            1.0,
+        )
+        env._advance_shock_durations()
+        env._advance_shock_durations()
+        self.assertFalse(env.flooded_grid.any())
+
+        technology_env = CityEnvironment(city, seed=83)
+        tech_cells = np.flatnonzero(technology_env.buildable.ravel())[:4]
+        for world_type, cell in enumerate(tech_cells, start=1):
+            technology_env.type_grid.ravel()[cell] = world_type
+            technology_env.quality_grid.ravel()[cell] = 1
+            technology_env.floors_grid.ravel()[cell] = 1
+            technology_env.owner_grid.ravel()[cell] = 0
+        technology_env._refresh_layers(advance_population=False)
+        before = technology_env._income_grid().ravel()[tech_cells].copy()
+        technology_env.apply_shock(
+            "technology_shift",
+            shock_rng(83, 0, 0, "technology_shift"),
+            1.2,
+        )
+        after = technology_env._income_grid().ravel()[tech_cells]
+        technology_observation = technology_env.observe(0).global_features
+        technology_feature = GLOBAL_FEATURE_NAMES.index(
+            f"technology_{('housing', 'commercial', 'mixed', 'industry')[technology_env.technology_sector - 1]}"
+        )
+        self.assertEqual(technology_observation[technology_feature], 1.0)
+        for index, world_type in enumerate(range(1, 5)):
+            multiplier = 1.2 if technology_env.technology_sector == world_type else 1.0
+            self.assertAlmostEqual(float(after[index]), float(before[index] * multiplier))
+        technology_env._advance_shock_durations()
+        np.testing.assert_allclose(
+            technology_env._income_grid().ravel()[tech_cells], after
+        )
+
+        control = run_episode(
+            city,
+            [RandomPolicy()],
+            seed=84,
+            include_automatic_shocks=False,
+        )
+        self.assertEqual(control.shocks, [])
+        automatic = run_episode(city, [RandomPolicy()], seed=84)
+        self.assertEqual(
+            {event["kind"] for event in automatic.shocks},
+            {"flood", "technology_shift"},
+        )
 
     def test_regulation_scenarios(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=3, initial_budget=5000)

@@ -7,6 +7,7 @@ import csv
 from dataclasses import replace
 from pathlib import Path
 import os
+from typing import Any
 import uuid
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -56,6 +57,29 @@ from .policy import (
 )
 from .world import CityEnvironment
 from .training_history import DEFAULT_HISTORY_DIR, TrainingHistoryStore
+
+
+FINAL_EVALUATION_SEED_COUNT = 5
+
+
+def _aggregate_evaluation_rows(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metric_names = sorted({name for row in rows for name in row["metrics"]})
+    aggregate: dict[str, dict[str, float]] = {}
+    for name in metric_names:
+        values = np.asarray([row["metrics"][name] for row in rows], dtype=np.float64)
+        aggregate[name] = {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=1)) if values.size > 1 else 0.0,
+        }
+    return {
+        "schema_version": 1,
+        "kind": "training-final-evaluation",
+        "seed_count": len(rows),
+        "seeds": rows,
+        "aggregate": aggregate,
+    }
 
 
 def parse_seeds(text: str) -> list[int]:
@@ -604,30 +628,63 @@ def command_train(args) -> None:
         stop_requested=progress.stop_requested if progress else None,
     )
     write_training_analytics(out, result.history, training_metadata)
-    evaluation_seed = evo.validation_seed_base + 777
-    evaluation_policies = [
-        NeuralPolicy(result.best_genome, layout)
-        for _ in range(city.n_agents)
-    ]
-    evaluation = AnalyticsRecorder(
-        out / "final_evaluation", "training-final-evaluation", evaluation_seed
-    )
-    try:
-        evaluation_result = run_episode(
-            city,
-            evaluation_policies,
+    evaluation_rows = []
+    for evaluation_index in range(FINAL_EVALUATION_SEED_COUNT):
+        evaluation_seed = evo.validation_seed_base + 777 + evaluation_index
+        evaluation_policies = [
+            NeuralPolicy(result.best_genome, layout)
+            for _ in range(city.n_agents)
+        ]
+        evaluation_dir = out / "final_evaluation"
+        if evaluation_index:
+            evaluation_dir /= f"seed-{evaluation_seed}"
+        evaluation = AnalyticsRecorder(
+            evaluation_dir,
+            "training-final-evaluation",
             evaluation_seed,
-            record_history=True,
-            on_action=evaluation.record_action,
-            on_round_end=evaluation.record_round,
         )
-    finally:
-        evaluation.close()
-    evaluation_scores = score_episode(evaluation_result)
-    evaluation.finish(
-        evaluation_result,
-        evaluation_scores,
-        score_breakdown(evaluation_result),
+        try:
+            evaluation_result = run_episode(
+                city,
+                evaluation_policies,
+                evaluation_seed,
+                record_history=True,
+                on_action=evaluation.record_action,
+                on_round_end=evaluation.record_round,
+            )
+        finally:
+            evaluation.close()
+        evaluation_scores = score_episode(evaluation_result)
+        evaluation_breakdown = score_breakdown(evaluation_result)
+        evaluation.finish(
+            evaluation_result,
+            evaluation_scores,
+            evaluation_breakdown,
+        )
+        evaluation_rows.append(
+            {
+                "seed": evaluation_seed,
+                "metrics": {
+                    "fitness_mean": float(evaluation_scores.mean()),
+                    "profit_mean": float(
+                        np.mean([agent.profit for agent in evaluation_result.agents])
+                    ),
+                    "city_quality": float(evaluation_result.city.city_quality),
+                    "mean_satisfaction": float(
+                        evaluation_result.city.mean_satisfaction
+                    ),
+                    "green_share": float(evaluation_result.city.green_share),
+                    "accessibility": float(evaluation_result.city.accessibility),
+                    "total_debt": float(evaluation_result.city.total_debt),
+                },
+                "scores": evaluation_scores.tolist(),
+                "score_breakdown": evaluation_breakdown,
+                "shocks": evaluation_result.shocks,
+            }
+        )
+    write_json(
+        out / "evaluation_summary.json",
+        _aggregate_evaluation_rows(evaluation_rows),
     )
     training_progress_path = out / "training_progress.ndjson"
     if training_progress_path.is_file():

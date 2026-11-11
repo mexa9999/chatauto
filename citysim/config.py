@@ -146,6 +146,7 @@ FEATURE_NAMES = (
     "infra_wait_rounds",       # 26 rounds until a nearby pending road activates
     "travel_time_center",      # 27 normalised road-network time from city centre
     "travel_time_jobs",        # 28 normalised road-network time to jobs
+    "flooded",                 # 29 temporarily flooded cell
 )
 
 GLOBAL_FEATURE_NAMES = (
@@ -165,12 +166,17 @@ GLOBAL_FEATURE_NAMES = (
     "net_migration_rate",      # net migration / base population
     "debt_ratio",              # debt / initial budget, clipped to 3
     "local_goods_coverage",    # local supply / total goods demand
+    "recession_multiplier",    # current city-wide income multiplier
+    "technology_housing",      # current technology bonus sector
+    "technology_commercial",
+    "technology_mixed",
+    "technology_industry",
 )
 
 N_CELL_FEATURES = len(FEATURE_NAMES)
 N_GLOBAL_FEATURES = len(GLOBAL_FEATURE_NAMES)
-assert N_CELL_FEATURES == 29
-assert N_GLOBAL_FEATURES == 16
+assert N_CELL_FEATURES == 30
+assert N_GLOBAL_FEATURES == 21
 
 # Behaviour descriptor length used by diversity and MAP-Elites.
 BEHAVIOR_DIM = 4
