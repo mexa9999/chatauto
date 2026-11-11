@@ -59,6 +59,7 @@ type ActionRow = {
 };
 type AnalyticsDetail = {
   source: AnalyticsSource;
+  action_type_names: Record<string, string>;
   summary: {
     round_count?: number;
     selected_round_count?: number;
@@ -72,6 +73,7 @@ type AnalyticsDetail = {
       by_agent?: Record<string, number>;
       by_round?: Record<string, number>;
       by_round_agent?: Record<string, number>;
+      accepted_by_round_agent?: Record<string, number>;
       by_type?: Record<string, number>;
       by_outcome?: Record<string, number>;
     };
@@ -85,6 +87,7 @@ type AnalyticsDetail = {
     sample_count?: number;
     by_agent: Record<string, number>;
     by_round_agent: Record<string, number>;
+    accepted_by_round_agent: Record<string, number>;
     by_type: Record<string, number>;
     building_count: number;
     floors_bins: { from: number; to: number; count: number }[];
@@ -378,22 +381,50 @@ export default function AnalyticsPage({
   const scoreValues = first?.summary.scores ?? [];
   const meanScore = scoreValues.length ? scoreValues.reduce((sum, score) => sum + score, 0) / scoreValues.length : undefined;
   const actionTypes = Object.entries(first?.action_metrics.by_type ?? {});
-  const comparisonOption = useMemo<EChartsOption>(() => ({
-    color: ["#8b5cf6", "#e55137", "#ff4f00", "#8bb8ff"],
-    animationDuration: 550,
-    tooltip: { trigger: "axis" },
-    legend: { top: 4, textStyle: { color: "#b8c0ce" } },
-    grid: { left: 54, right: 24, top: 42, bottom: 42 },
-    xAxis: { type: "value", name: "Раунд", nameLocation: "middle", nameGap: 28, axisLabel: { color: "#8f9aaa" }, splitLine: { lineStyle: { color: "rgba(255,255,255,.06)" } } },
-    yAxis: { type: "value", name: metricLabels[metric], min: ["city_quality", "mean_satisfaction", "green_share", "mean_utilization", "type_entropy"].includes(metric) ? 0 : undefined, max: ["city_quality", "mean_satisfaction", "green_share", "mean_utilization", "type_entropy"].includes(metric) ? 1 : undefined, axisLabel: { color: "#8f9aaa" }, splitLine: { lineStyle: { color: "rgba(255,255,255,.06)" } } },
-    series: details.map((detail) => ({
-      name: detail.source.label,
-      type: "line",
-      smooth: true,
-      showSymbol: false,
-      data: detail.rounds.map((row) => [row.round, numeric(row.city?.[metric]) ?? null]),
-    })),
-  }), [details, metric]);
+  const hasRoundSeries = details.some((detail) => detail.rounds.length > 0);
+  const comparisonOption = useMemo<EChartsOption>(() => {
+    const series: NonNullable<EChartsOption["series"]> = [];
+    if (hasRoundSeries) {
+      for (const detail of details) {
+        series.push({
+          name: detail.source.label,
+          type: "line",
+          smooth: true,
+          showSymbol: false,
+          data: detail.rounds.map((row) => [row.round, numeric(row.city?.[metric]) ?? null]),
+        });
+      }
+    } else {
+      for (const detail of details) {
+        const rows = detail.training?.series ?? [];
+        for (const [key, label] of [["best_ever", "Лучший результат"], ["best", "Лучший за поколение"], ["mean", "Средний fitness"]] as const) {
+          const points = rows
+            .map((row) => [numeric(row.gen ?? row.generation), numeric(row[key])])
+            .filter((point): point is [number, number] => point[0] != null && point[1] != null);
+          if (points.length) {
+            series.push({
+              name: `${detail.source.label} · ${label}`,
+              type: "line",
+              smooth: true,
+              showSymbol: true,
+              symbolSize: 5,
+              data: points,
+            });
+          }
+        }
+      }
+    }
+    return {
+      color: ["#8b5cf6", "#e55137", "#ff4f00", "#8bb8ff"],
+      animationDuration: 550,
+      tooltip: { trigger: "axis" },
+      legend: { top: 4, textStyle: { color: "#b8c0ce" } },
+      grid: { left: 54, right: 24, top: 42, bottom: 42 },
+      xAxis: { type: "value", name: hasRoundSeries ? "Раунд" : "Поколение", nameLocation: "middle", nameGap: 28, axisLabel: { color: "#8f9aaa" }, splitLine: { lineStyle: { color: "rgba(255,255,255,.06)" } } },
+      yAxis: { type: "value", name: hasRoundSeries ? metricLabels[metric] : "Fitness", min: hasRoundSeries && ["city_quality", "mean_satisfaction", "green_share", "mean_utilization", "type_entropy"].includes(metric) ? 0 : undefined, max: hasRoundSeries && ["city_quality", "mean_satisfaction", "green_share", "mean_utilization", "type_entropy"].includes(metric) ? 1 : undefined, axisLabel: { color: "#8f9aaa" }, splitLine: { lineStyle: { color: "rgba(255,255,255,.06)" } } },
+      series,
+    };
+  }, [details, hasRoundSeries, metric]);
 
   const compareBars = useMemo<EChartsOption>(() => ({
     color: ["#8b5cf6", "#e55137", "#ff4f00", "#8bb8ff"],
@@ -421,28 +452,48 @@ export default function AnalyticsPage({
       avoidLabelOverlap: true,
       itemStyle: { borderColor: "#151922", borderWidth: 3 },
       label: { color: "#d8deea", formatter: "{b}\n{d}%" },
-      data: actionTypes.map(([name, value], index) => ({ name: name === "pass" ? "Пропуск" : name === "demolish" ? "Снос" : `Тип ${name}`, value, itemStyle: { color: ["#8b5cf6", "#ff6b4a", "#ff4f00", "#8bb8ff", "#d9c8ff"][index % 5] } })),
+      data: actionTypes.map(([name, value], index) => ({
+        name: name === "pass"
+          ? "Пропуск"
+          : name === "demolish"
+            ? "Снос"
+            : ["Жильё", "Коммерция", "Смешанная застройка", "Промышленность", "Зелёная зона"][Number(name)]
+              ?? first?.action_type_names[name]
+              ?? `Неизвестный тип ${name}`,
+        value,
+        itemStyle: { color: ["#8b5cf6", "#ff6b4a", "#ff4f00", "#8bb8ff", "#d9c8ff"][index % 5] },
+      })),
     }],
   }), [actionTypes]);
 
   const heatOption = useMemo<EChartsOption>(() => {
     const detail = first;
     const counts = detail?.action_metrics.by_round_agent ?? {};
-    const cells = Object.entries(counts).map(([key, count]) => {
+    const accepted = detail?.action_metrics.accepted_by_round_agent ?? {};
+    const rawCells = Object.entries(counts).map(([key, count]) => {
       const [round, agent] = key.split(":").map(Number);
-      return [round, agent, count] as [number, number, number];
+      return { round, agent, rate: count ? (accepted[key] ?? 0) / count : 0 };
     });
-    const roundLabels = [...new Set(cells.map(([round]) => round))].sort((a, b) => a - b);
-    const agentLabels = [...new Set(cells.map(([, agent]) => agent))].sort((a, b) => a - b);
+    const roundLabels = [...new Set(rawCells.map(({ round }) => round))].sort((a, b) => a - b);
+    const agentLabels = [...new Set(rawCells.map(({ agent }) => agent))].sort((a, b) => a - b);
+    const roundIndex = new Map(roundLabels.map((round, index) => [round, index]));
+    const agentIndex = new Map(agentLabels.map((agent, index) => [agent, index]));
+    const cells = rawCells.map(({ round, agent, rate }) => [
+      roundIndex.get(round) ?? 0,
+      agentIndex.get(agent) ?? 0,
+      rate,
+      round,
+      agent,
+    ]);
     return {
       tooltip: { position: "top", formatter: (params: unknown) => {
-        const item = params as { value: [number, number, number] };
-        return `Раунд ${item.value[0]} · агент ${item.value[1]}<br/>Действий: ${item.value[2]}`;
+        const item = params as { value: [number, number, number, number, number] };
+        return `Раунд ${item.value[3]} · агент ${item.value[4]}<br/>Принято: ${(item.value[2] * 100).toFixed(1)}%`;
       } },
       grid: { left: 58, right: 20, top: 18, bottom: 42 },
-      xAxis: { type: "category", name: "Раунд", data: roundLabels, axisLabel: { color: "#9da8ba" } },
-      yAxis: { type: "category", name: "Агент", data: agentLabels, axisLabel: { color: "#9da8ba" } },
-      visualMap: { min: 0, max: Math.max(1, ...cells.map(([, , count]) => count)), calculable: true, orient: "horizontal", left: "center", bottom: 0, inRange: { color: ["#211a31", "#6600ff", "#ff4f00"] }, textStyle: { color: "#9da8ba" } },
+      xAxis: { type: "category", name: "Раунд", data: roundLabels.map(String), axisLabel: { color: "#9da8ba" } },
+      yAxis: { type: "category", name: "Агент", data: agentLabels.map(String), axisLabel: { color: "#9da8ba" } },
+      visualMap: { min: 0, max: 1, dimension: 2, calculable: false, orient: "horizontal", left: "center", bottom: 0, inRange: { color: ["#211a31", "#6600ff", "#ff4f00"] }, textStyle: { color: "#9da8ba" } },
       series: [{ type: "heatmap", data: cells, emphasis: { itemStyle: { shadowBlur: 9, shadowColor: "rgba(255,255,255,.35)" } } }],
     };
   }, [first]);
@@ -607,7 +658,7 @@ export default function AnalyticsPage({
       const rows = detail.training?.series ?? [];
       for (const [key, name] of [["best_ever", "Лучший результат"], ["best", "Лучший за поколение"], ["mean", "Средний fitness"]] as const) {
         const values = rows.map((row) => [numeric(row.gen ?? row.generation), numeric(row[key])]).filter((item): item is [number, number] => item[0] != null && item[1] != null);
-        if (values.length) series.push({ name: `${detail.source.label} · ${name}`, type: "line", smooth: true, showSymbol: false, data: values });
+        if (values.length) series.push({ name: `${detail.source.label} · ${name}`, type: "line", smooth: true, showSymbol: true, symbolSize: 5, data: values });
       }
     }
     return {
@@ -685,7 +736,7 @@ export default function AnalyticsPage({
             ))}
           </section>
           <section className="analytics-grid">
-            <ChartCard title="Динамика по раундам" eyebrow="ВРЕМЕННОЙ РЯД" option={comparisonOption} empty={!details.some((item) => item.rounds.length)} />
+            <ChartCard title={hasRoundSeries ? "Динамика по раундам" : "Динамика обучения"} eyebrow={hasRoundSeries ? "ВРЕМЕННОЙ РЯД" : "ПОКОЛЕНИЯ"} option={comparisonOption} empty={!hasRoundSeries && !details.some((item) => item.training?.series?.length)} />
             <ChartCard title="Сравнение прогонов" eyebrow="СВОДНЫЕ KPI" option={compareBars} empty={details.length === 0} />
             <ChartCard title="Распределение действий" eyebrow="СТРУКТУРА" option={typeOption} empty={!actionTypes.length} />
             <ChartCard title="Активность агентов" eyebrow="ТЕПЛОВАЯ КАРТА" option={heatOption} empty={!Object.keys(first?.action_metrics.by_round_agent ?? {}).length} />

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import numpy as np
 
 from .config import CityConfig, FitnessWeights
-from .policy import Policy
+from .policy import Policy, cap_bid
 from .world import Action, ActionRecord, AgentMetrics, CityMetrics, CityEnvironment
 
 
@@ -22,6 +22,10 @@ class EpisodeResult:
     config: CityConfig
     shocks: list[dict] = field(default_factory=list)
     type_grid: np.ndarray | None = None
+    player_road_grid: np.ndarray | None = None
+    pending_road_grid: np.ndarray | None = None
+    road_owner_grid: np.ndarray | None = None
+    road_cost_grid: np.ndarray | None = None
 
 
 ActionCallback = Callable[[int, Action, bool, CityEnvironment], bool | None]
@@ -79,6 +83,15 @@ def _resolve_bids(
     return winners
 
 
+def _cap_proposed_bids(
+    env: CityEnvironment,
+    agent_id: int,
+    actions: list[Action],
+) -> list[Action]:
+    budget = env.agents[agent_id].budget
+    return [replace(action, bid=cap_bid(action.bid, budget)) for action in actions]
+
+
 def _run_auction_round(
     env: CityEnvironment,
     policies: list[Policy],
@@ -92,8 +105,10 @@ def _run_auction_round(
 
     # Phase 1: everybody submits a small portfolio of sealed bids.
     proposals = {
-        i: policies[i].propose_bids(
-            env, i, rng, count=config.bids_per_agent
+        i: _cap_proposed_bids(
+            env,
+            i,
+            policies[i].propose_bids(env, i, rng, count=config.bids_per_agent),
         )
         for i in active
     }
@@ -105,8 +120,12 @@ def _run_auction_round(
     active2 = [i for i in active if slots[i] > 0 and not env.agents[i].bankrupt]
     if active2:
         proposals2 = {
-            i: policies[i].propose_bids(
-                env, i, rng, count=max(1, slots[i] + 1)
+            i: _cap_proposed_bids(
+                env,
+                i,
+                policies[i].propose_bids(
+                    env, i, rng, count=max(1, slots[i] + 1)
+                ),
             )
             for i in active2
         }
@@ -155,11 +174,16 @@ def run_round(
     config: CityConfig,
     on_action: ActionCallback | None = None,
 ) -> bool:
-    """Run one full bidding/building round without ending it."""
-    env._current_income = env._income_grid()
-    if config.use_auction:
-        return _run_auction_round(env, policies, rng, config, on_action)
-    return _run_sequential_round(env, policies, rng, config, on_action)
+    """Run one full round, with each agent taking the configured action turns."""
+    for _ in range(config.actions_per_round):
+        env._current_income = env._income_grid()
+        if config.use_auction:
+            completed = _run_auction_round(env, policies, rng, config, on_action)
+        else:
+            completed = _run_sequential_round(env, policies, rng, config, on_action)
+        if not completed:
+            return False
+    return True
 
 
 def run_episode(
@@ -213,6 +237,10 @@ def run_episode(
         config=config,
         shocks=env.shock_events,
         type_grid=env.type_grid.copy(),
+        player_road_grid=env.player_road_grid.copy(),
+        pending_road_grid=env.pending_road_grid.copy(),
+        road_owner_grid=env.road_owner_grid.copy(),
+        road_cost_grid=env.road_cost_grid.copy(),
     )
 
 
@@ -227,6 +255,7 @@ def score_breakdown(
     violations = np.array([a.violations for a in result.agents], dtype=np.float64)
     damage = np.array([a.damage_caused for a in result.agents], dtype=np.float64)
     bankrupt = np.array([a.bankrupt for a in result.agents], dtype=np.float64)
+    debt_ratios = np.array([a.debt_ratio for a in result.agents], dtype=np.float64)
     city_welfare = float(
         np.clip(
             0.5 * (result.city.city_quality + result.city.mean_satisfaction),
@@ -239,13 +268,22 @@ def score_breakdown(
         result.config.actions_per_agent * result.config.buildings_per_action,
     )
 
-    # Smooth, scale-aware normalisation.  tanh does not saturate at the very
-    # short horizons used by the quick experiments and keeps the sign.
-    profit_norm = np.tanh(profits / 1000.0)
+    if profits.size > 1:
+        _, inverse, counts = np.unique(
+            profits, return_inverse=True, return_counts=True
+        )
+        rank_starts = np.cumsum(np.r_[0, counts[:-1]])
+        average_ranks = rank_starts + (counts - 1) / 2.0
+        profit_norm = average_ranks[inverse] / (profits.size - 1)
+    elif profits.size == 1:
+        profit_norm = np.full(1, 0.5, dtype=np.float64)
+    else:
+        profit_norm = np.empty(0, dtype=np.float64)
     build_norm = np.minimum(np.maximum(builds / actions, 0.0), 1.0)
     violation_norm = violations / (violations + 10.0)
     damage_norm = damage / (damage + 50.0)
     skip_norm = np.minimum(np.maximum(skips / actions, 0.0), 1.0)
+    debt_penalty = debt_ratios / (1.0 + debt_ratios)
 
     scores = (
         weights.profit * profit_norm
@@ -254,7 +292,7 @@ def score_breakdown(
         - weights.violations * violation_norm
         - weights.externality_damage * damage_norm
         - weights.skip_penalty * skip_norm
-        - weights.bankruptcy * bankrupt
+        - weights.debt * debt_penalty
         + weights.shared_reward * city_welfare
     )
     return {
@@ -264,6 +302,8 @@ def score_breakdown(
         "violation_norm": violation_norm,
         "damage_norm": damage_norm,
         "skip_norm": skip_norm,
+        "debt_ratio": debt_ratios,
+        "debt_penalty": debt_penalty,
         "bankruptcy": bankrupt,
         "city_welfare": np.full_like(scores, city_welfare),
         "shared_reward": np.full_like(scores, weights.shared_reward * city_welfare),

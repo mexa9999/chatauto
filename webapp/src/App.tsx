@@ -1,8 +1,10 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { FeedbackProvider, useFeedback } from "./Feedback";
 import { useStoredState } from "./useStoredState";
 import { api } from "./api";
+import { HistoryGraph } from "./HistoryGraph";
+import { StrategyCatalog } from "./StrategyCatalog";
 
 const AnalyticsPage = lazy(() => import("./AnalyticsPage"));
 
@@ -86,6 +88,11 @@ type LiveFrame = {
   floors_grid?: number[][];
   roof_quality_grid?: number[][];
   owner_grid?: number[][];
+  player_road_grid?: number[][];
+  pending_road_grid?: number[][];
+  road_owner_grid?: number[][];
+  road_access_grid?: number[][];
+  player_road_density_grid?: number[][];
   agent_id?: number | null;
   action?: { cell: number | null; type_id: number; quality: number; floors?: number; roof_quality?: number; demolish: boolean } | null;
   accepted?: boolean | null;
@@ -151,8 +158,8 @@ function gridValidationError(value: string) {
     return "Введите размеры как высота×ширина, например 12x12.";
   }
   const [height, width] = parts.map(Number);
-  if (!Number.isSafeInteger(height) || !Number.isSafeInteger(width) || height < 3 || width < 3) {
-    return "Каждая сторона сетки должна быть целым числом не меньше 3.";
+  if (!Number.isSafeInteger(height) || !Number.isSafeInteger(width) || height < 3 || width < 3 || height > 64 || width > 64) {
+    return "Каждая сторона сетки должна быть от 3 до 64 клеток.";
   }
   return "";
 }
@@ -371,6 +378,7 @@ function DashboardApp() {
           <DataPage
             runs={runs}
             datasets={datasets}
+            branches={branches}
             onRefresh={refresh}
             onError={setError}
           />
@@ -781,8 +789,20 @@ function LaunchPage({
     onError,
   );
   const [quick, setQuick] = useStoredState("citysim.launch.v1.quick", true, (value): value is boolean => typeof value === "boolean", onError);
-  const [generations, setGenerations] = useStoredState("citysim.launch.v1.generations", 100, (value): value is number => isIntegerBetween(value, 1, 100_000), onError);
-  const [episodes, setEpisodes] = useStoredState("citysim.launch.v1.episodes", 10, (value): value is number => isIntegerBetween(value, 1, 100_000), onError);
+  const [generations, setGenerations] = useStoredState(
+    "citysim.launch.v2.generations",
+    125,
+    (value): value is number => isIntegerBetween(value, 1, 100_000),
+    onError,
+    { fromKey: "citysim.launch.v1.generations", migrate: (value) => value === 100 ? 125 : value },
+  );
+  const [episodes, setEpisodes] = useStoredState(
+    "citysim.launch.v2.episodes",
+    16,
+    (value): value is number => isIntegerBetween(value, 1, 100_000),
+    onError,
+    { fromKey: "citysim.launch.v1.episodes", migrate: (value) => value === 10 ? 16 : value },
+  );
   const [population, setPopulation] = useStoredState("citysim.launch.v1.population", 32, (value): value is number => isIntegerBetween(value, 8, 10_000), onError);
   const [rounds, setRounds] = useStoredState<number | null>("citysim.launch.v1.rounds", null, (value): value is number | null => value === null || isIntegerBetween(value, 1, 10_000), onError);
   const [agents, setAgents] = useStoredState("citysim.launch.v1.agents", 10, (value): value is number => isIntegerBetween(value, 1, 1000), onError);
@@ -790,6 +810,7 @@ function LaunchPage({
   const [seed, setSeed] = useStoredState("citysim.launch.v1.seed", 0, (value): value is number => isIntegerBetween(value, 0, Number.MAX_SAFE_INTEGER), onError);
   const [seeds, setSeeds] = useStoredState("citysim.launch.v1.seeds", "0-2", (value): value is string => typeof value === "string", onError);
   const [grid, setGrid] = useStoredState("citysim.launch.v1.grid", "12x12", (value): value is string => typeof value === "string", onError);
+  const [actionsPerRound, setActionsPerRound] = useStoredState("citysim.launch.v1.actionsPerRound", 2, (value): value is number => isIntegerBetween(value, 1, 4), onError);
   const [genomeRef, setGenomeRef] = useStoredState("citysim.launch.v1.genomeRef", "", (value): value is string => typeof value === "string", onError);
   const [checkpoints, setCheckpoints] = useState<DemoCheckpoint[]>([]);
   const [resume, setResume] = useStoredState("citysim.launch.v1.resume", false, (value): value is boolean => typeof value === "boolean", onError);
@@ -806,6 +827,7 @@ function LaunchPage({
     isIntegerBetween(episodes, 1, 100_000) &&
     isIntegerBetween(population, 8, 10_000) &&
     isIntegerBetween(agents, 1, 1000) &&
+    isIntegerBetween(actionsPerRound, 1, 4) &&
     isIntegerBetween(seed, 0, Number.MAX_SAFE_INTEGER) &&
     (rounds === null || isIntegerBetween(rounds, 1, 10_000)) &&
     workersValid;
@@ -831,8 +853,8 @@ function LaunchPage({
     setPolicy("manual");
     setShock("");
     setQuick(true);
-    setGenerations(100);
-    setEpisodes(10);
+    setGenerations(125);
+    setEpisodes(16);
     setPopulation(32);
     setRounds(null);
     setAgents(10);
@@ -840,6 +862,7 @@ function LaunchPage({
     setSeed(0);
     setSeeds("0-2");
     setGrid("12x12");
+    setActionsPerRound(2);
     setGenomeRef("");
     setResume(false);
   };
@@ -890,6 +913,7 @@ function LaunchPage({
         seed,
         seeds,
         grid,
+        actions_per_round: actionsPerRound,
         speed_ms: 80,
         eval_seeds: 5,
         checkpoint_every: 10,
@@ -955,6 +979,9 @@ function LaunchPage({
               <Field label="Размер сетки">
                 <input value={grid} onChange={(event) => setGrid(event.target.value)} placeholder="12x12" aria-invalid={Boolean(gridError)} aria-describedby={gridError ? "grid-format-hint grid-error" : "grid-format-hint"} />
               </Field>
+              <Field label="Действий на агента за раунд">
+                <input type="number" min="1" max="4" value={actionsPerRound} onChange={(event) => setActionsPerRound(Number(event.target.value))} />
+              </Field>
               <Field label="Сид"><input type="number" min="0" value={seed} onChange={(event) => setSeed(Number(event.target.value))} /></Field>
               <Field label="Раундов на эпизод">
                 <input
@@ -974,7 +1001,7 @@ function LaunchPage({
               </Field>
             </div>
             <label className="check-row"><input type="checkbox" checked={quick} onChange={(event) => setQuick(event.target.checked)} /> Быстрая конфигурация</label>
-            <p className="hint" id="grid-format-hint">Размер сетки задаётся как высота×ширина, например 12x12. Без изменения поля быстрый режим использует 6 раундов, обычный — 20; введённое число применяется независимо от режима.</p>
+            <p className="hint" id="grid-format-hint">Размер сетки задаётся как высота×ширина, от 3×3 до 64×64. Без изменения поля быстрый режим использует 6 раундов, обычный — 20; введённое число применяется независимо от режима.</p>
             {gridError && <p className="field-error" id="grid-error" role="alert">{gridError}</p>}
           </div>
         ) : (
@@ -1035,10 +1062,18 @@ function LaunchPage({
                     onChange={(event) => setRounds(Number(event.target.value))}
                   />
                 </Field>
+                <Field label="Размер карты (до 64×64)">
+                  <input value={grid} onChange={(event) => setGrid(event.target.value)} placeholder="12x12" aria-invalid={Boolean(gridError)} aria-describedby={gridError ? "grid-format-hint grid-error" : "grid-format-hint"} />
+                </Field>
+                <Field label="Действий на агента за раунд">
+                  <input type="number" min="1" max="4" value={actionsPerRound} onChange={(event) => setActionsPerRound(Number(event.target.value))} />
+                </Field>
                 <Field label="Размер популяции"><input type="number" min="8" max="10000" step="4" required value={population} onChange={(event) => setPopulation(Number(event.target.value))} /></Field>
                 <Field label="Агентов в городе"><input type="number" min="1" max="1000" required value={agents} onChange={(event) => setAgents(Number(event.target.value))} /></Field>
                 <Field label="CPU workers (пусто — авто)"><input type="number" min="1" max="1024" value={workers} onChange={(event) => setWorkers(event.target.value)} placeholder="Авто" /></Field>
               </div>
+              <p className="hint" id="grid-format-hint">Размер карты задаётся как высота×ширина от 3×3 до 64×64. За раунд каждый агент выполняет от 1 до 4 последовательных действий.</p>
+              {gridError && <p className="field-error" id="grid-error" role="alert">{gridError}</p>}
               <p className={`hint ${!populationValid || (kind === "experiment" && !seedsValid) ? "hint-error" : ""}`}>
                 Быстрый режим использует 6 раундов, обычный — 20, если число не задано.
                 Популяция должна делиться на 4, быть не меньше числа агентов, а эпизодов × агентов — покрывать популяцию.
@@ -1501,10 +1536,19 @@ function IsometricMap({ frame }: { frame: LiveFrame | null }) {
   const selectedRow = selectedCell == null || !width ? -1 : Math.floor(selectedCell / width);
   const selectedCol = selectedCell == null || !width ? -1 : selectedCell % width;
   const selectedType = selectedRow < 0 ? 0 : typeGrid?.[selectedRow]?.[selectedCol] ?? 0;
-  const selectedOwner = selectedRow < 0 ? -1 : frame?.owner_grid?.[selectedRow]?.[selectedCol] ?? -1;
+  const selectedActiveRoad = selectedRow >= 0 && (frame?.player_road_grid?.[selectedRow]?.[selectedCol] ?? 0) > 0;
+  const selectedPendingRoad = selectedRow >= 0 && (frame?.pending_road_grid?.[selectedRow]?.[selectedCol] ?? 0) > 0;
+  const selectedHasRoad = selectedActiveRoad || selectedPendingRoad;
+  const selectedOwner = selectedRow < 0
+    ? -1
+    : selectedHasRoad
+      ? frame?.road_owner_grid?.[selectedRow]?.[selectedCol] ?? -1
+      : frame?.owner_grid?.[selectedRow]?.[selectedCol] ?? -1;
   const selectedFloors = selectedRow < 0 ? 0 : frame?.floors_grid?.[selectedRow]?.[selectedCol] ?? 0;
   const selectedQuality = selectedRow < 0 ? 0 : frame?.quality_grid?.[selectedRow]?.[selectedCol] ?? 0;
   const selectedRoof = selectedRow < 0 ? 0 : frame?.roof_quality_grid?.[selectedRow]?.[selectedCol] ?? 0;
+  const selectedRoadAccess = selectedRow < 0 ? null : frame?.road_access_grid?.[selectedRow]?.[selectedCol] ?? null;
+  const selectedRoadDensity = selectedRow < 0 ? null : frame?.player_road_density_grid?.[selectedRow]?.[selectedCol] ?? null;
 
   useEffect(() => {
     if (!frame) {
@@ -1629,7 +1673,14 @@ function IsometricMap({ frame }: { frame: LiveFrame | null }) {
           const col = diagonal - row;
           const faces = isoCellFaces(frame, geometry, row, col);
           const { type, floors, cx, cy, elevation, ground, roof, left, right } = faces;
-          if (type <= 0) continue;
+          if (type <= 0) {
+            if ((frame.player_road_grid?.[row]?.[col] ?? 0) > 0) {
+              fillIsoPolygon(context, ground, "rgba(112, 128, 145, .92)", "rgba(220, 228, 238, .62)", 0.8);
+            } else if ((frame.pending_road_grid?.[row]?.[col] ?? 0) > 0) {
+              fillIsoPolygon(context, ground, "rgba(238, 190, 75, .48)", "rgba(255, 211, 105, .9)", 1.2);
+            }
+            continue;
+          }
           const material = BUILDING_MATERIALS[type] ?? BUILDING_MATERIALS[1];
           const shadow = ground.map(([x, y]) => [x, y + 2.2] as IsoPoint);
           fillIsoPolygon(context, shadow, "rgba(6, 8, 17, .35)");
@@ -1845,7 +1896,11 @@ function IsometricMap({ frame }: { frame: LiveFrame | null }) {
         />
         {hoverCell != null && frame && (
           <div className="iso-hover-chip" aria-live="polite">
-            Клетка {hoverCell + 1} · {BUILDING_LABELS[frame.type_grid?.[Math.floor(hoverCell / width)]?.[hoverCell % width] ?? 0]}
+            Клетка {hoverCell + 1} · {((frame.player_road_grid?.[Math.floor(hoverCell / width)]?.[hoverCell % width] ?? 0) > 0)
+              ? "Дорога"
+              : ((frame.pending_road_grid?.[Math.floor(hoverCell / width)]?.[hoverCell % width] ?? 0) > 0)
+                ? "Дорога строится"
+                : BUILDING_LABELS[frame.type_grid?.[Math.floor(hoverCell / width)]?.[hoverCell % width] ?? 0]}
           </div>
         )}
       </div>
@@ -1854,16 +1909,18 @@ function IsometricMap({ frame }: { frame: LiveFrame | null }) {
           <div className="iso-inspector-heading">
             <div>
               <span className="eyebrow">ВЫБРАННАЯ КЛЕТКА</span>
-              <h3>{BUILDING_LABELS[selectedType] ?? "Здание"} · #{selectedCell + 1}</h3>
+              <h3>{selectedHasRoad ? `Дорога · ${selectedPendingRoad ? "строится" : "активна"}` : BUILDING_LABELS[selectedType] ?? "Здание"} · #{selectedCell + 1}</h3>
             </div>
             <button className="icon-button" aria-label="Закрыть сведения о клетке" onClick={() => setSelectedCell(null)}>×</button>
           </div>
           <div className="iso-inspector-stats">
             <span><small>Позиция</small><b>{selectedRow + 1}, {selectedCol + 1}</b></span>
-            <span><small>Этажи</small><b>{selectedFloors || "—"}</b></span>
-            <span><small>Качество</small><b>{selectedType > 0 ? `${selectedQuality + 1}/3` : "—"}</b></span>
-            <span><small>Крыша</small><b>{selectedType > 0 ? `${selectedRoof}/3` : "—"}</b></span>
+            <span><small>Этажи</small><b>{selectedHasRoad ? "—" : selectedFloors || "—"}</b></span>
+            <span><small>Качество</small><b>{selectedType > 0 && !selectedHasRoad ? `${selectedQuality + 1}/3` : "—"}</b></span>
+            <span><small>Крыша</small><b>{selectedType > 0 && !selectedHasRoad ? `${selectedRoof}/3` : "—"}</b></span>
             <span><small>Агент</small><b>{selectedOwner >= 0 ? `#${selectedOwner + 1}` : "—"}</b></span>
+            <span><small>Доступность дорог</small><b>{selectedRoadAccess == null ? "—" : selectedRoadAccess.toFixed(2)}</b></span>
+            <span><small>Плотность дорог</small><b>{selectedRoadDensity == null ? "—" : selectedRoadDensity.toFixed(2)}</b></span>
           </div>
         </section>
       )}
@@ -1903,12 +1960,20 @@ function HistoryPage({
   const [seedCount, setSeedCount] = useState(5);
   const [name, setName] = useState("");
   const [fromRef, setFromRef] = useState("");
+  const [newBranchMode, setNewBranchMode] = useState<"empty" | "fork">("empty");
   const [resetRef, setResetRef] = useState("");
   const [fastForwardRef, setFastForwardRef] = useState("");
   const [maintenance, setMaintenance] = useState("");
   const [gcToken, setGcToken] = useState("");
   const [error, setError] = useState("");
   const [busyAction, setBusyAction] = useState("");
+  const handleGraphError = useCallback((message: string) => setError(message), []);
+  const handleGraphSelect = useCallback((selectedBranch: string, generation: number) => {
+    setBranch(selectedBranch);
+    setFromRef(`${selectedBranch}@${generation}`);
+    setResetRef(`${selectedBranch}@${generation}`);
+  }, []);
+  const graphRefreshKey = branches.map((item) => `${item.name}:${item.head_commit ?? ""}`).join("|");
   const refBranches = branches.filter((item) => item.head_commit);
   const branchKey = refBranches
     .map((item) => `${item.name}:${item.head_commit}`)
@@ -2044,6 +2109,7 @@ function HistoryPage({
           <button className="alert-close" aria-label="Закрыть сообщение" onClick={() => setError("")}>×</button>
         </div>
       )}
+      <HistoryGraph onError={handleGraphError} refreshKey={graphRefreshKey} onSelectCommit={handleGraphSelect} />
       <div className="two-column">
         <section className="panel">
           <div className="section-head"><div><p className="eyebrow">ИСТОРИЯ</p><h2>Снимки ветки</h2></div></div>
@@ -2115,13 +2181,25 @@ function HistoryPage({
           </div>
           <div className="inline-form">
             <Field label="Новая ветка"><input value={name} onChange={(event) => setName(event.target.value)} placeholder="experiment" required /></Field>
-            <Field label="Создать от (необязательно)"><input value={fromRef} onChange={(event) => setFromRef(event.target.value)} placeholder="main@40" /></Field>
+            <Field label="Режим создания">
+              <select value={newBranchMode} onChange={(event) => setNewBranchMode(event.target.value as typeof newBranchMode)}>
+                <option value="empty">Полностью пустая</option>
+                <option value="fork">Ответвить от снимка</option>
+              </select>
+            </Field>
+            {newBranchMode === "fork" && (
+              <Field label="Исходный снимок"><input value={fromRef} onChange={(event) => setFromRef(event.target.value)} placeholder="main@40" /></Field>
+            )}
             <button
               className="button primary"
-              disabled={!name.trim() || Boolean(busyAction)}
-              onClick={() => void mutate("/api/branches", { name, from_ref: fromRef || null }, "Новая ветка создана.")}
+              disabled={!name.trim() || Boolean(busyAction) || (newBranchMode === "fork" && !fromRef.trim())}
+              onClick={() => void mutate(
+                "/api/branches",
+                { name, empty: newBranchMode === "empty", from_ref: newBranchMode === "fork" ? fromRef.trim() : null },
+                newBranchMode === "empty" ? "Пустая ветка создана." : "Ветка ответвлена от снимка.",
+              )}
             >
-              {busyAction === "/api/branches" ? "Создание…" : "Создать ветку"}
+              {busyAction === "/api/branches" ? "Создание…" : newBranchMode === "empty" ? "Создать пустую ветку" : "Ответвить от снимка"}
             </button>
           </div>
           <div className="inline-form reset-form">
@@ -2216,11 +2294,13 @@ function HistoryPage({
 function DataPage({
   runs,
   datasets,
+  branches,
   onRefresh,
   onError,
 }: {
   runs: Run[];
   datasets: Dataset[];
+  branches: Branch[];
   onRefresh: () => Promise<void>;
   onError: (message: string) => void;
 }) {
@@ -2252,6 +2332,8 @@ function DataPage({
       : datasetSort === "newest"
         ? right.created_at.localeCompare(left.created_at)
         : left.created_at.localeCompare(right.created_at));
+  const strategyRefreshKey = branches.map((branch) => `${branch.name}:${branch.head_commit ?? ""}`).join("|");
+  const [showAdvancedCatalog, setShowAdvancedCatalog] = useState(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -2549,7 +2631,14 @@ function DataPage({
         </section>
       </div>
       <section className="panel">
-        <GenomeCatalog onError={onError} />
+        <StrategyCatalog branches={branches} onError={onError} refreshKey={strategyRefreshKey} />
+        <details
+          className="advanced-genome-catalog"
+          onToggle={(event) => setShowAdvancedCatalog(event.currentTarget.open)}
+        >
+          <summary>Импортированные геномы и расширенные операции</summary>
+          {showAdvancedCatalog && <GenomeCatalog onError={onError} />}
+        </details>
       </section>
       <TrashPanel onError={onError} />
       <section className="panel">
@@ -2566,21 +2655,53 @@ function GenomeCatalog({ onError }: { onError: (message: string) => void }) {
   const [genomes, setGenomes] = useState<Genome[]>([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
   const [detail, setDetail] = useState<Record<string, unknown> | null>(null);
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
+  const pageSize = 100;
+  const genomeGroups = Array.from(
+    genomes.reduce((groups, genome) => {
+      const branch = genome.branch_name ?? genome.metadata.branch ?? null;
+      const generation = genome.generation ?? genome.metadata.generation ?? null;
+      const key = JSON.stringify([
+        genome.source_kind,
+        branch,
+        generation,
+        genome.member_kind,
+        genome.source_kind === "import" ? genome.genome_id : null,
+      ]);
+      const group = groups.get(key) ?? { key, genomes: [] as Genome[] };
+      group.genomes.push(genome);
+      groups.set(key, group);
+      return groups;
+    }, new Map<string, { key: string; genomes: Genome[] }>())
+      .values(),
+  );
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
 
   const load = useCallback(async () => {
     try {
-      const result = await api<{ genomes: Genome[] }>(
-        `/api/genomes?query=${encodeURIComponent(query)}`,
+      const params = new URLSearchParams({
+        query,
+        limit: String(pageSize),
+        offset: String(offset),
+      });
+      const result = await api<{ genomes: Genome[]; has_more: boolean }>(
+        `/api/genomes?${params}`,
       );
+      if (!result.genomes.length && offset > 0) {
+        setOffset(Math.max(0, offset - pageSize));
+        return;
+      }
       setGenomes(result.genomes);
-      setSelected((current) => current.filter((id) => result.genomes.some((item) => item.genome_id === id)));
+      setHasMore(result.has_more);
+      setExpandedGroups(new Set());
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [onError, query]);
+  }, [offset, onError, pageSize, query]);
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 250);
     return () => window.clearTimeout(timer);
@@ -2646,12 +2767,20 @@ function GenomeCatalog({ onError }: { onError: (message: string) => void }) {
       </div>
       <p className="muted small">Откройте происхождение, сравните параметры или перенесите проверенный NPZ-геном между компьютерами.</p>
       <div className="inline-form genome-toolbar">
-        <Field label="Поиск"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Имя, ветка, тип…" /></Field>
+        <Field label="Поиск"><input value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0); }} placeholder="Имя, ветка, тип…" /></Field>
         <Field label="Импорт геномов NPZ"><input key={files.length} type="file" multiple accept=".npz,application/octet-stream" onChange={(event) => setFiles(Array.from(event.target.files ?? []))} /></Field>
         <button className="button secondary" disabled={!files.length || busy} onClick={() => void importFiles()}>{busy ? "Импорт…" : `Импортировать (${files.length})`}</button>
       </div>
       <div className="button-row">
-        <span className="count-pill">{selected.length} выбрано</span>
+        <span className="count-pill">
+          {selected.length} выбрано · {genomes.length ? `${offset + 1}–${offset + genomes.length}` : "0"} · страница {Math.floor(offset / pageSize) + 1}
+        </span>
+        <button className="button secondary" disabled={offset === 0 || busy} onClick={() => setOffset((current) => Math.max(0, current - pageSize))}>
+          Назад
+        </button>
+        <button className="button secondary" disabled={!hasMore || busy} onClick={() => setOffset((current) => current + pageSize)}>
+          Далее
+        </button>
         <button
           className="button secondary"
           disabled={!genomes.length || busy}
@@ -2660,7 +2789,7 @@ function GenomeCatalog({ onError }: { onError: (message: string) => void }) {
             ? current.filter((id) => !genomes.some((genome) => genome.genome_id === id))
             : [...new Set([...current, ...genomes.map((genome) => genome.genome_id)])])}
         >
-          {genomes.length > 0 && genomes.every((genome) => selected.includes(genome.genome_id)) ? "Снять выделение" : "Выбрать все результаты"}
+          {genomes.length > 0 && genomes.every((genome) => selected.includes(genome.genome_id)) ? "Снять выделение на странице" : "Выбрать страницу"}
         </button>
         <button className="button secondary" disabled={!selected.length || busy} onClick={() => {
           for (const id of selected) {
@@ -2716,25 +2845,57 @@ function GenomeCatalog({ onError }: { onError: (message: string) => void }) {
       <div className="table-wrap">
         <table>
           <thead><tr><th></th><th>Название</th><th>Источник</th><th>Ветка / поколение</th><th>Действия</th></tr></thead>
-          <tbody>{genomes.map((genome) => (
-            <tr key={genome.genome_id}>
-              <td><input aria-label={`Выбрать ${String(genome.metadata.name ?? genome.genome_id)}`} type="checkbox" checked={selected.includes(genome.genome_id)} onChange={(event) => setSelected((current) => event.target.checked ? [...current, genome.genome_id] : current.filter((id) => id !== genome.genome_id))} /></td>
-              <td><b>{String(genome.metadata.name ?? `${genome.member_kind} genome`)}</b><small className="sub-cell mono">{genome.genome_id.slice(0, 10)}</small></td>
-              <td>{genome.source_kind} · {genome.member_kind}{genome.member_index == null ? "" : ` #${genome.member_index}`}</td>
-              <td>{genome.branch_name ?? "Импорт"}{genome.generation == null ? "" : ` · gen ${genome.generation}`}</td>
-              <td><div className="button-row"><button className="button small-button secondary" disabled={busy} onClick={() => void act("Детали генома загружены.", async () => setDetail(await api(`/api/genomes/${genome.genome_id}`)))}>Открыть</button><button className="button small-button secondary" disabled={busy} onClick={async () => {
-                const oldName = String(genome.metadata.name ?? "");
-                const name = await prompt({
-                  title: "Переименовать геном",
-                  message: "Изменится только подпись в каталоге, параметры стратегии останутся прежними.",
-                  label: "Название",
-                  initialValue: oldName,
-                });
-                if (name?.trim() && name.trim() !== oldName) void act("Метаданные обновлены.", () => api(`/api/genomes/${genome.genome_id}`, { method: "PUT", body: JSON.stringify({ updates: { name: name.trim() } }) }));
-              }}>Переименовать</button></div></td>
-            </tr>
-          ))}{!genomes.length && <tr><td colSpan={5} className="empty-cell">
-            {query ? <>По запросу «{query}» ничего не найдено. <button className="text-button" onClick={() => setQuery("")}>Сбросить поиск</button></> : "Геномов пока нет. После первого checkpoint каталог заполнится автоматически; также можно импортировать NPZ-файл выше."}
+          <tbody>{genomeGroups.map((group) => {
+            const first = group.genomes[0];
+            const branch = String(first.branch_name ?? first.metadata.branch ?? "Импорт");
+            const generation = first.generation ?? first.metadata.generation;
+            const expanded = expandedGroups.has(group.key);
+            const grouped = group.genomes.length > 1;
+            const allSelected = group.genomes.every((genome) => selected.includes(genome.genome_id));
+            const toggleSelection = () => setSelected((current) => allSelected
+              ? current.filter((id) => !group.genomes.some((genome) => genome.genome_id === id))
+              : [...new Set([...current, ...group.genomes.map((genome) => genome.genome_id)])]);
+            const renderGenome = (genome: Genome, showMetadata: boolean) => (
+              <Fragment key={genome.genome_id}>
+                <tr>
+                  <td><input aria-label={`Выбрать ${String(genome.metadata.name ?? genome.genome_id)}`} type="checkbox" checked={selected.includes(genome.genome_id)} onChange={(event) => setSelected((current) => event.target.checked ? [...current, genome.genome_id] : current.filter((id) => id !== genome.genome_id))} /></td>
+                  <td><b>{String(genome.metadata.name ?? `${genome.member_kind} genome`)}</b><small className="sub-cell mono">{genome.genome_id.slice(0, 10)}</small></td>
+                  <td>{genome.source_kind} · {genome.member_kind}{genome.member_index == null ? "" : ` #${genome.member_index}`}</td>
+                  <td>{branch}{generation == null ? "" : ` · gen ${String(generation)}`}</td>
+                  <td><div className="button-row"><button className="button small-button secondary" disabled={busy} onClick={() => void act("Детали генома загружены.", async () => setDetail(await api(`/api/genomes/${genome.genome_id}`)))}>Открыть</button><button className="button small-button secondary" disabled={busy} onClick={async () => {
+                    const oldName = String(genome.metadata.name ?? "");
+                    const name = await prompt({
+                      title: "Переименовать геном",
+                      message: "Изменится только подпись в каталоге, параметры стратегии останутся прежними.",
+                      label: "Название",
+                      initialValue: oldName,
+                    });
+                    if (name?.trim() && name.trim() !== oldName) void act("Метаданные обновлены.", () => api(`/api/genomes/${genome.genome_id}`, { method: "PUT", body: JSON.stringify({ updates: { name: name.trim() } }) }));
+                  }}>Переименовать</button></div></td>
+                </tr>
+                {showMetadata && <tr className="genome-metadata-row"><td colSpan={5}><details open><summary>Подробные данные · {String(genome.metadata.name ?? genome.genome_id)}</summary><pre className="code-panel">{JSON.stringify({ genome_id: genome.genome_id, source_kind: genome.source_kind, member_kind: genome.member_kind, member_index: genome.member_index, branch_name: genome.branch_name, generation: genome.generation, metadata: genome.metadata }, null, 2)}</pre></details></td></tr>}
+              </Fragment>
+            );
+            if (!grouped) return renderGenome(first, false);
+            return (
+              <Fragment key={group.key}>
+                <tr className="genome-group-row">
+                  <td><input aria-label={`Выбрать группу ${first.member_kind}`} type="checkbox" checked={allSelected} onChange={toggleSelection} /></td>
+                  <td><button className="text-button" aria-expanded={expanded} onClick={() => setExpandedGroups((current) => {
+                    const next = new Set(current);
+                    if (next.has(group.key)) next.delete(group.key);
+                    else next.add(group.key);
+                    return next;
+                  })}>{expanded ? "Свернуть группу" : "Развернуть группу"} · {group.genomes.length}</button></td>
+                  <td>{first.source_kind} · {first.member_kind}</td>
+                  <td>{branch}{generation == null ? "" : ` · gen ${String(generation)}`}</td>
+                  <td>{group.genomes.filter((genome) => typeof genome.metadata.fitness === "number").length} с оценкой fitness</td>
+                </tr>
+                {expanded && group.genomes.map((genome) => renderGenome(genome, true))}
+              </Fragment>
+            );
+          })}{!genomes.length && <tr><td colSpan={5} className="empty-cell">
+            {query ? <>По запросу «{query}» ничего не найдено. <button className="text-button" onClick={() => { setQuery(""); setOffset(0); }}>Сбросить поиск</button></> : "Геномов пока нет. После первого checkpoint каталог заполнится автоматически; также можно импортировать NPZ-файл выше."}
           </td></tr>}</tbody>
         </table>
       </div>
@@ -2787,9 +2948,29 @@ function TrashPanel({
       setBusyId("");
     }
   };
+  const emptyTrash = async () => {
+    if (!items.length || busyId) return;
+    if (!await confirm({
+      title: "Очистить корзину безвозвратно?",
+      message: `Будут окончательно удалены все ${items.length} объектов: запуски, наборы, ветки и геномы. Это действие нельзя отменить.`,
+      confirmLabel: "Очистить корзину",
+      danger: true,
+    })) return;
+    setBusyId("purge-all");
+    try {
+      const result = await api<{ count: number }>("/api/data/purge-all", { method: "POST" });
+      notify({ kind: "warning", message: `Корзина очищена. Удалено объектов: ${result.count}.` });
+      onError("");
+      await load();
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyId("");
+    }
+  };
   return (
     <section className="panel">
-      <div className="section-head"><div><p className="eyebrow">ВОССТАНОВЛЕНИЕ</p><h2>Корзина</h2></div><button className="button small-button secondary" onClick={() => void load()}>Обновить</button></div>
+      <div className="section-head"><div><p className="eyebrow">ВОССТАНОВЛЕНИЕ</p><h2>Корзина</h2></div><div className="button-row"><button className="button small-button secondary" disabled={Boolean(busyId)} onClick={() => void load()}>Обновить</button><button className="button small-button danger" disabled={!items.length || Boolean(busyId)} onClick={() => void emptyTrash()}>{busyId === "purge-all" ? "Очистка…" : `Очистить корзину (${items.length})`}</button></div></div>
       <p className="muted small">Удалённые объекты сохраняются до ручной безвозвратной очистки.</p>
       <div className="table-wrap"><table><thead><tr><th>Объект</th><th>Тип</th><th>Удалён</th><th>Действия</th></tr></thead><tbody>
         {items.map((item) => {

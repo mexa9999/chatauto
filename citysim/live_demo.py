@@ -34,6 +34,19 @@ def _decode_grid(encoded: str, dtype: str, height: int, width: int) -> list[list
     return values.reshape((height, width)).astype(np.int64).tolist()
 
 
+def _decode_float_grid(
+    encoded: str, dtype: str, height: int, width: int
+) -> list[list[float]]:
+    try:
+        packed = zlib.decompress(base64.b64decode(encoded, validate=True))
+        values = np.frombuffer(packed, dtype=dtype)
+        if values.size != height * width:
+            raise ValueError("state grid has an invalid size")
+    except (ValueError, zlib.error) as exc:
+        raise ValueError(f"invalid compressed state grid: {exc}") from exc
+    return values.reshape((height, width)).astype(np.float64).tolist()
+
+
 class LiveDemoRecorder:
     def __init__(
         self,
@@ -90,6 +103,13 @@ class LiveDemoRecorder:
                     "i1",
                 ),
                 "owner_grid": _encode_grid(env.owner_grid, "<i2"),
+                "player_road_grid": _encode_grid(env.player_road_grid, "u1"),
+                "pending_road_grid": _encode_grid(env.pending_road_grid, "i1"),
+                "road_owner_grid": _encode_grid(env.road_owner_grid, "<i2"),
+                "road_access_grid": _encode_grid(env.road_access, "<f4"),
+                "player_road_density_grid": _encode_grid(
+                    env.player_road_density, "<f4"
+                ),
             }
         )
 
@@ -173,10 +193,18 @@ def read_live_frames(
                     ("floors_grid", "i1"),
                     ("roof_quality_grid", "i1"),
                     ("owner_grid", "<i2"),
+                    ("player_road_grid", "u1"),
+                    ("pending_road_grid", "i1"),
+                    ("road_owner_grid", "<i2"),
                 ):
                     if name in frame:
                         frame[name] = _decode_grid(
                             frame[name], dtype, height, width
+                        )
+                for name in ("road_access_grid", "player_road_density_grid"):
+                    if name in frame:
+                        frame[name] = _decode_float_grid(
+                            frame[name], "<f4", height, width
                         )
             frames.append(frame)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -206,10 +234,21 @@ def read_live_frame(path: str | Path, sequence: int) -> dict[str, Any]:
                         ("floors_grid", "i1"),
                         ("roof_quality_grid", "i1"),
                         ("owner_grid", "<i2"),
+                        ("player_road_grid", "u1"),
+                        ("pending_road_grid", "i1"),
+                        ("road_owner_grid", "<i2"),
                     ):
                         if name in frame:
                             frame[name] = _decode_grid(
                                 frame[name], dtype, height, width
+                            )
+                    for name in (
+                        "road_access_grid",
+                        "player_road_density_grid",
+                    ):
+                        if name in frame:
+                            frame[name] = _decode_float_grid(
+                                frame[name], "<f4", height, width
                             )
                 return frame
     raise ValueError(f"unknown live state frame: {sequence}")

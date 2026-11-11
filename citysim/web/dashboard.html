@@ -7,23 +7,23 @@
   <style>
     :root {
       color-scheme: dark;
-      font: 15px/1.45 "Segoe UI", sans-serif;
+      font: 18px/1.5 "Segoe UI", "Inter", sans-serif;
       background: #111827;
-      color: #e5e7eb;
+      color: #f1f5f9;
       --panel: #1f2937;
       --line: #374151;
       --accent: #60a5fa;
-      --muted: #9ca3af;
+      --muted: #c5d0df;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; }
+    body { margin: 0; font-size: 18px; }
     header { padding: 18px 24px; background: #0b1220; border-bottom: 1px solid var(--line); }
-    h1 { margin: 0; font-size: 1.35rem; }
+    h1 { margin: 0; font-size: 2.2rem; line-height: 1.2; letter-spacing: -0.03em; }
     main { max-width: 1440px; margin: auto; padding: 18px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; align-items: start; }
     section { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 16px; }
-    h2 { margin: 0 0 12px; font-size: 1.05rem; }
-    label { display: block; color: var(--muted); font-size: .88rem; margin: 9px 0 4px; }
+    h2 { margin: 0 0 12px; font-size: 1.4rem; line-height: 1.25; }
+    label { display: block; color: var(--muted); font-size: 1rem; margin: 9px 0 4px; }
     input, select, button { font: inherit; }
     input, select { width: 100%; padding: 8px; color: inherit; background: #111827; border: 1px solid #4b5563; border-radius: 5px; }
     input[type=checkbox] { width: auto; margin-right: 7px; }
@@ -34,10 +34,10 @@
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
     .status { margin: 12px 0; color: var(--muted); }
     progress { width: 100%; height: 17px; accent-color: #34d399; }
-    pre { max-height: 330px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; margin: 8px 0 0; color: #d1d5db; background: #0b1220; border: 1px solid var(--line); border-radius: 5px; }
+    pre { max-height: 330px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; margin: 8px 0 0; color: #f1f5f9; background: #0b1220; border: 1px solid var(--line); border-radius: 5px; font: 15px/1.5 "Cascadia Mono", Consolas, monospace; }
     #logs { min-height: 100px; max-height: 250px; }
     .error { color: #fca5a5; min-height: 1.4em; }
-    .hint { color: var(--muted); font-size: .86rem; }
+    .hint { color: var(--muted); font-size: .95rem; }
     @media (max-width: 600px) { main { padding: 10px; } .grid { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -64,8 +64,8 @@
           <label for="seeds">Обучающие сиды (например, 0-2)</label><input id="seeds" value="0-2">
         </div>
         <div class="row">
-          <div><label for="generations">Поколений</label><input id="generations" type="number" min="1" value="100"></div>
-          <div><label for="episodes">Эпизодов на поколение</label><input id="episodes" type="number" min="1" value="10"></div>
+          <div><label for="generations">Поколений</label><input id="generations" type="number" min="1" value="125"></div>
+          <div><label for="episodes">Эпизодов на поколение</label><input id="episodes" type="number" min="1" value="16"></div>
           <div><label for="population">Размер популяции (кратно 4)</label><input id="population" type="number" min="8" step="4" value="32"></div>
           <div><label for="agents">Агентов в городе</label><input id="agents" type="number" min="1" value="10"></div>
           <div><label for="workers">Рабочих CPU (пусто — авто)</label><input id="workers" type="number" min="1" placeholder="авто"></div>

@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 
 from .config import (
+    ACTION_TYPE_NAMES,
     BID_MAX,
     BID_MIN,
     MAX_FLOORS_BY_ACTION,
     N_ROOF_QUALITIES,
     N_CELL_FEATURES,
     N_GLOBAL_FEATURES,
+    OPTIMAL_DISTANCE,
+    ROAD_ACTION_ID,
 )
 from .world import Action
 
@@ -45,16 +48,12 @@ class Policy(Protocol):
 
 # A soft district-level prior: which action types are natural in a district
 # whose learned type is housing / commercial / industry / green / mixed.
-DISTRICT_ALLOWED: tuple[tuple[int, ...], ...] = (
-    (0, 2, 4),
-    (1, 2, 4),
-    (3, 4),
-    (4, 0),
-    (0, 1, 2, 3, 4),
+DISTRICT_ALLOWED: tuple[tuple[int, ...], ...] = tuple(
+    tuple(range(len(ACTION_TYPE_NAMES))) for _ in range(5)
 )
 
 _DISTRICT_ACTION_BIAS = np.zeros(
-    (len(DISTRICT_ALLOWED), len(DISTRICT_ALLOWED), 3), dtype=np.float64
+    (len(DISTRICT_ALLOWED), len(ACTION_TYPE_NAMES), 3), dtype=np.float64
 )
 for _district_id, _allowed_types in enumerate(DISTRICT_ALLOWED):
     for _type_id in _allowed_types:
@@ -75,7 +74,7 @@ class GenomeLayout:
     attention_dim: int = 8
     district_hidden: int = 12
     global_hidden: int = 8
-    n_types: int = 5
+    n_types: int = len(ACTION_TYPE_NAMES)
     n_qualities: int = 3
     n_floors: int = max(MAX_FLOORS_BY_ACTION)
     n_roof_qualities: int = N_ROOF_QUALITIES
@@ -265,6 +264,22 @@ def mutate_genome(
     return child
 
 
+def bid_cap(budget: float) -> float:
+    """Return the common maximum auction bid for the current budget."""
+    value = float(budget)
+    if not np.isfinite(value):
+        raise ValueError("budget must be finite")
+    return max(0.0, value) * BID_MAX
+
+
+def cap_bid(bid: float, budget: float) -> float:
+    """Clamp a proposed bid to the shared budget-relative auction limit."""
+    value = float(bid)
+    if not np.isfinite(value):
+        raise ValueError("bid must be finite")
+    return min(max(value, BID_MIN), bid_cap(budget))
+
+
 def genome_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean(np.abs(a - b)))
 
@@ -277,9 +292,10 @@ def strategic_bid(expected_surplus: float, cost: float, budget: float) -> float:
     """
     if budget <= 0.0 or expected_surplus <= 0.0 or cost <= 0.0:
         return 0.0
+    if not np.isfinite(expected_surplus) or not np.isfinite(cost):
+        raise ValueError("expected surplus and cost must be finite")
     fraction = min(BID_MAX, 0.08 * expected_surplus / cost)
-    cap = min(BID_MAX * budget, budget / 20.0)
-    return float(min(max(fraction * budget, BID_MIN), cap))
+    return cap_bid(fraction * budget, budget)
 
 
 # ---------------------------------------------------------------------------
@@ -540,23 +556,30 @@ class NeuralPolicy:
         h, w = (int(x) for x in forward["shape"])
         row, col = divmod(int(cell), w)
         budget = max(0.0, float(obs.budget))
-        bid_cap = max(0.0, min(BID_MAX * budget, budget / 10.0))
-        bid = float(min(max(forward["bid_fraction"][row, col] * budget, BID_MIN), bid_cap))
+        bid = cap_bid(forward["bid_fraction"][row, col] * budget, budget)
         floors = 1
         roof_quality = 0
-        if env.config.enable_extended_actions:
+        if env.config.enable_extended_actions and type_id != ROAD_ACTION_ID:
             floor_limit = MAX_FLOORS_BY_ACTION[type_id]
             floors = int(
                 np.argmax(forward["floor_logits"][row, col, :floor_limit]) + 1
             )
             roof_quality = int(np.argmax(forward["roof_logits"][row, col]))
-        cost = env.cost_of(cell, type_id, quality, floors, roof_quality)
+        cost = (
+            env.road_cost_of(cell)
+            if type_id == ROAD_ACTION_ID
+            else env.cost_of(cell, type_id, quality, floors, roof_quality)
+        )
         while cost + bid > budget + 1e-9 and (roof_quality > 0 or floors > 1):
             if roof_quality > 0:
                 roof_quality -= 1
             else:
                 floors -= 1
-            cost = env.cost_of(cell, type_id, quality, floors, roof_quality)
+            cost = (
+                env.road_cost_of(cell)
+                if type_id == ROAD_ACTION_ID
+                else env.cost_of(cell, type_id, quality, floors, roof_quality)
+            )
         if cost + bid > budget + 1e-9:
             return None
         return Action(
@@ -905,8 +928,7 @@ class ManualPolicy:
         p = self.params
         f = obs.cell_features.reshape(env.h, env.w, -1)
         utility = (
-            p[0] * (1.0 - f[..., 4])
-            + p[1] * (1.0 - f[..., 0])
+            p[1] * (1.0 - f[..., 0])
             + p[2] * f[..., 3]
             + p[3] * f[..., 2]
             + p[4] * f[..., 1]
@@ -922,17 +944,41 @@ class ManualPolicy:
         industry_share = f[..., 8].ravel()
         density = f[..., 5].ravel()
         mean_quality = f[..., 9].ravel()
-        compat = np.empty((5, env.h * env.w), dtype=np.float64)
+        compat = np.empty((len(ACTION_TYPE_NAMES), env.h * env.w), dtype=np.float64)
         compat[0] = 0.50 * housing_share + 0.45 * commercial_share - 0.70 * industry_share + 0.20 * mean_quality
         compat[1] = 0.45 * housing_share + 0.40 * commercial_share - 0.60 * industry_share + 0.15 * mean_quality
         compat[2] = 0.45 * (housing_share + commercial_share) - 0.50 * industry_share + 0.15 * mean_quality
         compat[3] = 0.30 * industry_share - 0.45 * (housing_share + commercial_share)
         compat[4] = 0.25 * density - 0.20 * industry_share
+        compat[5] = 0.0
+        access_fit = np.zeros_like(compat)
+        route_features = (
+            f[..., 28],
+            f[..., 27],
+            f[..., 28],
+            f[..., 27],
+            f[..., 4],
+        )
+        route_reachable = (
+            np.isfinite(env.travel_time_jobs),
+            np.isfinite(env.travel_time_center),
+            np.isfinite(env.travel_time_jobs),
+            np.isfinite(env.travel_time_center),
+            np.ones((env.h, env.w), dtype=bool),
+        )
+        for action_type, (distance, reachable) in enumerate(
+            zip(route_features, route_reachable)
+        ):
+            world_type = action_type + 1
+            fit = 1.0 - np.abs(distance - OPTIMAL_DISTANCE[world_type])
+            access_fit[action_type] = (
+                p[0] * np.where(reachable, fit, 0.0)
+            ).ravel()
         type_pref = np.array(
-            [p[6], p[7], 0.5 * (p[6] + p[7]), p[8], p[5]],
+            [p[6], p[7], 0.5 * (p[6] + p[7]), p[8], p[5], -1.0],
             dtype=np.float64,
         )
-        base_scores = utility[None, :] + type_pref[:, None] + compat
+        base_scores = utility[None, :] + type_pref[:, None] + compat + access_fit
         income = env.projected_income_table(agent_id)
         economic_value = income * float(max(1, obs.remaining_rounds)) - obs.cost_table
         return obs, base_scores, economic_value
@@ -952,7 +998,7 @@ class ManualPolicy:
         build_action = Action.pass_action()
         build_value = 0.0
         for quality in self._quality_order():
-            mask = obs.action_mask[:, :, quality].T  # (5, cells)
+            mask = obs.action_mask[:, :, quality].T
             mask = mask & (economic_value[:, :, quality].T > 0.0)
             if not mask.any():
                 continue

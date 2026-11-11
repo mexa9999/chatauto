@@ -9,7 +9,7 @@ import matplotlib
 matplotlib.use("Agg")  # use non-interactive backend for file output
 import matplotlib.pyplot as plt
 from matplotlib import font_manager  # noqa: F401  (kept for API compat)
-from matplotlib.patches import Polygon
+from matplotlib.patches import Patch, Polygon
 import numpy as np
 
 from .config import TYPE_NAMES
@@ -37,6 +37,12 @@ def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) 
     roof_quality_grid = getattr(
         env, "roof_quality_grid", np.zeros(type_grid.shape, dtype=np.int8)
     )
+    player_roads = getattr(
+        env, "player_road_grid", np.zeros(type_grid.shape, dtype=bool)
+    )
+    pending_roads = getattr(
+        env, "pending_road_grid", np.zeros(type_grid.shape, dtype=bool)
+    )
     max_height = max(
         building_height(
             int(type_grid[row, col]),
@@ -56,6 +62,8 @@ def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) 
     )
     for row, col in cells:
         type_id = int(type_grid[row, col])
+        is_active_road = bool(player_roads[row, col])
+        is_pending_road = bool(pending_roads[row, col])
         elevation = building_height(
             type_id,
             int(quality_grid[row, col]),
@@ -73,6 +81,12 @@ def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) 
             elevation,
         )
         color = matplotlib.colors.to_rgb(TYPE_COLORS[type_id])
+        alpha = 1.0
+        if is_active_road:
+            color = matplotlib.colors.to_rgb("#667482")
+        elif is_pending_road:
+            color = matplotlib.colors.to_rgb("#edc15e")
+            alpha = 0.58
         roof_blend = min(
             0.6,
             max(0.0, int(roof_quality_grid[row, col]) / 3.0 * 0.6),
@@ -94,6 +108,11 @@ def _draw_isometric(ax, env, tile_width: float = 1.0, tile_height: float = 0.5) 
                         vertices,
                         closed=True,
                         facecolor=face_color,
+                        alpha=(
+                            alpha
+                            if is_active_road or is_pending_road
+                            else 1.0
+                        ),
                         edgecolor="#333333",
                         linewidth=0.35,
                     )
@@ -120,6 +139,32 @@ def plot_city(
         _draw_isometric(ax, env)
     else:
         ax.imshow(env.type_grid, cmap=cmap, vmin=-0.5, vmax=5.5)
+        roads = np.zeros((*env.type_grid.shape, 4), dtype=np.float64)
+        active_roads = getattr(
+            env, "player_road_grid", np.zeros(env.type_grid.shape, dtype=bool)
+        )
+        pending_roads = getattr(
+            env, "pending_road_grid", np.zeros(env.type_grid.shape, dtype=bool)
+        )
+        roads[active_roads] = (0.40, 0.45, 0.51, 0.9)
+        roads[pending_roads] = (0.93, 0.76, 0.37, 0.58)
+        ax.imshow(roads, interpolation="nearest")
+    if np.any(getattr(env, "player_road_grid", False)) or np.any(
+        getattr(env, "pending_road_grid", False)
+    ):
+        ax.legend(
+            handles=[
+                Patch(facecolor="#667482", label="Active road"),
+                Patch(
+                    facecolor="#edc15e",
+                    alpha=0.58,
+                    label="Pending road",
+                ),
+            ],
+            loc="upper left",
+            fontsize=7,
+            framealpha=0.8,
+        )
         ax.set_xticks(range(env.w))
         ax.set_yticks(range(env.h))
         ax.set_xticks(np.arange(-0.5, env.w, 1), minor=True)

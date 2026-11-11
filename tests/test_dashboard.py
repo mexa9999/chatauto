@@ -30,8 +30,10 @@ from citysim.dashboard import (
     create_app,
 )
 from citysim.dashboard_worker import run_compare
+from citysim.experiment_store import ExperimentStore
 from citysim.experiment_support import train_evolution
 from citysim.live_demo import update_control_file
+from citysim.strategy_catalog import branch_graph, branch_training_runs, run_checkpoints
 from citysim.training_history import TrainingHistoryStore
 
 
@@ -46,7 +48,9 @@ class TestDashboard(unittest.TestCase):
 
         self.assertFalse(_pid_is_running(process.pid))
 
-    def _create_history(self, path: str, **architecture: int) -> TrainingHistoryStore:
+    def _create_history(
+        self, path: str, *, run_id: str | None = None, **architecture: int
+    ) -> TrainingHistoryStore:
         store = TrainingHistoryStore(path)
         city = quick_city_config(n_agents=2, actions_per_agent=1)
         config = EvolutionConfig(
@@ -61,8 +65,75 @@ class TestDashboard(unittest.TestCase):
             seed=81,
             **architecture,
         )
-        train_evolution(config, city, history_store=store, checkpoint_every=1)
+        train_evolution(
+            config,
+            city,
+            history_store=store,
+            checkpoint_every=1,
+            run_id=run_id,
+        )
         return store
+
+    def test_empty_branch_and_run_scoped_strategy_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            store = self._create_history(output, run_id="a" * 32)
+            store.create_branch("empty", empty=True)
+
+            runs = branch_training_runs(store, "main")
+            checkpoints = run_checkpoints(store, "main", runs[0]["key"])
+            groups = store.checkpoint_genome_groups(checkpoints[-1]["commit_id"])
+            genomes = store.list_checkpoint_genomes(
+                checkpoints[-1]["commit_id"],
+                groups[0]["member_kind"],
+                limit=2,
+            )
+            graph = branch_graph(store)
+            app = create_app(store.root, Path(output) / "dashboard-output")
+            routes = {
+                (route.path, method): route.endpoint
+                for route in app.routes
+                if hasattr(route, "endpoint")
+                for method in getattr(route, "methods", ())
+            }
+
+            self.assertEqual(store.branch_names()[0]["name"], "empty")
+            self.assertIsNone(next(item for item in store.branch_names() if item["name"] == "empty")["head_commit"])
+            self.assertEqual(runs[0]["run_id"], "a" * 32)
+            self.assertEqual(len(checkpoints), 2)
+            self.assertGreater(groups[0]["count"], 0)
+            self.assertLessEqual(len(genomes), 2)
+            self.assertEqual(len(graph["branches"]), 2)
+            self.assertEqual(len(graph["commits"]), 2)
+            self.assertEqual(
+                routes[("/api/branches/{name}/strategy-runs", "GET")]("main")["runs"][0]["run_id"],
+                "a" * 32,
+            )
+            self.assertEqual(
+                len(routes[("/api/history/graph", "GET")]()["commits"]),
+                2,
+            )
+            with store._connect() as connection:
+                connection.execute(
+                    "UPDATE commits SET run_id = NULL WHERE commit_id = ?",
+                    (checkpoints[0]["commit_id"],),
+                )
+                connection.execute(
+                    "UPDATE commits SET run_id = 'legacy' WHERE commit_id = ?",
+                    (checkpoints[1]["commit_id"],),
+                )
+            legacy_runs = branch_training_runs(store, "main")
+            self.assertEqual({run["key"] for run in legacy_runs}, {"legacy", "run:legacy"})
+
+    def test_start_job_rejects_out_of_range_grid_and_action_count(self) -> None:
+        with self.assertRaises(ValueError):
+            StartJobRequest(grid="65x12")
+        with self.assertRaises(ValueError):
+            StartJobRequest(actions_per_round=5)
+
+    def test_start_job_defaults_match_evolution_config(self) -> None:
+        request = StartJobRequest()
+        self.assertEqual(request.generations, 125)
+        self.assertEqual(request.episodes, 16)
 
     def test_verify_gc_preview_and_apply_preserve_reachable_history(self) -> None:
         with tempfile.TemporaryDirectory() as output:
@@ -130,6 +201,13 @@ class TestDashboard(unittest.TestCase):
                 {"homogeneous", "league"},
             )
             self.assertIn("fitness", result["metric_differences"]["league"])
+            self.assertIn("debt_ratio", result["metric_differences"]["league"])
+            self.assertIn(
+                "local_goods_coverage", result["metric_differences"]["league"]
+            )
+            self.assertIn(
+                "tax_rate_multiplier", result["metric_differences"]["league"]
+            )
             self.assertIn("evolution", result["config_differences"])
             for report in result["reports"].values():
                 for method in report["methods"].values():
@@ -202,9 +280,20 @@ class TestDashboard(unittest.TestCase):
                 StorageSelectionRequest(entity_type="branch", ids=["renamed"])
             )
 
-            genomes = routes[("/api/genomes", "GET")](
-                branch=None, query="", include_deleted=False
-            )["genomes"]
+            genome_page = routes[("/api/genomes", "GET")](
+                branch=None, query="", include_deleted=False, limit=1, offset=0
+            )
+            self.assertEqual(len(genome_page["genomes"]), 1)
+            self.assertTrue(genome_page["has_more"])
+            next_genome_page = routes[("/api/genomes", "GET")](
+                branch=None, query="", include_deleted=False, limit=1, offset=1
+            )
+            self.assertEqual(len(next_genome_page["genomes"]), 1)
+            self.assertNotEqual(
+                genome_page["genomes"][0]["genome_id"],
+                next_genome_page["genomes"][0]["genome_id"],
+            )
+            genomes = genome_page["genomes"]
             self.assertTrue(genomes)
             genome_id = genomes[0]["genome_id"]
             details = routes[("/api/genomes/{genome_id}", "GET")](genome_id)
@@ -250,6 +339,46 @@ class TestDashboard(unittest.TestCase):
             )
             with self.assertRaises(HTTPException):
                 routes[("/api/genomes/{genome_id}", "GET")](clone_id)
+
+    def test_purge_all_data_clears_every_trash_entity_type(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            history = self._create_history(str(Path(output) / "history"))
+            history.create_branch("discarded")
+            history.delete_branch("discarded")
+            genomes = history.list_genomes()
+            history.delete_genomes([genomes[0]["genome_id"]])
+
+            app = create_app(history.root, output, port=18767)
+            store = ExperimentStore(
+                Path(output) / ".dashboard" / "store", history.root
+            )
+            run_id = "b" * 32
+            run_dir = Path(output) / ".dashboard" / "jobs" / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "summary.json").write_text(
+                json.dumps({"fitness": 0.5}), encoding="utf-8"
+            )
+            store.register_run(run_id, "experiment", {}, run_dir)
+            store.update_run(run_id, "completed")
+            archive = Path(output) / "run.zip"
+            store.create_export(run_id, "light", history.root, archive)
+            preview = store.stage_import(archive, "trash-me")
+            dataset = store.commit_import(preview["token"])
+            store.trash_entities("run", [run_id])
+            store.trash_entities("dataset", [dataset["dataset_id"]])
+
+            routes = {
+                (route.path, method): route.endpoint
+                for route in app.routes
+                if hasattr(route, "endpoint")
+                for method in getattr(route, "methods", ())
+            }
+            result = routes[("/api/data/purge-all", "POST")]()
+
+            self.assertEqual(result, {"status": "purged", "count": 4})
+            self.assertEqual(routes[("/api/data/trash", "GET")]()["items"], [])
+            self.assertEqual(store.list_runs(), [])
+            self.assertEqual(store.list_datasets(), [])
 
     def test_demo_job_command_uses_isolated_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as output:
@@ -301,6 +430,10 @@ class TestDashboard(unittest.TestCase):
                 )
                 actions_index = command.index("--actions")
                 self.assertEqual(command[actions_index + 1], "13", kind)
+                self.assertIn("--grid", command)
+                self.assertIn("--actions-per-round", command)
+                if kind == "train":
+                    self.assertEqual(command[command.index("--run-id") + 1], job_dir.name)
 
     def test_history_api_returns_empty_commits_for_empty_branch(self) -> None:
         with tempfile.TemporaryDirectory() as output:

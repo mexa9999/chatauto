@@ -147,6 +147,8 @@ class AnalyticsRecorder:
             },
             "agent_state": {
                 "budget": float(env.agents[agent_id].budget),
+                "debt": float(env.agents[agent_id].debt),
+                "debt_ratio": float(env.agents[agent_id].debt_ratio),
                 "profit": float(env.agents[agent_id].profit),
                 "bankrupt": bool(env.agents[agent_id].bankrupt),
             },
@@ -291,15 +293,23 @@ def load_analytics(
     action_limit: int = 2_000,
 ) -> dict[str, Any]:
     root = Path(directory)
+    training_progress_path = root / "training_progress.ndjson"
+    event_root = root
+    if not training_progress_path.is_file() and not (event_root / "actions.ndjson").is_file() and (
+        event_root / "final_evaluation" / "actions.ndjson"
+    ).is_file():
+        event_root = event_root / "final_evaluation"
     summary_path = root / "analytics_summary.json"
+    if not summary_path.is_file() and event_root != root:
+        summary_path = event_root / "analytics_summary.json"
     summary = (
         _read_json(summary_path)
         if summary_path.is_file()
         else {"schema_version": _SUMMARY_VERSION, "round_count": 0, "action_count": 0}
     )
-    rounds = _load_rounds(root, round_start, round_end)
+    rounds = _load_rounds(event_root, round_start, round_end)
     actions, action_metrics = _load_actions(
-        root, round_start, round_end, agent_id, action_limit
+        event_root, round_start, round_end, agent_id, action_limit
     )
     summary["metrics"] = {
         key: _metric_summary([row.get("city", {}) for row in rounds], key)
@@ -320,6 +330,22 @@ def load_analytics(
     training = _read_json(training_path) if training_path.is_file() else None
     if training is None:
         training = _load_legacy_training(root)
+    if training_progress_path.is_file():
+        progress_rows = _load_training_progress(training_progress_path)
+        if progress_rows:
+            rows_by_generation = {
+                int(row.get("gen", row.get("generation", -1))): row
+                for row in (training or {}).get("series", [])
+                if isinstance(row, dict)
+            }
+            for row in progress_rows:
+                rows_by_generation[int(row["gen"])] = row
+            training = dict(training or {})
+            training["series"] = [
+                rows_by_generation[generation]
+                for generation in sorted(rows_by_generation)
+            ]
+            training["generation_count"] = len(training["series"])
     return {
         "summary": summary,
         "rounds": rounds,
@@ -328,6 +354,25 @@ def load_analytics(
         "training": training,
         "actions_truncated": action_metrics["count"] > len(actions),
     }
+
+
+def _load_training_progress(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        lines = stream.readlines()
+    rows = []
+    for index, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if index == len(lines) - 1 and not line.endswith("\n"):
+                break
+            raise ValueError(
+                f"Invalid training progress record on line {index + 1}"
+            ) from exc
+        if not isinstance(row, dict) or not isinstance(row.get("gen"), int):
+            raise ValueError(f"Invalid training progress record on line {index + 1}")
+        rows.append(row)
+    return rows
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -391,6 +436,7 @@ def _load_actions(
             "rejected": 0,
             "by_agent": {},
             "by_round_agent": {},
+            "accepted_by_round_agent": {},
             "by_type": {},
             "building_count": 0,
             "floors_bins": [],
@@ -402,6 +448,7 @@ def _load_actions(
     count = accepted = rejected = 0
     by_agent: dict[str, int] = {}
     by_round_agent: dict[str, int] = {}
+    accepted_by_round_agent: dict[str, int] = {}
     by_type: dict[str, int] = {}
     floor_values: list[float] = []
     roof_quality_counts: dict[str, int] = {}
@@ -433,6 +480,9 @@ def _load_actions(
             by_type[type_key] = by_type.get(type_key, 0) + 1
             if row["outcome"] == "accepted":
                 accepted += 1
+                accepted_by_round_agent[round_agent_key] = (
+                    accepted_by_round_agent.get(round_agent_key, 0) + 1
+                )
                 if action.get("kind") == "build" and not action.get("demolish", False):
                     floor_values.append(float(action.get("floors", 1)))
                     roof_key = str(action.get("roof_quality", 0))
@@ -463,6 +513,7 @@ def _load_actions(
         "rejected": rejected,
         "by_agent": by_agent,
         "by_round_agent": by_round_agent,
+        "accepted_by_round_agent": accepted_by_round_agent,
         "by_type": by_type,
         "building_count": len(floor_values),
         "floors_bins": _histogram(floor_values),

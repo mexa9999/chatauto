@@ -214,6 +214,7 @@ def train_evolution(
     branch: str = "main",
     progress_callback: ProgressCallback | None = None,
     stop_requested: StopRequested | None = None,
+    run_id: str | None = None,
 ) -> EvolutionResult:
     out = ensure_dir(out_dir) if out_dir is not None else None
     if history_store is not None:
@@ -226,6 +227,7 @@ def train_evolution(
             checkpoint_every,
             progress_callback,
             stop_requested,
+            run_id,
         )
     elif cache_dir is not None:
         with training_cache(
@@ -284,6 +286,7 @@ def _run_with_history(
     checkpoint_every: int,
     progress_callback: ProgressCallback | None,
     stop_requested: StopRequested | None,
+    run_id: str | None,
 ) -> EvolutionResult:
     branches = {row["name"]: row for row in history_store.branch_names()}
     if branch not in branches:
@@ -298,6 +301,10 @@ def _run_with_history(
         raise FileExistsError(
             f"branch {branch!r} already has history; pass --resume or create a branch"
         )
+    elif checkpoint.exists():
+        # A work checkpoint without a branch commit is orphaned and cannot be
+        # resumed through the history API; start the empty branch cleanly.
+        checkpoint.unlink()
 
     def record_snapshot(path: Path, generation: int, complete: bool) -> None:
         nonlocal head
@@ -309,6 +316,7 @@ def _run_with_history(
             evolution_config,
             city_config,
             expected_parent=head,
+            run_id=run_id,
         )
 
     return EvolutionEngine(evolution_config, city_config).run(

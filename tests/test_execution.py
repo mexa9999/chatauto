@@ -8,27 +8,117 @@ from unittest.mock import patch
 
 import numpy as np
 
-from citysim.config import EvolutionConfig, quick_city_config
+from citysim.config import EvolutionConfig, quick_city_config, quick_evolution_config
 from citysim.evolution import (
     EvolutionEngine,
     Individual,
+    LARGE_MUTATION_PROBABILITY,
+    LARGE_MUTATION_RATE,
+    LARGE_MUTATION_SIGMA_MULTIPLIER,
+    SIGMA_BOOST_FACTOR,
+    SIGMA_MAX_INITIAL_MULTIPLE,
+    SIGMA_STAGNATION_GENERATIONS,
+    _TRAINING_PROTOCOL_VERSION,
     _configuration_digest,
     evaluate_population,
     layout_from_config,
 )
 from citysim.execution import EpisodeExecutor, EpisodeTask
-from citysim.experiment_support import _run_evolution, training_cache
-from citysim.policy import random_genome
+from citysim.experiment_support import _run_evolution, train_evolution, training_cache
+from citysim.policy import mutate_genome, random_genome
 from citysim.training_history import TrainingHistoryStore
 
 
 class TestEpisodeExecution(unittest.TestCase):
+    def test_evolution_protocol_defaults_and_quick_preset(self) -> None:
+        config = EvolutionConfig()
+        self.assertEqual(config.generations, 125)
+        self.assertEqual(config.episodes_per_generation, 16)
+        self.assertEqual(config.tournament_size, 5)
+        self.assertEqual(config.sharing_radius, 0.40)
+        quick = quick_evolution_config()
+        self.assertEqual(quick.generations, 20)
+        self.assertEqual(quick.episodes_per_generation, 4)
+
+    def test_sigma_controller_uses_uncertainty_and_caps_boost(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=2,
+            episodes_per_generation=2,
+            elites=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+        )
+        engine = EvolutionEngine(config, city)
+        engine.sigma_reference_fitness = 1.0
+        engine.sigma_reference_se = 0.1
+
+        engine._update_sigma_stagnation(1.2, 0.1)
+        self.assertEqual(engine.sigma_stagnation_count, 1)
+        engine._update_sigma_stagnation(1.0, None)
+        self.assertEqual(engine.sigma_stagnation_count, 1)
+
+        with patch("citysim.evolution.SIGMA_STAGNATION_GENERATIONS", 2):
+            engine._update_sigma_stagnation(1.0, 0.1)
+            self.assertEqual(engine._adapt_sigma(), "boost")
+        self.assertEqual(engine.sigma_stagnation_count, 0)
+        self.assertAlmostEqual(
+            engine.sigma,
+            config.mutation_sigma * SIGMA_BOOST_FACTOR,
+        )
+
+        engine._update_sigma_stagnation(1.4, 0.1)
+        self.assertEqual(engine.sigma_stagnation_count, 0)
+        self.assertEqual(engine.sigma_reference_fitness, 1.4)
+
+        engine.sigma = config.mutation_sigma * SIGMA_MAX_INITIAL_MULTIPLE
+        engine.sigma_stagnation_count = SIGMA_STAGNATION_GENERATIONS
+        self.assertEqual(engine._adapt_sigma(), "boost_capped")
+        self.assertEqual(
+            engine.sigma, config.mutation_sigma * SIGMA_MAX_INITIAL_MULTIPLE
+        )
+
+    def test_large_mutation_is_sparse_and_uses_engine_rng(self) -> None:
+        self.assertEqual(LARGE_MUTATION_PROBABILITY, 0.02)
+        self.assertEqual(LARGE_MUTATION_RATE, 0.01)
+        self.assertEqual(LARGE_MUTATION_SIGMA_MULTIPLIER, 4.0)
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=2,
+            episodes_per_generation=2,
+            elites=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+            seed=15,
+        )
+        engine = EvolutionEngine(config, city)
+        genome = np.zeros(2000)
+        with (
+            patch("citysim.evolution.LARGE_MUTATION_PROBABILITY", 1.0),
+            patch("citysim.evolution.mutate_genome", wraps=mutate_genome) as mutate,
+        ):
+            child, was_large = engine._mutate_offspring(genome)
+        self.assertTrue(was_large)
+        changed = np.flatnonzero(child)
+        self.assertGreater(changed.size, 0)
+        self.assertLess(changed.size, genome.size)
+        mutate.assert_called_once_with(
+            genome,
+            engine.rng,
+            engine.sigma * LARGE_MUTATION_SIGMA_MULTIPLIER,
+            mutation_rate=LARGE_MUTATION_RATE,
+        )
+
     def test_generation_checkpoint_resumes_identically(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=1)
         config = EvolutionConfig(
             population_size=4,
             generations=4,
-            episodes_per_generation=2,
+            episodes_per_generation=4,
             elites=1,
             islands=1,
             use_islands=False,
@@ -38,32 +128,39 @@ class TestEpisodeExecution(unittest.TestCase):
             use_parallel=False,
             seed=12,
         )
-        uninterrupted = EvolutionEngine(config, city).run()
+        with (
+            patch("citysim.evolution.SIGMA_STAGNATION_GENERATIONS", 1),
+            patch("citysim.evolution.SIGMA_SIGNIFICANCE_Z", 1e9),
+            patch("citysim.evolution.LARGE_MUTATION_PROBABILITY", 1.0),
+        ):
+            uninterrupted = EvolutionEngine(config, city).run()
 
-        with tempfile.TemporaryDirectory() as output:
-            checkpoint = Path(output) / "resume.npz"
-            interrupted_engine = EvolutionEngine(config, city)
-            evaluate_generation = interrupted_engine._evaluate_generation
+            with tempfile.TemporaryDirectory() as output:
+                checkpoint = Path(output) / "resume.npz"
+                interrupted_engine = EvolutionEngine(config, city)
+                evaluate_generation = interrupted_engine._evaluate_generation
 
-            def stop_after_first_generation(generation: int) -> None:
-                if generation == 1:
-                    raise RuntimeError("simulated interruption")
-                evaluate_generation(generation)
+                def stop_after_first_generation(generation: int) -> None:
+                    if generation == 1:
+                        raise RuntimeError("simulated interruption")
+                    evaluate_generation(generation)
 
-            with patch.object(
-                interrupted_engine,
-                "_evaluate_generation",
-                side_effect=stop_after_first_generation,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
-                    interrupted_engine.run(checkpoint_path=checkpoint)
+                with patch.object(
+                    interrupted_engine,
+                    "_evaluate_generation",
+                    side_effect=stop_after_first_generation,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                        interrupted_engine.run(checkpoint_path=checkpoint)
 
-            resumed = EvolutionEngine(config, city).run(
-                checkpoint_path=checkpoint,
-                resume=True,
-            )
+                resumed = EvolutionEngine(config, city).run(
+                    checkpoint_path=checkpoint,
+                    resume=True,
+                )
 
         self.assertEqual(uninterrupted.history, resumed.history)
+        self.assertEqual(uninterrupted.history[1]["sigma_adjustment"], "boost")
+        self.assertEqual(uninterrupted.history[1]["large_mutation_events"], 3)
         self.assertEqual(uninterrupted.best_fitness, resumed.best_fitness)
         self.assertEqual(uninterrupted.best_generation, resumed.best_generation)
         np.testing.assert_array_equal(uninterrupted.best_genome, resumed.best_genome)
@@ -72,6 +169,61 @@ class TestEpisodeExecution(unittest.TestCase):
             np.testing.assert_array_equal(expected.genome, actual.genome)
             self.assertEqual(expected.fitness, actual.fitness)
             np.testing.assert_array_equal(expected.behavior, actual.behavior)
+
+    def test_legacy_checkpoint_schema_is_rejected(self) -> None:
+        from citysim.checkpoint_io import read_checkpoint, write_checkpoint
+
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=1,
+            episodes_per_generation=2,
+            elites=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+        )
+        with tempfile.TemporaryDirectory() as output:
+            checkpoint = Path(output) / "legacy.npz"
+            EvolutionEngine(config, city).run(checkpoint_path=checkpoint)
+            metadata, arrays = read_checkpoint(checkpoint)
+            metadata["schema"] = 2
+            write_checkpoint(checkpoint, metadata, arrays)
+            with self.assertRaisesRegex(ValueError, "unsupported checkpoint schema"):
+                EvolutionEngine(config, city).run(
+                    checkpoint_path=checkpoint,
+                    resume=True,
+                )
+
+    def test_checkpoint_from_previous_training_protocol_is_rejected(self) -> None:
+        from citysim.checkpoint_io import read_checkpoint, write_checkpoint
+
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=1,
+            episodes_per_generation=2,
+            elites=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+        )
+        with tempfile.TemporaryDirectory() as output:
+            checkpoint = Path(output) / "previous-protocol.npz"
+            EvolutionEngine(config, city).run(checkpoint_path=checkpoint)
+            metadata, arrays = read_checkpoint(checkpoint)
+            self.assertEqual(
+                metadata["training_protocol_version"],
+                _TRAINING_PROTOCOL_VERSION,
+            )
+            metadata.pop("training_protocol_version")
+            write_checkpoint(checkpoint, metadata, arrays)
+            with self.assertRaisesRegex(ValueError, "checkpoint training protocol"):
+                EvolutionEngine(config, city).run(
+                    checkpoint_path=checkpoint,
+                    resume=True,
+                    allow_config_changes=True,
+                )
 
     def test_checkpoint_interval_still_saves_final_generation(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=1)
@@ -237,8 +389,6 @@ class TestEpisodeExecution(unittest.TestCase):
             self.assertNotIn(checkpoint.name, store.gc_preview()["objects"])
 
     def test_training_history_branches_and_forks_from_generation(self) -> None:
-        from citysim.experiment_support import train_evolution
-
         city = quick_city_config(n_agents=2, actions_per_agent=1)
         config = EvolutionConfig(
             population_size=4,
@@ -307,9 +457,40 @@ class TestEpisodeExecution(unittest.TestCase):
         self.assertGreaterEqual(forked.best_generation, 2)
         self.assertEqual(reset_history[-1]["generation"], 1)
 
-    def test_training_history_rejects_architecture_change_on_branch(self) -> None:
-        from citysim.experiment_support import train_evolution
+    def test_new_history_run_replaces_orphaned_work_checkpoint(self) -> None:
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=1,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+            seed=32,
+        )
+        with tempfile.TemporaryDirectory() as output:
+            store = TrainingHistoryStore(output)
+            orphaned_checkpoint = store.work_path("main")
+            orphaned_checkpoint.write_bytes(b"interrupted before history snapshot")
 
+            result = train_evolution(
+                config,
+                city,
+                history_store=store,
+                checkpoint_every=1,
+            )
+
+            self.assertEqual(len(result.history), 1)
+            self.assertTrue(orphaned_checkpoint.is_file())
+            self.assertNotEqual(
+                orphaned_checkpoint.read_bytes(),
+                b"interrupted before history snapshot",
+            )
+            self.assertEqual(store.history("main")[-1]["generation"], 1)
+
+    def test_training_history_rejects_architecture_change_on_branch(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=1)
         config = EvolutionConfig(
             population_size=4,

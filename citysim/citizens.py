@@ -83,6 +83,7 @@ class CitizenPool:
             )
 
     def evaluate_city(self, env) -> dict[str, float]:
+        env._ensure_travel_time_maps()
         type_grid = env.type_grid
         built = type_grid > 0
         built_count = int(built.sum())
@@ -93,7 +94,9 @@ class CitizenPool:
             transport = float(
                 env.static["road"][built].mean() * (1.0 - env.load[built].mean())
             )
-            accessibility = float(1.0 - env.static["dist_center"][built].mean())
+            accessibility = float(
+                1.0 - env.travel_time_center_norm[built].mean()
+            )
             price_index = float(np.clip(env.land_value[built].mean(), 0.0, 1.0))
         else:
             green_share = 0.0

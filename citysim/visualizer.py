@@ -9,7 +9,7 @@ except ImportError:  # pragma: no cover - pygame is optional
 
 import numpy as np
 
-from .config import MAX_FLOORS_BY_ACTION, TYPE_NAMES
+from .config import ACTION_TYPE_NAMES, MAX_FLOORS_BY_ACTION, TYPE_NAMES
 from .isometric import (
     building_height,
     cell_center,
@@ -40,10 +40,12 @@ AGENT_COLORS = [
 
 PANEL_BG = (24, 24, 24)
 GRID_BG = (28, 28, 28)
-TEXT = (210, 210, 210)
-TEXT_DIM = (150, 150, 150)
+TEXT = (235, 239, 245)
+TEXT_DIM = (195, 202, 212)
 ACCENT = (90, 190, 255)
 GREEN_ROOF = (84, 162, 75)
+ACTIVE_ROAD = (94, 105, 117)
+PENDING_ROAD = (232, 184, 70)
 
 
 def _roof_color(color: tuple[int, int, int], quality: int) -> tuple[int, int, int]:
@@ -84,10 +86,10 @@ class _BaseVisualizer:
         self.paused = False
         self.running = True
         self.clock = pygame.time.Clock()
-        self.font_small = pygame.font.SysFont("consolas", 12)
-        self.font = pygame.font.SysFont("consolas", 13)
-        self.font_header = pygame.font.SysFont("consolas", 15, bold=True)
-        self.font_tiny = pygame.font.SysFont("consolas", 11)
+        self.font_small = pygame.font.SysFont("segoeui", 16)
+        self.font = pygame.font.SysFont("segoeui", 17)
+        self.font_header = pygame.font.SysFont("segoeui", 20, bold=True)
+        self.font_tiny = pygame.font.SysFont("segoeui", 14)
 
     def tick(self) -> None:
         if self.paused:
@@ -154,9 +156,9 @@ class _BaseVisualizer:
         pygame.draw.rect(self.screen, (60, 60, 60), (x, y, w, h), 1)
         self.screen.blit(self.font_tiny.render(title, True, TEXT_DIM), (x + 6, y + 3))
         plot_x = x + 36
-        plot_y = y + 18
+        plot_y = y + 23
         plot_w = max(10, w - 44)
-        plot_h = max(6, h - 28)
+        plot_h = max(6, h - 35)
         if not series or not series[0]:
             self.screen.blit(
                 self.font_tiny.render("collecting data...", True, TEXT_DIM),
@@ -188,7 +190,9 @@ class _BaseVisualizer:
         )
         if labels:
             label = "  ".join(labels[:4])
-            self.screen.blit(self.font_tiny.render(label, True, TEXT_DIM), (plot_x, y + h - 11))
+            self.screen.blit(
+                self.font_tiny.render(label, True, TEXT_DIM), (plot_x, y + h - 15)
+            )
 
 
 class CityVisualizer(_BaseVisualizer):
@@ -290,6 +294,16 @@ class CityVisualizer(_BaseVisualizer):
                 type_id = int(self.env.type_grid[y, x])
                 pygame.draw.rect(self.screen, TYPE_COLORS[type_id], rect)
                 pygame.draw.rect(self.screen, (55, 55, 55), rect, 1)
+                if self.env.player_road_grid[y, x]:
+                    road_rect = rect.inflate(-6, -6)
+                    pygame.draw.rect(self.screen, ACTIVE_ROAD, road_rect)
+                    pygame.draw.line(
+                        self.screen, (205, 211, 218),
+                        road_rect.midleft, road_rect.midright, 1,
+                    )
+                elif self.env.pending_road_grid[y, x] > 0:
+                    road_rect = rect.inflate(-6, -6)
+                    pygame.draw.rect(self.screen, PENDING_ROAD, road_rect, 2)
 
                 if type_id > 0:
                     owner = int(self.env.owner_grid[y, x])
@@ -346,6 +360,11 @@ class CityVisualizer(_BaseVisualizer):
                 TYPE_COLORS[type_id],
                 [(int(x), int(y)) for x, y in ground],
             )
+            if self.env.player_road_grid[row, col]:
+                pygame.draw.polygon(self.screen, ACTIVE_ROAD, ground)
+                pygame.draw.polygon(self.screen, (205, 211, 218), ground, 1)
+            elif self.env.pending_road_grid[row, col] > 0:
+                pygame.draw.polygon(self.screen, PENDING_ROAD, ground, 2)
             if left:
                 pygame.draw.polygon(
                     self.screen,
@@ -381,6 +400,12 @@ class CityVisualizer(_BaseVisualizer):
             pygame.draw.polygon(
                 self.screen, (55, 55, 55), [(int(x), int(y)) for x, y in top], 1
             )
+            if type_id == 0:
+                if self.env.player_road_grid[row, col]:
+                    pygame.draw.polygon(self.screen, ACTIVE_ROAD, ground)
+                    pygame.draw.polygon(self.screen, (205, 211, 218), ground, 1)
+                elif self.env.pending_road_grid[row, col] > 0:
+                    pygame.draw.polygon(self.screen, PENDING_ROAD, ground, 2)
 
             if type_id > 0:
                 owner = int(self.env.owner_grid[row, col])
@@ -416,11 +441,14 @@ class CityVisualizer(_BaseVisualizer):
 
     def _draw_header(self) -> None:
         built = int((self.env.type_grid > 0).sum())
+        roads = int(self.env.player_road_grid.sum())
+        pending_roads = int((self.env.pending_road_grid > 0).sum())
         total = self.h * self.w
         status = "PAUSED" if self.paused else "RUNNING"
         title = self.font_header.render(
             f"CitySim  |  Round {self.round_idx + 1}/{self.env.config.actions_per_agent}"
             f"  |  Built: {built}/{total}"
+            f"  |  Roads: {roads}+{pending_roads}"
             f"  |  {self.projection}  |  {status}"
             f"  |  Space pause, ↑/↓ speed, Esc quit, click a cell",
             True,
@@ -437,11 +465,19 @@ class CityVisualizer(_BaseVisualizer):
             label = self.font_tiny.render(name, True, TEXT_DIM)
             self.screen.blit(label, (x + 15, y - 1))
             x += 18 + label.get_width()
+        for color, name, outline in (
+            (ACTIVE_ROAD, "road", False),
+            (PENDING_ROAD, "pending", True),
+        ):
+            pygame.draw.rect(self.screen, color, (x, y, 12, 12), 1 if outline else 0)
+            label = self.font_tiny.render(name, True, TEXT_DIM)
+            self.screen.blit(label, (x + 15, y - 1))
+            x += 18 + label.get_width()
 
     def _draw_agent_table(self, px: int, y: int) -> int:
         header = self.font_header.render("Agents", True, (220, 220, 220))
         self.screen.blit(header, (px, y))
-        y += 21
+        y += 25
         if self.n_agents <= 12:
             indices = list(range(self.n_agents))
         else:
@@ -459,13 +495,13 @@ class CityVisualizer(_BaseVisualizer):
             )
             label = self.font_small.render(text, True, (200, 200, 200))
             self.screen.blit(label, (px + 18, y))
-            y += 17
+            y += 21
         if self.n_agents > 12:
             self.screen.blit(
                 self.font_tiny.render("(top 11 by profit)", True, TEXT_DIM),
                 (px + 18, y),
             )
-            y += 16
+            y += 19
         return y
 
     def _draw_selected(self, px: int, y: int) -> int:
@@ -475,26 +511,45 @@ class CityVisualizer(_BaseVisualizer):
         row, col = divmod(cell, self.w)
         type_id = int(self.env.type_grid[row, col])
         owner = int(self.env.owner_grid[row, col])
+        is_road = bool(
+            self.env.player_road_grid[row, col]
+            or self.env.pending_road_grid[row, col] > 0
+        )
+        if is_road:
+            owner = int(self.env.road_owner_grid[row, col])
         quality = int(self.env.quality_grid[row, col])
-        cost = float(self.env.cost_grid[row, col])
+        cost = float(
+            self.env.road_cost_grid[row, col]
+            if is_road
+            else self.env.cost_grid[row, col]
+        )
         district = int(self.env.district_labels[row, col])
         lines = [
             f"Cell {cell} ({row},{col})  district {district}",
-            f"type {TYPE_NAMES[type_id]}  owner {owner if owner >= 0 else '-'}"
-            f"  quality {quality if quality >= 0 else '-'}",
-            f"floors {int(self.env.floors_grid[row, col])}"
+            f"type {'road' if is_road else TYPE_NAMES[type_id]}"
+            f"  owner {owner if owner >= 0 else '-'}"
+            f"  quality {quality if quality >= 0 and not is_road else '-'}",
+            f"floors {int(self.env.floors_grid[row, col]) if not is_road else '-'}"
             f"  roof {int(self.env.roof_quality_grid[row, col])}/3"
-            f"  synergy {self.env.district_synergy[row, col]:.2f}",
+            if not is_road
+            else "floors -  roof -",
+            f"synergy {self.env.district_synergy[row, col]:.2f}",
             f"cost {cost:.1f}  land {self.env.land_value[row, col]:.2f}",
+            f"road access {self.env.road_access[row, col]:.2f}"
+            f"  density {self.env.player_road_density[row, col]:.2f}",
+            f"road status {'pending' if self.env.pending_road_grid[row, col] > 0 else 'active' if self.env.player_road_grid[row, col] else '-'}"
+            f"  wait {self.env.infra_wait_rounds[row, col]:.0f}",
             f"pollution {self.env.pollution[row, col]:.2f}"
             f"  noise {self.env.noise[row, col]:.2f}",
             f"attractiveness {self.env.attractiveness[row, col]:.2f}"
             f"  util {self.env.util_grid[row, col]:.2f}",
         ]
-        pygame.draw.rect(self.screen, (40, 40, 40), (px - 2, y - 2, 395, 16 * len(lines) + 4))
+        pygame.draw.rect(
+            self.screen, (40, 40, 40), (px - 2, y - 2, 395, 19 * len(lines) + 4)
+        )
         for line in lines:
             self.screen.blit(self.font_tiny.render(line, True, ACCENT), (px + 2, y))
-            y += 16
+            y += 19
         return y + 4
 
     def _draw_panel(self) -> None:
@@ -504,10 +559,10 @@ class CityVisualizer(_BaseVisualizer):
         y += 6
         header = self.font_header.render("Recent actions", True, (220, 220, 220))
         self.screen.blit(header, (px, y))
-        y += 19
+        y += 24
         for line in self.action_log[-self.max_log:]:
             self.screen.blit(self.font_small.render(line, True, TEXT_DIM), (px, y))
-            y += 15
+            y += 19
         y += 4
         y = self._draw_selected(px, y)
 
@@ -622,16 +677,18 @@ class CityVisualizer(_BaseVisualizer):
             if action.demolish:
                 action_name = "DEMO"
             else:
-                action_name = TYPE_NAMES[action.type_id + 1][:4].upper()
+                action_name = ACTION_TYPE_NAMES[action.type_id][:4].upper()
             bid = f" bid{action.bid:.0f}" if action.bid else ""
+            road_action = action.type_id == len(ACTION_TYPE_NAMES) - 1
             dimensions = (
                 ""
-                if action.demolish
+                if action.demolish or road_action
                 else f" f{action.floors} r{action.roof_quality}"
             )
+            quality = "" if action.demolish or road_action else f" q{action.quality}"
             self.action_log.append(
                 f"R{self.round_idx + 1} A{agent_id:02d} {action_name:>4}"
-                f" q{action.quality}{dimensions} @{action.cell}{bid}"
+                f"{quality}{dimensions} @{action.cell}{bid}"
             )
         else:
             self.agent_skips[agent_id] += 1
@@ -777,6 +834,16 @@ class ComparisonVisualizer(_BaseVisualizer):
                 type_id = int(env.type_grid[y, x])
                 pygame.draw.rect(self.screen, TYPE_COLORS[type_id], rect)
                 pygame.draw.rect(self.screen, (55, 55, 55), rect, 1)
+                if env.player_road_grid[y, x]:
+                    road_rect = rect.inflate(-6, -6)
+                    pygame.draw.rect(self.screen, ACTIVE_ROAD, road_rect)
+                    pygame.draw.line(
+                        self.screen, (205, 211, 218),
+                        road_rect.midleft, road_rect.midright, 1,
+                    )
+                elif env.pending_road_grid[y, x] > 0:
+                    road_rect = rect.inflate(-6, -6)
+                    pygame.draw.rect(self.screen, PENDING_ROAD, road_rect, 2)
                 if type_id > 0:
                     owner = int(env.owner_grid[y, x])
                     if 0 <= owner < self.n_agents:
@@ -830,6 +897,16 @@ class ComparisonVisualizer(_BaseVisualizer):
                 origin_y,
                 elevation,
             )
+            shifted_ground = [(int(x0 + x), int(y)) for x, y in ground]
+            if env.player_road_grid[row, col]:
+                pygame.draw.polygon(self.screen, ACTIVE_ROAD, shifted_ground)
+                pygame.draw.polygon(
+                    self.screen, (205, 211, 218), shifted_ground, 1
+                )
+            elif env.pending_road_grid[row, col] > 0:
+                pygame.draw.polygon(
+                    self.screen, PENDING_ROAD, shifted_ground, 2
+                )
             faces = (
                 (ground, TYPE_COLORS[type_id]),
                 (left, darken(TYPE_COLORS[type_id], 0.58)),
@@ -848,6 +925,16 @@ class ComparisonVisualizer(_BaseVisualizer):
                     pygame.draw.polygon(self.screen, color, shifted)
                     if face_index > 0:
                         pygame.draw.polygon(self.screen, (55, 55, 55), shifted, 1)
+            if type_id == 0:
+                if env.player_road_grid[row, col]:
+                    pygame.draw.polygon(self.screen, ACTIVE_ROAD, shifted_ground)
+                    pygame.draw.polygon(
+                        self.screen, (205, 211, 218), shifted_ground, 1
+                    )
+                elif env.pending_road_grid[row, col] > 0:
+                    pygame.draw.polygon(
+                        self.screen, PENDING_ROAD, shifted_ground, 2
+                    )
             if type_id > 0:
                 owner = int(env.owner_grid[row, col])
                 if 0 <= owner < self.n_agents:
@@ -905,7 +992,7 @@ class ComparisonVisualizer(_BaseVisualizer):
             profit = _mean([a.profit for a in env.agents])
             lines = [
                 f"{self.labels[side][:26]}",
-                f"built {metrics.built_cells:>2}  bank {metrics.bankrupt_agents:>2}"
+                f"built {metrics.built_cells:>2}  debt {metrics.mean_debt_ratio:>4.2f}x"
                 f"  profit {profit:>+7.1f}",
                 f"quality {metrics.city_quality:.3f}"
                 f"  sat {metrics.mean_satisfaction:.3f}",
@@ -919,7 +1006,7 @@ class ComparisonVisualizer(_BaseVisualizer):
                     self.screen.blit(self.font_small.render(line, True, color), (px + 16, y))
                 else:
                     self.screen.blit(self.font_small.render(line, True, color), (px + 4, y))
-                y += 16
+                y += 20
             y += 6
 
         # selected cell info for the most recently clicked side
@@ -931,15 +1018,24 @@ class ComparisonVisualizer(_BaseVisualizer):
                 env = self.envs[selected_side]
                 type_id = int(env.type_grid[row, col])
                 owner = int(env.owner_grid[row, col])
+                is_road = bool(
+                    env.player_road_grid[row, col]
+                    or env.pending_road_grid[row, col] > 0
+                )
+                if is_road:
+                    owner = int(env.road_owner_grid[row, col])
                 lines = [
                     f"{selected_side.upper()} cell {cell} ({row},{col})",
-                    f"{TYPE_NAMES[type_id]} owner {owner if owner >= 0 else '-'}",
+                    f"{'road' if is_road else TYPE_NAMES[type_id]} owner {owner if owner >= 0 else '-'}",
+                    f"status {'pending' if env.pending_road_grid[row, col] > 0 else 'active' if env.player_road_grid[row, col] else '-'}",
                     f"land {env.land_value[row, col]:.2f}"
                     f"  pollution {env.pollution[row, col]:.2f}",
+                    f"road access {env.road_access[row, col]:.2f}"
+                    f"  density {env.player_road_density[row, col]:.2f}",
                 ]
                 for line in lines:
                     self.screen.blit(self.font_tiny.render(line, True, ACCENT), (px + 4, y))
-                    y += 15
+                    y += 18
                 y += 4
 
         chart_x = px

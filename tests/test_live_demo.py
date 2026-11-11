@@ -38,6 +38,21 @@ class TestLiveDemo(unittest.TestCase):
                 type_grid=np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int8),
                 quality_grid=np.array([[-1, 0, 1], [2, 0, 1]], dtype=np.int8),
                 owner_grid=np.array([[-1, 0, 1], [2, 3, 4]], dtype=np.int16),
+                player_road_grid=np.array(
+                    [[False, True, False], [False, False, False]], dtype=bool
+                ),
+                pending_road_grid=np.array(
+                    [[0, 0, 1], [0, 0, 0]], dtype=np.int8
+                ),
+                road_owner_grid=np.array(
+                    [[-1, 2, 3], [-1, -1, -1]], dtype=np.int16
+                ),
+                road_access=np.array(
+                    [[0.1, 0.4, 0.7], [0.2, 0.5, 0.8]], dtype=np.float64
+                ),
+                player_road_density=np.array(
+                    [[0.0, 0.3, 0.6], [0.1, 0.4, 0.7]], dtype=np.float64
+                ),
             )
             recorder.record_state(
                 environment,
@@ -58,6 +73,13 @@ class TestLiveDemo(unittest.TestCase):
             self.assertEqual(state["floors_grid"], [[0, 1, 1], [1, 1, 1]])
             self.assertEqual(state["roof_quality_grid"], [[0, 0, 0], [0, 0, 0]])
             self.assertEqual(state["owner_grid"], [[-1, 0, 1], [2, 3, 4]])
+            self.assertEqual(state["player_road_grid"], [[0, 1, 0], [0, 0, 0]])
+            self.assertEqual(state["pending_road_grid"], [[0, 0, 1], [0, 0, 0]])
+            self.assertEqual(state["road_owner_grid"], [[-1, 2, 3], [-1, -1, -1]])
+            self.assertAlmostEqual(state["road_access_grid"][0][1], 0.4, places=6)
+            self.assertAlmostEqual(
+                state["player_road_density_grid"][1][2], 0.7, places=6
+            )
             self.assertEqual(state["action"]["cell"], 2)
             self.assertEqual(state["action"]["floors"], 1)
             self.assertEqual(state["action"]["roof_quality"], 0)

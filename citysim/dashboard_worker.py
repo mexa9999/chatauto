@@ -141,6 +141,11 @@ def run_compare(
             for key in (
                 "fitness",
                 "profit",
+                "debt",
+                "debt_ratio",
+                "interest_paid",
+                "local_goods_coverage",
+                "tax_rate_multiplier",
                 "city_quality",
                 "mean_satisfaction",
                 "green_share",

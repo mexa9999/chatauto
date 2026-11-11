@@ -35,9 +35,16 @@ from .policy import (
 )
 
 
-_CHECKPOINT_SCHEMA = 2
+_CHECKPOINT_SCHEMA = 3
 # Bump when training semantics change so old cache entries are not reused.
-_TRAINING_PROTOCOL_VERSION = 2
+_TRAINING_PROTOCOL_VERSION = 10
+SIGMA_STAGNATION_GENERATIONS = 8
+SIGMA_SIGNIFICANCE_Z = 2.0
+SIGMA_BOOST_FACTOR = 1.5
+SIGMA_MAX_INITIAL_MULTIPLE = 4.0
+LARGE_MUTATION_PROBABILITY = 0.02
+LARGE_MUTATION_RATE = 0.01
+LARGE_MUTATION_SIGMA_MULTIPLIER = 4.0
 
 
 def _configuration_digest(config: EvolutionConfig, city_config: CityConfig) -> str:
@@ -148,6 +155,11 @@ class EvolutionEngine:
         self.layout = layout_from_config(config)
         self.rng = np.random.default_rng(config.seed)
         self.sigma = float(config.mutation_sigma)
+        self.sigma_reference_fitness: float | None = None
+        self.sigma_reference_se: float | None = None
+        self.sigma_stagnation_count = 0
+        self._generation_best_se: float | None = None
+        self._pending_large_mutation_events = 0
         self.generation = 0
 
         self.population = [
@@ -223,8 +235,18 @@ class EvolutionEngine:
 
             for gen in range(start_generation, self.config.generations):
                 self.generation = gen
+                sigma_used = self.sigma
                 self._evaluate_generation(gen)
-                row = self._log_generation(gen)
+                sigma_adjustment = (
+                    self._adapt_sigma()
+                    if gen < self.config.generations - 1
+                    else "none"
+                )
+                row = self._log_generation(
+                    gen,
+                    sigma_used=sigma_used,
+                    sigma_adjustment=sigma_adjustment,
+                )
                 self.history.append(row)
                 if progress_callback is not None:
                     progress_callback(gen, row, self.config.generations)
@@ -260,9 +282,6 @@ class EvolutionEngine:
                     and (gen + 1) % self.config.fresh_blood_interval == 0
                 ):
                     self._fresh_blood()
-                self.sigma = max(
-                    self.config.min_sigma, self.sigma * self.config.sigma_decay
-                )
                 if checkpoint is not None and (
                     (gen + 1) % checkpoint_every == 0 or stopping
                 ):
@@ -325,6 +344,7 @@ class EvolutionEngine:
         )
         metadata = {
             "schema": _CHECKPOINT_SCHEMA,
+            "training_protocol_version": _TRAINING_PROTOCOL_VERSION,
             "evolution_config": asdict(self.config),
             "city_config": asdict(self.city_config),
             "configuration_digest": _configuration_digest(
@@ -333,6 +353,10 @@ class EvolutionEngine:
             "next_generation": next_generation,
             "complete": complete,
             "sigma": self.sigma,
+            "sigma_reference_fitness": self.sigma_reference_fitness,
+            "sigma_reference_se": self.sigma_reference_se,
+            "sigma_stagnation_count": self.sigma_stagnation_count,
+            "pending_large_mutation_events": self._pending_large_mutation_events,
             "rng_state": self.rng.bit_generator.state,
             "best_ever": self.best_ever,
             "best_ever_generation": self.best_ever_generation,
@@ -399,6 +423,10 @@ class EvolutionEngine:
         metadata, arrays = read_checkpoint(path)
         if metadata.get("schema") != _CHECKPOINT_SCHEMA:
             raise ValueError(f"unsupported checkpoint schema in {path}")
+        if metadata.get("training_protocol_version") != _TRAINING_PROTOCOL_VERSION:
+            raise ValueError(
+                f"checkpoint training protocol does not match the requested run in {path}"
+            )
         city_changed = (
             allow_config_changes
             and metadata.get("city_config") != asdict(self.city_config)
@@ -430,6 +458,12 @@ class EvolutionEngine:
         ]
         self.generation = int(metadata["next_generation"])
         self.sigma = float(metadata["sigma"])
+        self.sigma_reference_fitness = metadata["sigma_reference_fitness"]
+        self.sigma_reference_se = metadata["sigma_reference_se"]
+        self.sigma_stagnation_count = int(metadata["sigma_stagnation_count"])
+        self._pending_large_mutation_events = int(
+            metadata["pending_large_mutation_events"]
+        )
         previous_config = metadata.get("evolution_config", {})
         if (
             allow_config_changes
@@ -475,6 +509,10 @@ class EvolutionEngine:
             self.best_ever_generation = -1
             self.best_ever_genome = np.zeros(self.layout.parameter_count)
             self.best_ever_behavior = np.zeros(BEHAVIOR_DIM)
+            self.sigma_reference_fitness = None
+            self.sigma_reference_se = None
+            self.sigma_stagnation_count = 0
+            self._pending_large_mutation_events = 0
             self.hall_of_fame = []
             self.archive = {}
             for individual in self.population:
@@ -577,6 +615,7 @@ class EvolutionEngine:
             cfg.episodes_per_generation,
         )
         fitness_sum = np.zeros(cfg.population_size, dtype=np.float64)
+        fitness_square_sum = np.zeros(cfg.population_size, dtype=np.float64)
         behavior_sum = np.zeros((cfg.population_size, BEHAVIOR_DIM), dtype=np.float64)
         appearances = np.zeros(cfg.population_size, dtype=np.int64)
         city_keys = (
@@ -587,6 +626,14 @@ class EvolutionEngine:
             "gini_satisfaction",
             "mean_utilization",
             "population",
+            "total_debt",
+            "mean_debt_ratio",
+            "housing_vacancy_rate",
+            "job_vacancy_rate",
+            "unemployment_rate",
+            "net_migration_rate",
+            "local_goods_coverage",
+            "tax_rate_multiplier",
             "green_share",
             "externality_damage_total",
             "bankrupt_agents",
@@ -607,7 +654,9 @@ class EvolutionEngine:
                 city_sum[key] += value
             for slot, idx in enumerate(devs):
                 idx = int(idx)
-                fitness_sum[idx] += float(result.scores[slot])
+                score = float(result.scores[slot])
+                fitness_sum[idx] += score
+                fitness_square_sum[idx] += score * score
                 behavior_sum[idx] += np.asarray(
                     result.behaviors[slot], dtype=np.float64
                 )
@@ -619,6 +668,18 @@ class EvolutionEngine:
             }
         else:
             self._last_city_metrics = {key: 0.0 for key in city_keys}
+
+        standard_errors = np.full(cfg.population_size, np.nan, dtype=np.float64)
+        sampled = appearances > 1
+        sample_counts = appearances[sampled].astype(np.float64)
+        centered_sums = (
+            fitness_square_sum[sampled]
+            - fitness_sum[sampled] ** 2 / sample_counts
+        )
+        sample_variances = np.maximum(
+            0.0, centered_sums / (sample_counts - 1.0)
+        )
+        standard_errors[sampled] = np.sqrt(sample_variances / sample_counts)
 
         for i, ind in enumerate(self.population):
             ind.episodes = int(appearances[i])
@@ -632,7 +693,17 @@ class EvolutionEngine:
         self._apply_fitness_sharing()
         self._update_archive()
 
-        best = max(self.population, key=lambda ind: ind.fitness)
+        best_index = max(
+            range(len(self.population)),
+            key=lambda index: self.population[index].fitness,
+        )
+        best = self.population[best_index]
+        self._generation_best_se = (
+            float(standard_errors[best_index])
+            if np.isfinite(standard_errors[best_index])
+            else None
+        )
+        self._update_sigma_stagnation(best.fitness, self._generation_best_se)
         if best.fitness > self.best_ever:
             self.best_ever = float(best.fitness)
             self.best_ever_genome = best.genome.copy()
@@ -641,6 +712,44 @@ class EvolutionEngine:
         self.hall_of_fame.append((gen, float(best.fitness), best.genome.copy()))
         self.hall_of_fame.sort(key=lambda item: item[1], reverse=True)
         self.hall_of_fame = self.hall_of_fame[:10]
+
+    def _update_sigma_stagnation(
+        self, fitness: float, fitness_se: float | None
+    ) -> None:
+        if fitness_se is None:
+            return
+        if (
+            self.sigma_reference_fitness is None
+            or self.sigma_reference_se is None
+        ):
+            self.sigma_reference_fitness = float(fitness)
+            self.sigma_reference_se = float(fitness_se)
+            self.sigma_stagnation_count = 0
+            return
+        significance_margin = SIGMA_SIGNIFICANCE_Z * float(
+            np.hypot(fitness_se, self.sigma_reference_se)
+        )
+        if fitness > self.sigma_reference_fitness + significance_margin:
+            self.sigma_reference_fitness = float(fitness)
+            self.sigma_reference_se = float(fitness_se)
+            self.sigma_stagnation_count = 0
+        else:
+            self.sigma_stagnation_count += 1
+
+    def _adapt_sigma(self) -> str:
+        if self.sigma_stagnation_count >= SIGMA_STAGNATION_GENERATIONS:
+            maximum = (
+                self.config.mutation_sigma * SIGMA_MAX_INITIAL_MULTIPLE
+            )
+            updated = min(maximum, self.sigma * SIGMA_BOOST_FACTOR)
+            adjustment = "boost" if updated > self.sigma else "boost_capped"
+            self.sigma = updated
+            self.sigma_stagnation_count = 0
+            return adjustment
+        self.sigma = max(
+            self.config.min_sigma, self.sigma * self.config.sigma_decay
+        )
+        return "decay"
 
     def _apply_fitness_sharing(self) -> None:
         cfg = self.config
@@ -697,9 +806,23 @@ class EvolutionEngine:
         best = max((pool[int(i)] for i in indices), key=lambda ind: ind.shaped_fitness)
         return best
 
+    def _mutate_offspring(self, genome: np.ndarray) -> tuple[np.ndarray, bool]:
+        if self.rng.random() < LARGE_MUTATION_PROBABILITY:
+            return (
+                mutate_genome(
+                    genome,
+                    self.rng,
+                    self.sigma * LARGE_MUTATION_SIGMA_MULTIPLIER,
+                    mutation_rate=LARGE_MUTATION_RATE,
+                ),
+                True,
+            )
+        return mutate_genome(genome, self.rng, self.sigma), False
+
     def _select(self) -> None:
         cfg = self.config
         next_population: list[Individual] = []
+        large_mutation_events = 0
         if cfg.use_islands:
             base_elites = cfg.elites // cfg.islands
             extra = cfg.elites % cfg.islands
@@ -722,8 +845,10 @@ class EvolutionEngine:
                 children = []
                 for _ in range(children_needed):
                     parent = self._tournament(members)
+                    genome, large_mutation = self._mutate_offspring(parent.genome)
+                    large_mutation_events += int(large_mutation)
                     child = Individual(
-                        genome=mutate_genome(parent.genome, self.rng, self.sigma),
+                        genome=genome,
                         island=island,
                     )
                     children.append(child)
@@ -744,14 +869,17 @@ class EvolutionEngine:
             children = []
             for _ in range(cfg.population_size - elite_count):
                 parent = self._tournament(members)
+                genome, large_mutation = self._mutate_offspring(parent.genome)
+                large_mutation_events += int(large_mutation)
                 children.append(
                     Individual(
-                        genome=mutate_genome(parent.genome, self.rng, self.sigma),
+                        genome=genome,
                         island=0,
                     )
                 )
             next_population = elites + children
         self.population = next_population
+        self._pending_large_mutation_events = large_mutation_events
 
     def _migrate(self) -> None:
         cfg = self.config
@@ -796,7 +924,12 @@ class EvolutionEngine:
     # Logging
     # ------------------------------------------------------------------
 
-    def _log_generation(self, gen: int) -> dict:
+    def _log_generation(
+        self,
+        gen: int,
+        sigma_used: float | None = None,
+        sigma_adjustment: str = "none",
+    ) -> dict:
         fitness = np.array([ind.fitness for ind in self.population], dtype=np.float64)
         shaped = np.array([ind.shaped_fitness for ind in self.population], dtype=np.float64)
         behaviors = np.array([ind.behavior for ind in self.population], dtype=np.float64)
@@ -809,7 +942,12 @@ class EvolutionEngine:
             "mean_shaped": float(shaped.mean()),
             "diversity": mean_pairwise_distance(behaviors),
             "unique_behaviors": unique_behaviors(behaviors),
-            "sigma": float(self.sigma),
+            "sigma": float(self.sigma if sigma_used is None else sigma_used),
+            "sigma_next": float(self.sigma),
+            "sigma_adjustment": sigma_adjustment,
+            "sigma_stagnation_count": self.sigma_stagnation_count,
+            "fitness_se": self._generation_best_se,
+            "large_mutation_events": self._pending_large_mutation_events,
             "best_ever": float(self.best_ever),
             "best_green_share": float(behaviors[:, 3].max()),
             "archive_coverage": float(len(self.archive)),
@@ -824,6 +962,22 @@ class EvolutionEngine:
                 "eval_gini_satisfaction": float(city.get("gini_satisfaction", 0.0)),
                 "eval_utilization": float(city.get("mean_utilization", 0.0)),
                 "eval_population": float(city.get("population", 0.0)),
+                "eval_housing_vacancy_rate": float(
+                    city.get("housing_vacancy_rate", 0.0)
+                ),
+                "eval_job_vacancy_rate": float(city.get("job_vacancy_rate", 0.0)),
+                "eval_unemployment_rate": float(city.get("unemployment_rate", 0.0)),
+                "eval_net_migration_rate": float(
+                    city.get("net_migration_rate", 0.0)
+                ),
+                "eval_local_goods_coverage": float(
+                    city.get("local_goods_coverage", 1.0)
+                ),
+                "eval_tax_rate_multiplier": float(
+                    city.get("tax_rate_multiplier", 1.0)
+                ),
+                "eval_total_debt": float(city.get("total_debt", 0.0)),
+                "eval_mean_debt_ratio": float(city.get("mean_debt_ratio", 0.0)),
                 "eval_green_share": float(city.get("green_share", 0.0)),
                 "eval_damage": float(city.get("externality_damage_total", 0.0)),
                 "eval_bankrupt_agents": float(city.get("bankrupt_agents", 0.0)),
@@ -949,6 +1103,10 @@ def evaluate_population(
                 "damage_total": float(
                     np.mean([city.externality_damage_total for city in seed_cities])
                 ),
+                "total_debt": float(np.mean([city.total_debt for city in seed_cities])),
+                "mean_debt_ratio": float(
+                    np.mean([city.mean_debt_ratio for city in seed_cities])
+                ),
             }
         )
 
@@ -1006,6 +1164,11 @@ def evaluate_league(
                 "seed": int(seed),
                 "fitness": float(scores[slot]),
                 "profit": float(focal.profit),
+                "debt": float(focal.debt),
+                "debt_ratio": float(focal.debt_ratio),
+                "interest_paid": float(focal.interest_paid),
+                "total_debt": float(result.city.total_debt),
+                "mean_debt_ratio": float(result.city.mean_debt_ratio),
                 "city_quality": float(result.city.city_quality),
                 "mean_satisfaction": float(result.city.mean_satisfaction),
                 "gini_satisfaction": float(result.city.gini_satisfaction),
@@ -1023,12 +1186,19 @@ def evaluate_league(
                 "tax_revenue": float(result.city.tax_revenue),
                 "subsidy_total": float(result.city.subsidy_total),
                 "bankrupt_agents": int(result.city.bankrupt_agents),
+                "local_goods_coverage": float(result.city.local_goods_coverage),
+                "tax_rate_multiplier": float(result.city.tax_rate_multiplier),
                 "behavior": focal.behavior.tolist(),
             }
         )
     keys = [
         "fitness",
         "profit",
+        "total_debt",
+        "mean_debt_ratio",
+        "debt",
+        "debt_ratio",
+        "interest_paid",
         "city_quality",
         "mean_satisfaction",
         "gini_satisfaction",
@@ -1046,6 +1216,8 @@ def evaluate_league(
         "tax_revenue",
         "subsidy_total",
         "bankrupt_agents",
+        "local_goods_coverage",
+        "tax_rate_multiplier",
     ]
     summary = {key: _stats([row[key] for row in per_seed]) for key in keys}
     summary["behavior"] = np.mean(behaviors, axis=0).tolist() if behaviors else [1.0, 0.0, 0.0, 0.0]
@@ -1074,6 +1246,13 @@ def evaluate_homogeneous(
                 "fitness": float(np.mean(scores)),
                 "fitness_std": float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
                 "profit": float(np.mean(profits)),
+                "debt": float(np.mean([agent.debt for agent in result.agents])),
+                "debt_ratio": float(
+                    np.mean([agent.debt_ratio for agent in result.agents])
+                ),
+                "interest_paid": float(
+                    np.mean([agent.interest_paid for agent in result.agents])
+                ),
                 "city_quality": float(result.city.city_quality),
                 "mean_satisfaction": float(result.city.mean_satisfaction),
                 "gini_satisfaction": float(result.city.gini_satisfaction),
@@ -1091,6 +1270,14 @@ def evaluate_homogeneous(
                 "gini_profit": float(result.city.gini_profit),
                 "built_cells": int(result.city.built_cells),
                 "population": float(result.city.population),
+                "local_goods_coverage": float(result.city.local_goods_coverage),
+                "tax_rate_multiplier": float(result.city.tax_rate_multiplier),
+                "total_debt": float(result.city.total_debt),
+                "mean_debt_ratio": float(result.city.mean_debt_ratio),
+                "housing_vacancy_rate": float(result.city.housing_vacancy_rate),
+                "job_vacancy_rate": float(result.city.job_vacancy_rate),
+                "unemployment_rate": float(result.city.unemployment_rate),
+                "net_migration_rate": float(result.city.net_migration_rate),
                 "mean_utilization": float(result.city.mean_utilization),
                 "tax_revenue": float(result.city.tax_revenue),
                 "subsidy_total": float(result.city.subsidy_total),
@@ -1102,6 +1289,9 @@ def evaluate_homogeneous(
     keys = [
         "fitness",
         "profit",
+        "debt",
+        "debt_ratio",
+        "interest_paid",
         "city_quality",
         "mean_satisfaction",
         "gini_satisfaction",
@@ -1119,6 +1309,14 @@ def evaluate_homogeneous(
         "gini_profit",
         "built_cells",
         "population",
+        "local_goods_coverage",
+        "tax_rate_multiplier",
+        "total_debt",
+        "mean_debt_ratio",
+        "housing_vacancy_rate",
+        "job_vacancy_rate",
+        "unemployment_rate",
+        "net_migration_rate",
         "mean_utilization",
         "tax_revenue",
         "subsidy_total",

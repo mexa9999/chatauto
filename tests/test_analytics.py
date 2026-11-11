@@ -14,6 +14,7 @@ from citysim.dashboard import create_app
 from citysim.episode import run_episode, score_breakdown, score_episode
 from citysim.experiment_store import ExperimentStore
 from citysim.policy import RandomPolicy
+from citysim.progress import TrainingProgress
 from citysim.training_history import TrainingHistoryStore
 
 
@@ -62,6 +63,11 @@ class TestAnalytics(unittest.TestCase):
                 detail["action_metrics"]["building_count"],
                 sum(detail["action_metrics"]["roof_quality_counts"].values()),
             )
+            accepted = detail["action_metrics"]["accepted_by_round_agent"]
+            total = detail["action_metrics"]["by_round_agent"]
+            self.assertTrue(
+                all(accepted.get(key, 0) <= count for key, count in total.items())
+            )
 
     def test_training_series_are_persisted_with_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -79,6 +85,75 @@ class TestAnalytics(unittest.TestCase):
             self.assertEqual(result["generation_count"], 2)
             self.assertEqual(loaded["metrics"]["best"]["max"], 0.5)
             self.assertEqual(loaded["metrics"]["best"]["trend_per_round"], 0.4)
+
+    def test_training_progress_publishes_generation_series_incrementally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = TrainingProgress(
+                root / "progress.json",
+                root / "stop.request",
+                analytics_directory=root / "artifacts",
+            )
+            progress.generation_completed(
+                0,
+                {"best": 0.3, "best_ever": 0.3, "mean": 0.1},
+                3,
+            )
+
+            analytics = load_analytics(root / "artifacts")["training"]
+
+            self.assertEqual(analytics["generation_count"], 1)
+            self.assertEqual(analytics["series"][0]["gen"], 0)
+            self.assertEqual(analytics["series"][0]["best_ever"], 0.3)
+
+    def test_new_training_progress_replaces_stale_generation_series(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_training_analytics(
+                root,
+                [{"gen": 0, "best": 0.2}, {"gen": 1, "best": 0.4}],
+                {"run_id": "old"},
+            )
+            progress = TrainingProgress(
+                root / "progress.json",
+                root / "stop.request",
+                analytics_directory=root,
+            )
+            write_training_analytics(root, [], {"run_id": "new"})
+            progress.generation_completed(0, {"best": 0.7}, 1)
+
+            series = load_analytics(root)["training"]["series"]
+
+            self.assertEqual([row["gen"] for row in series], [0])
+            self.assertEqual(series[0]["best"], 0.7)
+
+    def test_training_analytics_uses_final_evaluation_action_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evaluation = root / "final_evaluation"
+            evaluation.mkdir()
+            (evaluation / "actions.ndjson").write_text(
+                json.dumps(
+                    {
+                        "round": 0,
+                        "agent_id": 0,
+                        "outcome": "accepted",
+                        "action": {"kind": "build", "type_id": 0},
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+            (evaluation / "rounds.ndjson").write_text(
+                json.dumps({"round": 0, "city": {"city_quality": 0.5}}) + "\n",
+                encoding="utf-8",
+            )
+            write_training_analytics(root, [{"gen": 0, "best": 0.2}], {})
+
+            detail = load_analytics(root)
+
+            self.assertEqual(detail["action_metrics"]["accepted"], 1)
+            self.assertEqual(detail["rounds"][0]["city"]["city_quality"], 0.5)
+            self.assertEqual(detail["training"]["series"][0]["gen"], 0)
 
     def test_api_serves_local_and_imported_analytics_and_csv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -175,6 +250,23 @@ class TestAnalytics(unittest.TestCase):
             )
             self.assertEqual(histogram_count, detail["action_metrics"]["sample_count"])
             self.assertTrue(np.isfinite(detail["summary"]["metrics"]["city_quality"]["mean"]))
+
+    def test_accepted_action_heatmap_counts_are_per_agent_and_round(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [
+                {"round": 1, "agent_id": 0, "outcome": "accepted", "action": {"kind": "build", "type_id": 0}},
+                {"round": 1, "agent_id": 0, "outcome": "rejected", "action": {"kind": "build", "type_id": 1}},
+            ]
+            (root / "actions.ndjson").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            metrics = load_analytics(root)["action_metrics"]
+
+            self.assertEqual(metrics["by_round_agent"], {"1:0": 2})
+            self.assertEqual(metrics["accepted_by_round_agent"], {"1:0": 1})
 
 
 if __name__ == "__main__":

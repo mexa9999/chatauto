@@ -10,15 +10,39 @@ from pathlib import Path
 import time
 from typing import Callable
 
+def _json_default(value: object) -> object:
+    converter = getattr(value, "item", None)
+    if callable(converter):
+        return converter()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
 
 class TrainingStopped(Exception):
     """Raised after a batch experiment reaches a requested checkpoint boundary."""
 
 
 class TrainingProgress:
-    def __init__(self, path: str | Path, stop_path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        stop_path: str | Path,
+        *,
+        analytics_directory: str | Path | None = None,
+    ):
         self.path = Path(path)
         self.stop_path = Path(stop_path)
+        self.analytics_directory = (
+            Path(analytics_directory) if analytics_directory is not None else None
+        )
+        if self.analytics_directory is not None:
+            self.analytics_directory.mkdir(parents=True, exist_ok=True)
+        self.training_progress_path = (
+            self.analytics_directory / "training_progress.ndjson"
+            if self.analytics_directory is not None
+            else None
+        )
+        if self.training_progress_path is not None:
+            self.training_progress_path.write_text("", encoding="utf-8")
         self.started = time.monotonic()
         self.last_generation: int | None = None
         self.last_update = self.started
@@ -38,6 +62,20 @@ class TrainingProgress:
             self.durations.append(max(0.0, now - self.last_update))
         self.last_generation = generation
         self.last_update = now
+        if self.training_progress_path is not None:
+            with self.training_progress_path.open(
+                "a", encoding="utf-8", newline="\n"
+            ) as stream:
+                stream.write(
+                    json.dumps(
+                        {"gen": generation, **row},
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        default=_json_default,
+                    )
+                )
+                stream.write("\n")
+                stream.flush()
         remaining = max(0, total_generations - generation - 1)
         average = (
             sum(self.durations) / len(self.durations)

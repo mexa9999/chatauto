@@ -68,6 +68,7 @@ class TrainingHistoryStore:
                     evolution_json TEXT NOT NULL,
                     city_json TEXT NOT NULL,
                     branch_name TEXT NOT NULL,
+                    run_id TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS branches (
@@ -131,6 +132,14 @@ class TrainingHistoryStore:
                 connection.execute("ALTER TABLE branches ADD COLUMN archived_at TEXT")
             if "deleted_at" not in branch_columns:
                 connection.execute("ALTER TABLE branches ADD COLUMN deleted_at TEXT")
+            commit_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(commits)")
+            }
+            if "run_id" not in commit_columns:
+                connection.execute("ALTER TABLE commits ADD COLUMN run_id TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS commits_run_idx ON commits(run_id)"
+            )
             now = datetime.now(timezone.utc).isoformat()
             connection.execute(
                 "INSERT OR IGNORE INTO branches (name, head_commit, created_at) "
@@ -162,6 +171,26 @@ class TrainingHistoryStore:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def is_commit_reachable(self, commit_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                WITH RECURSIVE reachable(commit_id, parent_id) AS (
+                    SELECT c.commit_id, c.parent_id
+                    FROM commits AS c
+                    JOIN branches AS b ON b.head_commit = c.commit_id
+                    WHERE b.deleted_at IS NULL
+                    UNION
+                    SELECT parent.commit_id, parent.parent_id
+                    FROM commits AS parent
+                    JOIN reachable AS child ON child.parent_id = parent.commit_id
+                )
+                SELECT 1 FROM reachable WHERE commit_id = ? LIMIT 1
+                """,
+                (commit_id,),
+            ).fetchone()
+        return row is not None
 
     def active_branch(self) -> str:
         with self._connect() as connection:
@@ -414,14 +443,49 @@ class TrainingHistoryStore:
             raise RuntimeError(f"missing history commit: {commit_id}")
         evolution = EvolutionConfig(**json.loads(row["evolution_json"]))
         city_values = json.loads(row["city_json"])
+        city_values.setdefault("actions_per_round", 1)
         city_values["requirements"] = Requirements(**city_values["requirements"])
-        city_values["regulation"] = Regulation(**city_values["regulation"])
+        regulation_values = city_values["regulation"]
+        if "type_tax_rates" not in regulation_values:
+            property_rate = regulation_values.pop("property_tax_rate", 0.02)
+            industry_rate = regulation_values.pop("industry_tax_rate", 0.03)
+            regulation_values["type_tax_rates"] = (
+                property_rate,
+                property_rate,
+                property_rate,
+                industry_rate,
+                property_rate,
+            )
+        else:
+            regulation_values.pop("property_tax_rate", None)
+            regulation_values.pop("industry_tax_rate", None)
+        for key in (
+            "type_tax_rates",
+            "quality_tax_multipliers",
+            "tax_phase_multipliers",
+        ):
+            if key in regulation_values:
+                regulation_values[key] = tuple(regulation_values[key])
+        if regulation_values.get("name") == "no_tax":
+            regulation_values.setdefault("affordable_housing_subsidy_per_floor", 0.0)
+            regulation_values.setdefault("employment_subsidy_per_job", 0.0)
+        city_values["regulation"] = Regulation(**regulation_values)
         city_values["fitness"] = FitnessWeights(**city_values["fitness"])
         return CityConfig(**city_values), evolution
 
-    def create_branch(self, name: str, from_ref: str | None = None) -> str | None:
+    def create_branch(
+        self,
+        name: str,
+        from_ref: str | None = None,
+        *,
+        empty: bool = False,
+    ) -> str | None:
         self._validate_branch_name(name)
-        if from_ref is None:
+        if empty and from_ref is not None:
+            raise ValueError("an empty branch cannot have a source reference")
+        if empty:
+            head = None
+        elif from_ref is None:
             with self._connect() as connection:
                 row = connection.execute(
                     "SELECT head_commit FROM branches WHERE name = ?",
@@ -532,7 +596,13 @@ class TrainingHistoryStore:
         branch: str | None = None,
         query: str = "",
         include_deleted: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
         self._index_missing_genomes()
         with self._connect() as connection:
             branch_names = (
@@ -597,7 +667,69 @@ class TrainingHistoryStore:
             ).casefold():
                 continue
             results.append(item)
-        return results
+        return results[offset : offset + limit] if limit is not None else results[offset:]
+
+    def checkpoint_genome_groups(self, commit_id: str) -> list[dict]:
+        self._index_missing_genomes(commit_id)
+        with self._connect() as connection:
+            commit = connection.execute(
+                "SELECT 1 FROM commits WHERE commit_id = ?", (commit_id,)
+            ).fetchone()
+            if commit is None:
+                raise ValueError(f"unknown history commit: {commit_id}")
+            rows = connection.execute(
+                """
+                SELECT member_kind, COUNT(*) AS genome_count
+                FROM genomes
+                WHERE commit_id = ? AND deleted_at IS NULL
+                GROUP BY member_kind
+                ORDER BY CASE member_kind
+                    WHEN 'best' THEN 0
+                    WHEN 'population' THEN 1
+                    WHEN 'hall_of_fame' THEN 2
+                    WHEN 'map_elites' THEN 3
+                    ELSE 4
+                END
+                """,
+                (commit_id,),
+            ).fetchall()
+        return [
+            {"member_kind": row["member_kind"], "count": int(row["genome_count"])}
+            for row in rows
+        ]
+
+    def list_checkpoint_genomes(
+        self,
+        commit_id: str,
+        member_kind: str,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> list[dict]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        self._index_missing_genomes(commit_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT g.*, c.generation, c.branch_name
+                FROM genomes AS g
+                JOIN commits AS c ON c.commit_id = g.commit_id
+                WHERE g.commit_id = ? AND g.member_kind = ?
+                    AND g.deleted_at IS NULL
+                ORDER BY g.member_index, g.genome_id
+                LIMIT ? OFFSET ?
+                """,
+                (commit_id, member_kind, limit, offset),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            items.append(item)
+        return items
 
     def genome(self, genome_id: str) -> tuple[dict, np.ndarray]:
         self._index_missing_genomes()
@@ -812,14 +944,19 @@ class TrainingHistoryStore:
             "cosine_similarity": cosine,
         }
 
-    def _index_missing_genomes(self) -> None:
+    def _index_missing_genomes(self, commit_id: str | None = None) -> None:
         with self._connect() as connection:
-            commits = connection.execute(
-                """
+            query = """
                 SELECT c.commit_id, c.checkpoint_hash, c.generation, c.branch_name
                 FROM commits c LEFT JOIN indexed_genome_commits i ON i.commit_id = c.commit_id
-                WHERE i.commit_id IS NULL ORDER BY c.created_at
-                """
+                WHERE i.commit_id IS NULL
+            """
+            parameters: tuple[str, ...] = ()
+            if commit_id is not None:
+                query += " AND c.commit_id = ?"
+                parameters = (commit_id,)
+            commits = connection.execute(
+                query + " ORDER BY c.created_at", parameters
             ).fetchall()
         for commit in commits:
             checkpoint_path = self.objects / f"{commit['checkpoint_hash']}.npz"
@@ -1217,6 +1354,7 @@ class TrainingHistoryStore:
         evolution_config: EvolutionConfig,
         city_config: CityConfig,
         expected_parent: str | None,
+        run_id: str | None = None,
     ) -> str:
         source = Path(checkpoint_path)
         if not source.is_file():
@@ -1261,8 +1399,9 @@ class TrainingHistoryStore:
                 """
                 INSERT INTO commits (
                     commit_id, parent_id, checkpoint_hash, generation, complete,
-                    best_fitness, evolution_json, city_json, branch_name, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    best_fitness, evolution_json, city_json, branch_name, run_id,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     commit_id,
@@ -1278,6 +1417,7 @@ class TrainingHistoryStore:
                     json.dumps(asdict(evolution_config), sort_keys=True),
                     json.dumps(asdict(city_config), sort_keys=True),
                     branch,
+                    run_id,
                     now,
                 ),
             )

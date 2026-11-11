@@ -14,17 +14,19 @@ import numpy as np
 from .citizens import CitizenPool
 from .config import (
     ACTION_TYPE_NAMES,
-    BANKRUPTCY_STREAK,
-    BANKRUPTCY_THRESHOLD,
     BUILD_COST,
     CITIZEN_GOODS_DEMAND,
     COMMERCIAL_CUSTOMERS,
     COMMERCIAL_GOODS_DEMAND,
     COMMERCIAL_JOBS,
+    CONGESTION_ALPHA,
+    DEBT_INTEREST_RATE,
     DISTRICT_SIZE,
+    GOODS_IMPORT_MARKUP,
     GREEN_TARGET,
     HOUSING_CAPACITY,
     INDUSTRY_GOODS_SUPPLY,
+    INDUSTRY_INCOME_MULTIPLIER,
     INDUSTRY_JOBS,
     INCOME_BASE,
     LAND_VALUE_MAX,
@@ -35,19 +37,31 @@ from .config import (
     MAX_PRICE,
     MIXED_CAPACITY,
     MIXED_JOBS,
+    MIGRATION_RATE,
     N_CELL_FEATURES,
     N_CITIZENS,
     N_GLOBAL_FEATURES,
     NOISE_RADIUS,
     OPTIMAL_DISTANCE,
     POLLUTION_RADIUS,
-    POPULATION_INERTIA,
     QUALITY_COST_MULT,
     QUALITY_INCOME_MULT,
     N_ROOF_QUALITIES,
+    ROAD_ACTION_ID,
+    ROAD_ACTIVATION_DELAY,
+    BUILDING_TRAVEL_COST,
+    ROAD_CONNECTED_WEIGHT,
+    ROAD_COST_BASE,
+    ROAD_COST_LAND_MULTIPLIER,
+    ROAD_DEMOLISH_REFUND,
+    ROAD_MAINTENANCE_RATE,
+    ROAD_RELIEF_MAX,
+    ROAD_SUPPLY_FULL,
+    ROAD_TRAVEL_COST,
     SATURATION_ALPHA,
     SATURATION_RADIUS,
     TYPE_NAMES,
+    WALK_TRAVEL_COST,
     CityConfig,
 )
 from .grid import (
@@ -55,8 +69,10 @@ from .grid import (
     box_sum,
     distance_to_mask,
     district_ids,
+    grid_shortest_paths,
     incompatible_edges,
     make_static_layers,
+    road_network_fields,
     type_entropy,
 )
 
@@ -65,7 +81,7 @@ from .grid import (
 class Action:
     """A build or demolition action.
 
-    ``type_id`` is a policy index 0..4 (not a world id).  ``bid`` is the
+    ``type_id`` is a policy action index.  ``bid`` is the
     auction payment for the plot, and ``demolish`` selects demolition mode.
     """
 
@@ -109,9 +125,11 @@ class AgentState:
     agent_id: int
     initial_budget: float
     budget: float = field(init=False)
+    debt: float = 0.0
     revenue: float = 0.0
     spend: float = 0.0
     maintenance: float = 0.0
+    interest_paid: float = 0.0
     tax_paid: float = 0.0
     subsidy_received: float = 0.0
     bid_paid: float = 0.0
@@ -120,7 +138,6 @@ class AgentState:
     damage_suffered: float = 0.0
     build_count: int = 0
     skip_count: int = 0
-    bankrupt_streak: int = 0
     bankrupt: bool = False
 
     def __post_init__(self) -> None:
@@ -128,7 +145,11 @@ class AgentState:
 
     @property
     def profit(self) -> float:
-        return float(self.budget - self.initial_budget)
+        return float(self.budget - self.debt - self.initial_budget)
+
+    @property
+    def debt_ratio(self) -> float:
+        return float(self.debt / max(1.0, self.initial_budget))
 
 
 @dataclass
@@ -136,9 +157,9 @@ class Observation:
     agent_id: int
     cell_features: np.ndarray      # (n_cells, F)
     global_features: np.ndarray    # (G,)
-    action_mask: np.ndarray        # (n_cells, 5, 3) bool
+    action_mask: np.ndarray        # (n_cells, 6, 3) bool
     valid_cells: np.ndarray        # (n_cells,) bool
-    cost_table: np.ndarray         # (n_cells, 5, 3)
+    cost_table: np.ndarray         # (n_cells, 6, 3)
     remaining_rounds: int
     budget: float
     demolish_mask: np.ndarray | None = None  # (n_cells,) bool
@@ -149,6 +170,9 @@ class Observation:
 class AgentMetrics:
     agent_id: int
     profit: float
+    debt: float
+    debt_ratio: float
+    interest_paid: float
     revenue: float
     spend: float
     maintenance: float
@@ -192,9 +216,20 @@ class CityMetrics:
     type_counts: dict[int, int]
     population: float = 0.0
     jobs: float = 0.0
+    housing_capacity: float = 0.0
+    housing_vacancies: float = 0.0
+    housing_vacancy_rate: float = 0.0
+    employed: float = 0.0
+    unemployed: float = 0.0
+    unemployment_rate: float = 0.0
+    job_vacancies: float = 0.0
+    job_vacancy_rate: float = 0.0
+    net_migration: float = 0.0
+    net_migration_rate: float = 0.0
     goods_supply: float = 0.0
     goods_demand: float = 0.0
     goods_balance: float = 0.0
+    local_goods_coverage: float = 1.0
     mean_utilization: float = 0.0
     land_value_mean: float = 0.0
     pollution_mean: float = 0.0
@@ -204,7 +239,11 @@ class CityMetrics:
     rich_satisfaction: float = 0.0
     poor_satisfaction: float = 0.0
     tax_revenue: float = 0.0
+    economic_phase: str = "normal"
+    tax_rate_multiplier: float = 1.0
     subsidy_total: float = 0.0
+    total_debt: float = 0.0
+    mean_debt_ratio: float = 0.0
     bankrupt_agents: int = 0
     affordable_share: float = 0.0
 
@@ -235,6 +274,10 @@ class CityEnvironment:
         self.roof_quality_grid = np.zeros((self.h, self.w), dtype=np.int8)
         self.owner_grid = np.full((self.h, self.w), -1, dtype=np.int16)
         self.cost_grid = np.zeros((self.h, self.w), dtype=np.float64)
+        self.player_road_grid = np.zeros((self.h, self.w), dtype=bool)
+        self.pending_road_grid = np.zeros((self.h, self.w), dtype=np.int8)
+        self.road_owner_grid = np.full((self.h, self.w), -1, dtype=np.int16)
+        self.road_cost_grid = np.zeros((self.h, self.w), dtype=np.float64)
 
         self.agents = [
             AgentState(agent_id=i, initial_budget=config.initial_budget)
@@ -249,9 +292,20 @@ class CityEnvironment:
         self.population_extra = 0.0
         self.population = 0.0
         self.jobs = 0.0
+        self.housing_capacity = 0.0
+        self.housing_vacancies = 0.0
+        self.housing_vacancy_rate = 0.0
+        self.employed = 0.0
+        self.unemployed = 0.0
+        self.unemployment_rate = 0.0
+        self.job_vacancies = 0.0
+        self.job_vacancy_rate = 0.0
+        self.net_migration = 0.0
+        self.net_migration_rate = 0.0
         self.goods_supply = 0.0
         self.goods_demand = 0.0
         self.goods_balance = 0.0
+        self.local_goods_coverage = 1.0
         self.utilization: dict[int, float] = {t: 0.0 for t in range(1, 6)}
         self.util_grid = np.zeros((self.h, self.w), dtype=np.float64)
         self.mean_utilization = 0.0
@@ -282,7 +336,13 @@ class CityEnvironment:
         self._cached_compat = None
         self._income_cache = None
         self._current_income = None
+        self.travel_time_center = np.full((self.h, self.w), np.inf)
+        self.travel_time_jobs = np.full((self.h, self.w), np.inf)
+        self.travel_time_center_norm = np.ones((self.h, self.w), dtype=np.float64)
+        self.travel_time_jobs_norm = np.ones((self.h, self.w), dtype=np.float64)
+        self._travel_time_dirty = True
         self._refresh_layers(advance_population=False)
+        self._refresh_travel_time_maps()
 
     # ------------------------------------------------------------------
     # Observation and cost tables
@@ -293,11 +353,26 @@ class CityEnvironment:
         land_mult = (0.4 + 1.6 * self.land_value).ravel()
         soil_mult = (0.9 + 0.2 * self.static["soil"]).ravel()
         cell_mult = (land_mult * soil_mult)[:, None, None]
-        return (
+        building_costs = (
             BUILD_COST[1:][None, :, None]
             * QUALITY_COST_MULT[None, None, :]
             * cell_mult
         )
+        road_costs = self.road_cost_grid_for_cells()
+        return np.concatenate(
+            (building_costs, np.repeat(road_costs[:, None, None], 3, axis=2)),
+            axis=1,
+        )
+
+    def road_cost_grid_for_cells(self) -> np.ndarray:
+        return (
+            ROAD_COST_BASE
+            + ROAD_COST_LAND_MULTIPLIER * self.land_value.ravel()
+        )
+
+    def road_cost_of(self, cell: int) -> float:
+        c = int(np.clip(cell, 0, self.n_cells - 1))
+        return float(self.road_cost_grid_for_cells()[c])
 
     def cost_of(
         self,
@@ -332,8 +407,10 @@ class CityEnvironment:
         )
 
     def observe(self, agent_id: int) -> Observation:
+        self._ensure_travel_time_maps()
         built = self.type_grid > 0
-        free = ~built
+        occupied = built | self.player_road_grid | (self.pending_road_grid > 0)
+        free = ~occupied
         agent = self.agents[agent_id]
 
         own = (self.owner_grid == agent_id).astype(np.float64)
@@ -365,6 +442,11 @@ class CityEnvironment:
         f[..., 21] = self.district_type / 5.0
         f[..., 22] = self.district_util
         f[..., 23] = self.district_synergy
+        f[..., 24] = self.road_access
+        f[..., 25] = self.player_road_density
+        f[..., 26] = self.infra_wait_rounds
+        f[..., 27] = self.travel_time_center_norm
+        f[..., 28] = self.travel_time_jobs_norm
 
         if not self.config.enable_externalities:
             # Ablation: the policy does not see any neighbour-dependent signal.
@@ -382,38 +464,22 @@ class CityEnvironment:
         costs = self.cost_table()
         affordable = costs <= agent.budget + 1e-9
         free_buildable = (free & self.buildable).ravel()
-
-        buffer = self.config.requirements.industry_buffer
-        if buffer > 0:
-            industry_mask = (self.type_grid == 4).astype(np.float64)
-            sensitive_mask = (
-                (self.type_grid == 1)
-                | (self.type_grid == 2)
-                | (self.type_grid == 3)
-            ).astype(np.float64)
-            near_industry = (box_sum(industry_mask, buffer) > 0.0).ravel()
-            near_sensitive = (box_sum(sensitive_mask, buffer) > 0.0).ravel()
-            planning = np.ones((self.n_cells, 5), dtype=bool)
-            planning[:, 0:3] &= ~near_industry[:, None]
-            planning[:, 3] &= ~near_sensitive
-        else:
-            planning = np.ones((self.n_cells, 5), dtype=bool)
-
-        action_mask = (
-            free_buildable[:, None, None]
-            & affordable
-            & planning[:, :, None]
-        )
+        action_mask = free_buildable[:, None, None] & affordable
+        action_mask[:, ROAD_ACTION_ID, 1:] = False
         if agent.bankrupt:
             action_mask[:] = False
         valid = action_mask.any(axis=(1, 2))
-        demolish_mask = (self.owner_grid == agent_id) & (self.type_grid > 0)
+        building_demolish_mask = (
+            (self.owner_grid == agent_id) & (self.type_grid > 0)
+        )
+        road_demolish_mask = self.road_owner_grid == agent_id
+        demolish_mask = building_demolish_mask | road_demolish_mask
         if agent.bankrupt:
             demolish_mask[:] = False
         costs_flat = self.cost_grid.ravel()
         income_flat = self._income_grid().ravel()
         type_flat = self.type_grid.ravel()
-        owned_cells = np.flatnonzero(demolish_mask.ravel())
+        owned_cells = np.flatnonzero(building_demolish_mask.ravel())
         if owned_cells.size:
             owned_types = type_flat[owned_cells]
             unutilized = np.array(
@@ -427,19 +493,28 @@ class CityEnvironment:
                     owned_types[unutilized] - 1,
                     self.quality_grid.ravel()[unutilized_cells],
                 ]
-        regulation = self.config.regulation
+        tax_grid, subsidy_grid = self._fiscal_grids(
+            income_flat.reshape(self.h, self.w)
+        )
         net_income = (
             income_flat
             - MAINTENANCE_RATE * costs_flat
-            - regulation.property_tax_rate * costs_flat
-            - regulation.industry_tax_rate * income_flat * (type_flat == 4)
-            + regulation.green_subsidy * (type_flat == 5)
+            - tax_grid.ravel()
+            + subsidy_grid.ravel()
         )
         demolish_value = np.where(
             net_income < 0.0,
             0.5 * costs_flat
             - net_income * max(0, self.config.actions_per_agent - self.round),
             0.0,
+        )
+        road_costs = self.road_cost_grid.ravel()
+        road_cells = np.flatnonzero(road_demolish_mask.ravel())
+        demolish_value[road_cells] = (
+            ROAD_DEMOLISH_REFUND * road_costs[road_cells]
+            + ROAD_MAINTENANCE_RATE
+            * road_costs[road_cells]
+            * max(0, self.config.actions_per_agent - self.round)
         )
         demolish_value[~demolish_mask.ravel()] = 0.0
 
@@ -458,6 +533,12 @@ class CityEnvironment:
                 np.clip(self.jobs / max(1.0, self.population), 0.0, 2.0) / 2.0,
                 np.clip(self.goods_balance, -1.0, 1.0),
                 float(np.mean(util_values)) if util_values else 0.0,
+                self.housing_vacancy_rate,
+                self.job_vacancy_rate,
+                self.unemployment_rate,
+                self.net_migration_rate,
+                np.clip(agent.debt_ratio, 0.0, 3.0),
+                self.local_goods_coverage,
             ],
             dtype=np.float64,
         )
@@ -500,16 +581,30 @@ class CityEnvironment:
         row, col = divmod(cell, self.w)
 
         if action.demolish:
-            if self.owner_grid[row, col] != agent_id or self.type_grid[row, col] == 0:
+            is_owned_road = self.road_owner_grid[row, col] == agent_id
+            is_owned_building = (
+                self.owner_grid[row, col] == agent_id
+                and self.type_grid[row, col] > 0
+            )
+            if not (is_owned_road or is_owned_building):
                 self._record_pass(agent_id)
                 return False
-            refund = 0.5 * float(self.cost_grid[row, col])
-            self.type_grid[row, col] = 0
-            self.quality_grid[row, col] = -1
-            self.floors_grid[row, col] = 0
-            self.roof_quality_grid[row, col] = 0
-            self.owner_grid[row, col] = -1
-            self.cost_grid[row, col] = 0.0
+            if is_owned_road:
+                refund = ROAD_DEMOLISH_REFUND * float(
+                    self.road_cost_grid[row, col]
+                )
+                self.player_road_grid[row, col] = False
+                self.pending_road_grid[row, col] = False
+                self.road_owner_grid[row, col] = -1
+                self.road_cost_grid[row, col] = 0.0
+            else:
+                refund = 0.5 * float(self.cost_grid[row, col])
+                self.type_grid[row, col] = 0
+                self.quality_grid[row, col] = -1
+                self.floors_grid[row, col] = 0
+                self.roof_quality_grid[row, col] = 0
+                self.owner_grid[row, col] = -1
+                self.cost_grid[row, col] = 0.0
             agent.budget += refund
             agent.refund_received += refund
             self._refresh_layers(advance_population=False)
@@ -529,31 +624,47 @@ class CityEnvironment:
             )
             return True
 
-        if self.type_grid[row, col] != 0 or not self.buildable[row, col]:
-            self._record_pass(agent_id)
-            return False
         if (
-            not 0 <= action.type_id < 5
-            or not 0 <= action.quality < 3
-            or not 1 <= action.floors <= MAX_FLOORS_BY_ACTION[action.type_id]
-            or not 0 <= action.roof_quality < N_ROOF_QUALITIES
-            or (
-                not self.config.enable_extended_actions
-                and (action.floors != 1 or action.roof_quality != 0)
-            )
+            self.type_grid[row, col] != 0
+            or self.player_road_grid[row, col]
+            or self.pending_road_grid[row, col] > 0
+            or not self.buildable[row, col]
         ):
             self._record_pass(agent_id)
             return False
-        if self._violates_industry_buffer(row, col, action.type_id):
+        is_road_action = action.type_id == ROAD_ACTION_ID
+        is_building_action = 0 <= action.type_id < len(MAX_FLOORS_BY_ACTION)
+        if is_road_action:
+            valid_action = (
+                action.quality == 0
+                and action.floors == 1
+                and action.roof_quality == 0
+            )
+        elif is_building_action:
+            valid_action = (
+                0 <= action.quality < 3
+                and 1 <= action.floors <= MAX_FLOORS_BY_ACTION[action.type_id]
+                and 0 <= action.roof_quality < N_ROOF_QUALITIES
+                and (
+                    self.config.enable_extended_actions
+                    or (action.floors == 1 and action.roof_quality == 0)
+                )
+            )
+        else:
+            valid_action = False
+        if not valid_action:
             self._record_pass(agent_id)
             return False
-
-        cost = self.cost_of(
-            cell,
-            action.type_id,
-            action.quality,
-            action.floors,
-            action.roof_quality,
+        cost = (
+            self.road_cost_of(cell)
+            if is_road_action
+            else self.cost_of(
+                cell,
+                action.type_id,
+                action.quality,
+                action.floors,
+                action.roof_quality,
+            )
         )
         bid = max(0.0, float(action.bid))
         if cost + bid > agent.budget + 1e-9:
@@ -563,12 +674,17 @@ class CityEnvironment:
         pre_income = self._income_grid()
         pre_built = self.type_grid > 0
 
-        self.type_grid[row, col] = action.type_id + 1
-        self.quality_grid[row, col] = action.quality
-        self.floors_grid[row, col] = action.floors
-        self.roof_quality_grid[row, col] = action.roof_quality
-        self.owner_grid[row, col] = agent_id
-        self.cost_grid[row, col] = cost
+        if is_road_action:
+            self.pending_road_grid[row, col] = ROAD_ACTIVATION_DELAY
+            self.road_owner_grid[row, col] = agent_id
+            self.road_cost_grid[row, col] = cost
+        else:
+            self.type_grid[row, col] = action.type_id + 1
+            self.quality_grid[row, col] = action.quality
+            self.floors_grid[row, col] = action.floors
+            self.roof_quality_grid[row, col] = action.roof_quality
+            self.owner_grid[row, col] = agent_id
+            self.cost_grid[row, col] = cost
         agent.budget -= cost + bid
         agent.spend += cost
         agent.bid_paid += bid
@@ -607,24 +723,6 @@ class CityEnvironment:
         )
         return True
 
-    def _violates_industry_buffer(self, row: int, col: int, action_type: int) -> bool:
-        """Hard planning rule: incompatible uses must keep a buffer distance."""
-        buffer = self.config.requirements.industry_buffer
-        if buffer <= 0:
-            return False
-        world_type = action_type + 1
-        if world_type == 4:
-            sensitive = (self.type_grid == 1) | (self.type_grid == 2) | (self.type_grid == 3)
-        elif world_type in (1, 2, 3):
-            sensitive = self.type_grid == 4
-        else:
-            return False
-        y0 = max(0, row - buffer)
-        y1 = min(self.h, row + buffer + 1)
-        x0 = max(0, col - buffer)
-        x1 = min(self.w, col + buffer + 1)
-        return bool(sensitive[y0:y1, x0:x1].any())
-
     def _record_pass(self, agent_id: int) -> None:
         self.agents[agent_id].skip_count += 1
         self.actions.append(
@@ -649,27 +747,41 @@ class CityEnvironment:
         self._advance_district_synergy()
         incomes = self._income_grid()
         maintenance = MAINTENANCE_RATE * self.cost_grid
-        regulation = self.config.regulation
+        road_maintenance = ROAD_MAINTENANCE_RATE * self.road_cost_grid
+        taxes, subsidies = self._fiscal_grids(incomes)
         for agent in self.agents:
             mask = self.owner_grid == agent.agent_id
-            if not mask.any():
-                continue
+            road_mask = self.road_owner_grid == agent.agent_id
             revenue = float(incomes[mask].sum())
-            maint = float(maintenance[mask].sum())
-            property_tax = float(regulation.property_tax_rate * self.cost_grid[mask].sum())
-            industry_tax = float(
-                regulation.industry_tax_rate
-                * incomes[mask & (self.type_grid == 4)].sum()
+            maint = float(
+                maintenance[mask].sum() + road_maintenance[road_mask].sum()
             )
-            green_count = int(np.sum(mask & (self.type_grid == 5)))
-            subsidy = float(regulation.green_subsidy * green_count)
+            tax = float(taxes[mask].sum())
+            subsidy = float(subsidies[mask].sum())
             agent.revenue += revenue
             agent.maintenance += maint
-            agent.tax_paid += property_tax + industry_tax
+            agent.tax_paid += tax
             agent.subsidy_received += subsidy
-            agent.budget += revenue - maint - property_tax - industry_tax + subsidy
+            operating_cash_flow = revenue - maint - tax + subsidy
+            agent.interest_paid += agent.debt * DEBT_INTEREST_RATE
+            available_cash = (
+                agent.budget + operating_cash_flow - agent.debt * DEBT_INTEREST_RATE
+            )
+            if available_cash < 0.0:
+                agent.debt += -available_cash
+                agent.budget = 0.0
+            else:
+                principal_payment = min(agent.debt, available_cash)
+                agent.debt -= principal_payment
+                agent.budget = available_cash - principal_payment
 
-        self._process_bankruptcies()
+        if np.any(self.pending_road_grid > 0):
+            pending = self.pending_road_grid > 0
+            self.pending_road_grid[pending] -= 1
+            activated = pending & (self.pending_road_grid == 0)
+            self.player_road_grid[activated] = True
+            self._refresh_layers(advance_population=False)
+        self._travel_time_dirty = True
 
         if self.record_history:
             city = self.city_metrics()
@@ -684,7 +796,12 @@ class CityEnvironment:
                     "damage_total": city.externality_damage_total,
                     "population": city.population,
                     "jobs": city.jobs,
+                    "housing_vacancy_rate": city.housing_vacancy_rate,
+                    "job_vacancy_rate": city.job_vacancy_rate,
+                    "unemployment_rate": city.unemployment_rate,
+                    "net_migration_rate": city.net_migration_rate,
                     "goods_balance": city.goods_balance,
+                    "local_goods_coverage": city.local_goods_coverage,
                     "mean_utilization": city.mean_utilization,
                     "mean_satisfaction": city.mean_satisfaction,
                     "gini_satisfaction": city.gini_satisfaction,
@@ -693,35 +810,15 @@ class CityEnvironment:
                     "gini_profit": city.gini_profit,
                     "violations": city.violations_total,
                     "tax_revenue": city.tax_revenue,
+                    "economic_phase": city.economic_phase,
+                    "tax_rate_multiplier": city.tax_rate_multiplier,
                     "subsidy_total": city.subsidy_total,
                     "bankrupt_agents": city.bankrupt_agents,
+                    "total_debt": city.total_debt,
+                    "mean_debt_ratio": city.mean_debt_ratio,
                 }
             )
         self.round += 1
-
-    def _process_bankruptcies(self) -> None:
-        threshold = BANKRUPTCY_THRESHOLD
-        any_bankrupt = False
-        for agent in self.agents:
-            if agent.bankrupt:
-                continue
-            if agent.budget < threshold:
-                agent.bankrupt_streak += 1
-            else:
-                agent.bankrupt_streak = 0
-            if agent.bankrupt_streak >= BANKRUPTCY_STREAK:
-                agent.bankrupt = True
-                mask = self.owner_grid == agent.agent_id
-                self.type_grid[mask] = 0
-                self.quality_grid[mask] = -1
-                self.floors_grid[mask] = 0
-                self.roof_quality_grid[mask] = 0
-                self.owner_grid[mask] = -1
-                self.cost_grid[mask] = 0.0
-                agent.budget = 0.0
-                any_bankrupt = True
-        if any_bankrupt:
-            self._refresh_layers(advance_population=False)
 
     # ------------------------------------------------------------------
     # Dynamic layers
@@ -730,6 +827,17 @@ class CityEnvironment:
     def _refresh_layers(self, advance_population: bool = False) -> None:
         self._cached_compat = None  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
         self._income_cache = None   # <--- ДОБАВИТЬ ЭТУ СТРОКУ
+        (
+            self.road_access,
+            self.player_road_density,
+            self.infra_wait_rounds,
+        ) = road_network_fields(
+            self.static["road"],
+            self.static["road_mask"],
+            self.player_road_grid,
+            self.pending_road_grid,
+            connected_weight=ROAD_CONNECTED_WEIGHT,
+        )
         built = (self.type_grid > 0).astype(np.float64)
         built_bool = built > 0.0
 
@@ -784,13 +892,17 @@ class CityEnvironment:
             if industry_count
             else np.ones((self.h, self.w), dtype=np.float64)
         )
+        industry_pollution = 0.80 * np.exp(-6.0 * industry_dist)
+        park_shield = 0.5 * self.share_green
         self.pollution = (
-            0.80 * np.exp(-6.0 * industry_dist)
+            industry_pollution * (1.0 - park_shield)
             + 0.15 * box_mean(road_mask, POLLUTION_RADIUS)
         )
         commercial_mask = (self.type_grid == 2).astype(np.float64)
+        industry_noise = 0.45 * box_mean(industry_mask, NOISE_RADIUS)
         self.noise = (
-            0.45 * box_mean(industry_mask + commercial_mask, NOISE_RADIUS)
+            industry_noise * (1.0 - park_shield)
+            + 0.45 * box_mean(commercial_mask, NOISE_RADIUS)
             + 0.45 * box_mean(road_mask, NOISE_RADIUS)
             + 0.10 * self.density
         )
@@ -831,9 +943,8 @@ class CityEnvironment:
         if self.config.enable_externalities:
             self.demand =np.minimum(np.maximum(
                 self.static["base_demand"]
-                + 0.25 * (1.0 - self.density)
                 + 0.10 * self.static["road"]
-                - 0.20 * self.load
+                - 0.05 * self.load
                 - 0.15 * self.share_industry
                 + 0.15 * self.attractiveness
                 - 0.10 * self.local_saturation,
@@ -873,27 +984,56 @@ class CityEnvironment:
             floor_counts[1] * HOUSING_CAPACITY
             + floor_counts[3] * MIXED_CAPACITY
         )
-        target_population = min(
-            self.base_population + self.population_extra, housing_capacity
-        )
-        target_population = max(0.0, target_population)
-        if advance_population:
-            self.population = (
-                POPULATION_INERTIA * self.population
-                + (1.0 - POPULATION_INERTIA) * target_population
-            )
-        else:
-            self.population = min(self.population, target_population)
-
         self.jobs = (
             floor_counts[2] * COMMERCIAL_JOBS
             + floor_counts[3] * MIXED_JOBS
             + floor_counts[4] * INDUSTRY_JOBS
         )
+        target_population = max(
+            0.0, min(housing_capacity, self.jobs + self.population_extra)
+        )
+        previous_population = self.population
+        if advance_population:
+            self.population = min(
+                housing_capacity,
+                max(
+                    0.0,
+                    self.population
+                    + MIGRATION_RATE * (target_population - self.population),
+                ),
+            )
+            self.net_migration = self.population - previous_population
+        else:
+            self.population = min(self.population, housing_capacity)
+            if self.population != previous_population:
+                self.net_migration = self.population - previous_population
+        self.housing_capacity = float(housing_capacity)
+        self.employed = min(self.population, self.jobs)
+        self.unemployed = max(0.0, self.population - self.employed)
+        self.housing_vacancies = max(0.0, housing_capacity - self.population)
+        self.job_vacancies = max(0.0, self.jobs - self.employed)
+        self.housing_vacancy_rate = (
+            self.housing_vacancies / housing_capacity if housing_capacity > 0 else 0.0
+        )
+        self.job_vacancy_rate = (
+            self.job_vacancies / self.jobs if self.jobs > 0 else 0.0
+        )
+        self.unemployment_rate = (
+            self.unemployed / self.population if self.population > 0 else 0.0
+        )
+        self.net_migration_rate = float(
+            np.clip(self.net_migration / max(1.0, self.base_population), -1.0, 1.0)
+        )
         self.goods_supply = floor_counts[4] * INDUSTRY_GOODS_SUPPLY
         self.goods_demand = (
             CITIZEN_GOODS_DEMAND * self.population
-            + floor_counts[2] * COMMERCIAL_GOODS_DEMAND
+            + COMMERCIAL_GOODS_DEMAND
+            * (floor_counts[2] + 0.5 * floor_counts[3])
+        )
+        self.local_goods_coverage = (
+            min(1.0, self.goods_supply / self.goods_demand)
+            if self.goods_demand > 0.0
+            else 1.0
         )
         self.goods_balance = float(
             (self.goods_supply - self.goods_demand)
@@ -918,6 +1058,57 @@ class CityEnvironment:
         self.mean_utilization = (
             float(self.util_grid[self.type_grid > 0].mean()) if built_count else 0.0
         )
+
+    def _economic_phase(self) -> tuple[str, float]:
+        regulation = self.config.regulation
+        if self.population <= 0.0:
+            return "normal", regulation.tax_phase_multipliers[1]
+        if self.unemployment_rate >= regulation.recession_unemployment_threshold:
+            return "recession", regulation.tax_phase_multipliers[0]
+        if self.unemployment_rate <= regulation.boom_unemployment_threshold:
+            return "boom", regulation.tax_phase_multipliers[2]
+        return "normal", regulation.tax_phase_multipliers[1]
+
+    def _fiscal_grids(
+        self, incomes: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if incomes is None:
+            incomes = self._income_grid()
+        built = self.type_grid > 0
+        world_type = self.type_grid.astype(np.int64)
+        quality = np.clip(self.quality_grid.astype(np.int64), 0, 2)
+        regulation = self.config.regulation
+        _, phase_multiplier = self._economic_phase()
+        type_rates = np.asarray(regulation.type_tax_rates, dtype=np.float64)
+        quality_multipliers = np.asarray(
+            regulation.quality_tax_multipliers, dtype=np.float64
+        )
+        tax_rates = np.zeros((self.h, self.w), dtype=np.float64)
+        tax_rates[built] = (
+            type_rates[world_type[built] - 1]
+            * quality_multipliers[quality[built]]
+            * phase_multiplier
+        )
+        taxes = np.maximum(incomes, 0.0) * tax_rates
+
+        floors = np.maximum(1.0, self.floors_grid.astype(np.float64))
+        affordable_housing = (world_type == 1) & (quality == 0)
+        job_capacity = (
+            (world_type == 2) * COMMERCIAL_JOBS
+            + (world_type == 3) * MIXED_JOBS
+            + (world_type == 4) * INDUSTRY_JOBS
+        ) * floors
+        employment_ratio = self.employed / self.jobs if self.jobs > 0.0 else 0.0
+        subsidies = (
+            (world_type == 5) * regulation.green_subsidy
+            + affordable_housing
+            * floors
+            * regulation.affordable_housing_subsidy_per_floor
+            + job_capacity
+            * employment_ratio
+            * regulation.employment_subsidy_per_job
+        )
+        return taxes, subsidies
 
     def _refresh_districts(self) -> None:
         labels = self.district_labels_flat
@@ -1011,6 +1202,7 @@ class CityEnvironment:
         for action_type in range(5):
             world_type = action_type + 1
             same = counts[world_type]
+            same_type_effect = 0.03 if world_type in (2, 4) else -0.03
             if world_type == 4:
                 incompatible = sensitive
                 complementary = green
@@ -1027,7 +1219,7 @@ class CityEnvironment:
                 incompatible = np.zeros_like(housing)
                 complementary = housing + commercial + mixed
             fields[action_type] = np.minimum(np.maximum(
-                1.0 + 0.05 * complementary - 0.10 * incompatible - 0.03 * same + 0.04 * green,
+                1.0 + 0.05 * complementary - 0.05 * incompatible + same_type_effect * same + 0.04 * green,
                 0.35), 1.55)
         self._cached_compat = fields
         return fields
@@ -1043,7 +1235,83 @@ class CityEnvironment:
             return 1.0 - 0.05 * self.noise
         return np.ones((self.h, self.w), dtype=np.float64)
 
+    def _travel_cell_costs(self) -> np.ndarray:
+        costs = np.full(
+            (self.h, self.w), WALK_TRAVEL_COST, dtype=np.float64
+        )
+        water = self.static["water_blocked"]
+        built = self.type_grid > 0
+        pending = self.pending_road_grid > 0
+        costs[built] = BUILDING_TRAVEL_COST
+        costs[pending & ~built] = WALK_TRAVEL_COST
+
+        road_supply = box_sum(self.player_road_grid.astype(np.float64), 2)
+        effective_density = self.density * (
+            1.0
+            - ROAD_RELIEF_MAX
+            * np.minimum(1.0, road_supply / ROAD_SUPPLY_FULL)
+        )
+        congestion = 1.0 + CONGESTION_ALPHA * np.square(effective_density)
+        road_cells = (
+            (self.static["road_mask"] > 0.0) | self.player_road_grid
+        ) & ~built & ~pending & ~water
+        costs[road_cells] = ROAD_TRAVEL_COST * congestion[road_cells]
+        costs[water] = np.inf
+        return costs
+
+    def _refresh_travel_time_maps(self) -> None:
+        costs = self._travel_cell_costs()
+        walkable = np.isfinite(costs)
+        center_y, center_x = (self.h - 1) / 2.0, (self.w - 1) / 2.0
+        center_distance = (self.yy - center_y) ** 2 + (
+            self.xx - center_x
+        ) ** 2
+        center_sources = np.zeros((self.h, self.w), dtype=bool)
+        if walkable.any():
+            nearest_center = center_distance[walkable].min()
+            center_sources = walkable & np.isclose(
+                center_distance, nearest_center
+            )
+        self.travel_time_center = grid_shortest_paths(costs, center_sources)
+
+        jobs_sources = np.isin(self.type_grid, (2, 3, 4)) & walkable
+        self.travel_time_jobs = (
+            grid_shortest_paths(costs, jobs_sources)
+            if jobs_sources.any()
+            else self.travel_time_center.copy()
+        )
+        normalization = max(1e-12, 2.0 * float(np.hypot(self.h, self.w)))
+        self.travel_time_center_norm = np.clip(
+            self.travel_time_center / normalization, 0.0, 1.0
+        )
+        self.travel_time_jobs_norm = np.clip(
+            self.travel_time_jobs / normalization, 0.0, 1.0
+        )
+        self.travel_time_center_norm[~np.isfinite(self.travel_time_center)] = 1.0
+        self.travel_time_jobs_norm[~np.isfinite(self.travel_time_jobs)] = 1.0
+        self._income_cache = None
+        self._travel_time_dirty = False
+
+    def _ensure_travel_time_maps(self) -> None:
+        if self._travel_time_dirty:
+            self._refresh_travel_time_maps()
+
+    def _access_fit_map(self, world_type: int) -> np.ndarray:
+        self._ensure_travel_time_maps()
+        if world_type == 5:
+            distance = self.static["dist_center"]
+            reachable = np.ones((self.h, self.w), dtype=bool)
+        elif world_type in (1, 3):
+            distance = self.travel_time_jobs_norm
+            reachable = np.isfinite(self.travel_time_jobs)
+        else:
+            distance = self.travel_time_center_norm
+            reachable = np.isfinite(self.travel_time_center)
+        fit = 1.0 - np.abs(distance - OPTIMAL_DISTANCE[world_type])
+        return np.where(reachable, fit, 0.0)
+
     def _income_grid(self) -> np.ndarray:
+        self._ensure_travel_time_maps()
         if self._income_cache is not None:
             return self._income_cache
         built = self.type_grid > 0
@@ -1060,15 +1328,25 @@ class CityEnvironment:
             roof_quality = np.zeros_like(roof_quality)
 
         type_income = INCOME_BASE[world_type]
+        industry_income = np.where(
+            world_type == 4, INDUSTRY_INCOME_MULTIPLIER, 1.0
+        )
+        goods_import_factor = np.where(
+            (world_type == 2) | (world_type == 3),
+            1.0 - GOODS_IMPORT_MARKUP * (1.0 - self.local_goods_coverage),
+            1.0,
+        )
         quality_income = QUALITY_INCOME_MULT[quality]
         floor_income = np.sqrt(floors)
         roof_income = 1.0 + 0.015 * roof_quality
         district_synergy_income = 1.0 + 0.20 * self.district_synergy
         demand_factor = 0.5 + 0.7 * (self.demand / MAX_DEMAND)
-        road_factor = 0.7 + 0.6 * self.static["road"]
-        access_fit = 1.0 - np.abs(
-            self.static["dist_center"] - OPTIMAL_DISTANCE[world_type]
-        )
+        road_factor = 0.7 + 0.6 * self.road_access
+        access_fit = np.ones((self.h, self.w), dtype=np.float64)
+        for action_type in range(1, 6):
+            mask = world_type == action_type
+            if mask.any():
+                access_fit[mask] = self._access_fit_map(action_type)[mask]
         access_factor = 0.6 + 0.8 * access_fit
         soil_factor = 0.9 + 0.2 * self.static["soil"]
 
@@ -1076,7 +1354,6 @@ class CityEnvironment:
             compatibility = self._compatibility_fields()[
                 type_for_index, self.yy.astype(int), self.xx.astype(int)
             ]
-            load_factor = 1.0 - 0.10 * self.load
             penalties = np.ones((self.h, self.w), dtype=np.float64)
             for action_type in range(5):
                 mask = world_type == action_type + 1
@@ -1093,13 +1370,14 @@ class CityEnvironment:
                 )
         else:
             compatibility = np.ones((self.h, self.w), dtype=np.float64)
-            load_factor = np.ones((self.h, self.w), dtype=np.float64)
             penalties = np.ones((self.h, self.w), dtype=np.float64)
             util = np.ones((self.h, self.w), dtype=np.float64)
             saturation = np.ones((self.h, self.w), dtype=np.float64)
 
         income = (
             type_income
+            * industry_income
+            * goods_import_factor
             * quality_income
             * floor_income
             * roof_income
@@ -1108,7 +1386,6 @@ class CityEnvironment:
             * road_factor
             * access_factor
             * compatibility
-            * load_factor
             * penalties
             * util
             * saturation
@@ -1121,32 +1398,35 @@ class CityEnvironment:
     def projected_income_table(self, agent_id: int) -> np.ndarray:
         """Expected one-round income for building in every empty cell.
 
-        Shape: (n_cells, 5 action types, 3 qualities).  Used by the greedy
-        baseline; learned policies never call this method.
+        Shape: (n_cells, 6 action types, 3 qualities). Road actions have no
+        direct income; learned policies do not use this table for selection.
         """
         del agent_id
+        self._ensure_travel_time_maps()
         fields = self._compatibility_fields() if self.config.enable_externalities else None
         if self.config.enable_externalities:
-            load_factor = 1.0 - 0.10 * self.load
             compatibility = fields
         else:
-            load_factor = np.ones((self.h, self.w), dtype=np.float64)
             compatibility = np.ones((5, self.h, self.w), dtype=np.float64)
 
         demand_factor = 0.5 + 0.7 * (self.demand / MAX_DEMAND)
-        road_factor = 0.7 + 0.6 * self.static["road"]
+        road_factor = 0.7 + 0.6 * self.road_access
         soil_factor = 0.9 + 0.2 * self.static["soil"]
 
-        out = np.zeros((self.n_cells, 5, 3), dtype=np.float64)
+        out = np.zeros((self.n_cells, len(ACTION_TYPE_NAMES), 3), dtype=np.float64)
         for action_type in range(5):
             world_type = action_type + 1
-            access_fit = 1.0 - np.abs(
-                self.static["dist_center"] - OPTIMAL_DISTANCE[world_type]
-            )
+            access_fit = self._access_fit_map(world_type)
             access_factor = 0.6 + 0.8 * access_fit
             base = INCOME_BASE[world_type] * (
                 demand_factor * road_factor * access_factor * soil_factor
             )
+            if world_type == 4:
+                base *= INDUSTRY_INCOME_MULTIPLIER
+            elif world_type in (2, 3):
+                base *= 1.0 - GOODS_IMPORT_MARKUP * (
+                    1.0 - self.local_goods_coverage
+                )
             if self.config.enable_externalities:
                 sector_penalty = self._sector_quality_penalty(action_type)
                 util = self.utilization[world_type]
@@ -1164,7 +1444,6 @@ class CityEnvironment:
                     base
                     * QUALITY_INCOME_MULT[quality]
                     * compatibility[action_type]
-                    * load_factor
                     * sector_penalty
                     * util
                     * saturation
@@ -1190,6 +1469,7 @@ class CityEnvironment:
         elif kind == "population_boom":
             self.population_extra += float(magnitude)
             self._refresh_layers(advance_population=False)
+            self._travel_time_dirty = True
             self.shock_events.append(
                 {"round": self.round, "kind": kind, "magnitude": float(magnitude), "cleared": 0}
             )
@@ -1206,6 +1486,7 @@ class CityEnvironment:
         else:
             raise ValueError(f"unknown shock kind: {kind}")
         self._refresh_layers(advance_population=False)
+        self._travel_time_dirty = True
         event = {
             "round": self.round,
             "kind": kind,
@@ -1275,6 +1556,7 @@ class CityEnvironment:
         return violations, incompatible, density_excess
 
     def city_metrics(self) -> CityMetrics:
+        self._ensure_travel_time_maps()
         type_grid = self.type_grid
         built = type_grid > 0
         built_count = int(built.sum())
@@ -1282,7 +1564,9 @@ class CityEnvironment:
         green_share = counts[5] / max(1, built_count)
         entropy = type_entropy(type_grid)
         if built_count:
-            accessibility = 1.0 - float(self.static["dist_center"][built].mean())
+            accessibility = 1.0 - float(
+                self.travel_time_center_norm[built].mean()
+            )
             mean_load = float(self.load[built].mean())
             land_value_mean = float(self.land_value[built].mean())
             pollution_mean = float(self.pollution[built].mean())
@@ -1319,6 +1603,7 @@ class CityEnvironment:
         shifted = profits - profits.min() if profits.size else profits
         satisfaction = self.citizens.evaluate_city(self)
         util_values = [v for v in self.utilization.values() if v > 0]
+        economic_phase, tax_rate_multiplier = self._economic_phase()
         return CityMetrics(
             green_share=float(green_share),
             green_component=green_component,
@@ -1338,9 +1623,20 @@ class CityEnvironment:
             type_counts=counts,
             population=float(self.population),
             jobs=float(self.jobs),
+            housing_capacity=float(self.housing_capacity),
+            housing_vacancies=float(self.housing_vacancies),
+            housing_vacancy_rate=float(self.housing_vacancy_rate),
+            employed=float(self.employed),
+            unemployed=float(self.unemployed),
+            unemployment_rate=float(self.unemployment_rate),
+            job_vacancies=float(self.job_vacancies),
+            job_vacancy_rate=float(self.job_vacancy_rate),
+            net_migration=float(self.net_migration),
+            net_migration_rate=float(self.net_migration_rate),
             goods_supply=float(self.goods_supply),
             goods_demand=float(self.goods_demand),
             goods_balance=float(self.goods_balance),
+            local_goods_coverage=float(self.local_goods_coverage),
             mean_utilization=float(np.mean(util_values)) if util_values else 0.0,
             land_value_mean=land_value_mean,
             pollution_mean=pollution_mean,
@@ -1350,9 +1646,15 @@ class CityEnvironment:
             rich_satisfaction=satisfaction["rich_satisfaction"],
             poor_satisfaction=satisfaction["poor_satisfaction"],
             tax_revenue=float(sum(a.tax_paid for a in self.agents)),
+            economic_phase=economic_phase,
+            tax_rate_multiplier=float(tax_rate_multiplier),
             subsidy_total=float(sum(a.subsidy_received for a in self.agents)),
             bankrupt_agents=int(sum(a.bankrupt for a in self.agents)),
             affordable_share=affordable_share,
+            total_debt=float(sum(a.debt for a in self.agents)),
+            mean_debt_ratio=float(
+                np.mean([a.debt_ratio for a in self.agents]) if self.agents else 0.0
+            ),
         )
 
     def agent_metrics(self) -> list[AgentMetrics]:
@@ -1398,6 +1700,9 @@ class CityEnvironment:
                 AgentMetrics(
                     agent_id=agent.agent_id,
                     profit=agent.profit,
+                    debt=agent.debt,
+                    debt_ratio=agent.debt_ratio,
+                    interest_paid=agent.interest_paid,
                     revenue=agent.revenue,
                     spend=agent.spend,
                     maintenance=agent.maintenance,

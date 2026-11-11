@@ -358,17 +358,16 @@ class ExperimentStore:
             else ("datasets", "dataset_id", self.datasets)
         )
         placeholders = ",".join("?" for _ in ids)
+        state_column = ", state" if entity_type == "run" else ""
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT {key}, directory, state FROM {table} "
+                f"SELECT {key}, directory{state_column} FROM {table} "
                 f"WHERE {key} IN ({placeholders}) AND deleted_at IS NOT NULL",
                 ids,
             ).fetchall()
             if len(rows) != len(set(ids)):
                 raise ValueError("one or more items are not in the trash")
-            if entity_type == "run" and any(
-                row["state"] in {"running", "stopping"} for row in rows
-            ):
+            if entity_type == "run" and any(row["state"] in {"running", "stopping"} for row in rows):
                 raise ValueError("running tasks cannot be permanently deleted")
             if entity_type == "dataset":
                 active_path = self.active_history_dir()
@@ -766,6 +765,7 @@ def _has_analytics(directory: Path) -> bool:
         for name in (
             "analytics_summary.json",
             "training_metrics.json",
+            "training_progress.ndjson",
             "history.csv",
             "metrics.json",
         )

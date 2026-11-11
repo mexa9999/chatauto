@@ -7,6 +7,7 @@ import csv
 from dataclasses import replace
 from pathlib import Path
 import os
+import uuid
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -82,6 +83,10 @@ def parse_grid(text: str) -> tuple[int, int]:
         raise argparse.ArgumentTypeError(
             "grid dimensions must be positive integers, e.g. 8x8"
         )
+    if height < 3 or width < 3 or height > 64 or width > 64:
+        raise argparse.ArgumentTypeError(
+            "grid dimensions must be between 3 and 64, e.g. 12x12"
+        )
     return height, width
 
 
@@ -101,6 +106,13 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n-agents", type=int, default=None)
     parser.add_argument("--grid", type=str, default=None, help="HxW, e.g. 8x8")
     parser.add_argument("--actions", type=int, default=None)
+    parser.add_argument(
+        "--actions-per-round",
+        type=int,
+        choices=range(1, 5),
+        default=None,
+        help="sequential actions per agent in each round (1-4)",
+    )
     parser.add_argument(
         "--buildings-per-action",
         type=int,
@@ -172,6 +184,8 @@ def build_configs(
         city = replace(city, height=h, width=w)
     if args.actions is not None:
         city = replace(city, actions_per_agent=args.actions)
+    if getattr(args, "actions_per_round", None) is not None:
+        city = replace(city, actions_per_round=args.actions_per_round)
     if args.buildings_per_action is not None:
         city = replace(city, buildings_per_action=args.buildings_per_action)
     if args.bids is not None:
@@ -400,7 +414,17 @@ def command_demo(args) -> None:
     )
     if recorder is None:
         plot_city(
-            type("EnvProxy", (), {"type_grid": result.type_grid, "w": city.width, "h": city.height})(),
+            type(
+                "EnvProxy",
+                (),
+                {
+                    "type_grid": result.type_grid,
+                    "player_road_grid": result.player_road_grid,
+                    "pending_road_grid": result.pending_road_grid,
+                    "w": city.width,
+                    "h": city.height,
+                },
+            )(),
             out / "final.png",
             title=f"{policy_name}, final city",
             projection=getattr(args, "projection", "isometric"),
@@ -411,6 +435,7 @@ def command_demo(args) -> None:
         f"satisfaction={result.city.mean_satisfaction:.3f} "
         f"utilization={result.city.mean_utilization:.3f} "
         f"profit_mean={np.mean([a.profit for a in result.agents]):.1f} "
+        f"debt_total={result.city.total_debt:.1f} "
         f"damage_total={result.city.externality_damage_total:.2f}"
     )
     if snapshots:
@@ -543,8 +568,25 @@ def command_train(args) -> None:
     base_config = history.config_for_branch(branch) if args.resume else None
     city, evo, _ = build_configs(args, base_config=base_config)
     layout = _layout(evo)
+    training_metadata = {
+        "branch": branch,
+        "seed": evo.seed,
+        "evolution_config": evo.as_dict(),
+        "city_config": city.as_dict(),
+    }
+    initial_history = []
+    if args.resume:
+        initial_history = read_checkpoint_metadata(
+            history.checkpoint_path(branch)
+        ).get("history", [])
+    write_training_analytics(out, initial_history, training_metadata)
+    (out / "training_progress.ndjson").write_text("", encoding="utf-8")
     progress = (
-        TrainingProgress(args.progress_file, args.stop_file)
+        TrainingProgress(
+            args.progress_file,
+            args.stop_file,
+            analytics_directory=out,
+        )
         if args.progress_file and args.stop_file
         else None
     )
@@ -557,15 +599,10 @@ def command_train(args) -> None:
         checkpoint_every=args.checkpoint_every,
         history_store=history,
         branch=branch,
+        run_id=getattr(args, "run_id", None) or uuid.uuid4().hex,
         progress_callback=progress.generation_completed if progress else None,
         stop_requested=progress.stop_requested if progress else None,
     )
-    training_metadata = {
-        "branch": branch,
-        "seed": evo.seed,
-        "evolution_config": evo.as_dict(),
-        "city_config": city.as_dict(),
-    }
     write_training_analytics(out, result.history, training_metadata)
     evaluation_seed = evo.validation_seed_base + 777
     evaluation_policies = [
@@ -592,6 +629,9 @@ def command_train(args) -> None:
         evaluation_scores,
         score_breakdown(evaluation_result),
     )
+    training_progress_path = out / "training_progress.ndjson"
+    if training_progress_path.is_file():
+        training_progress_path.unlink()
     if progress is not None:
         from .checkpoint_io import read_checkpoint_metadata
 
@@ -847,6 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_HISTORY_DIR),
     )
     train.add_argument("--branch", type=str, default=None)
+    train.add_argument("--run-id", type=str, default=None)
     train.add_argument(
         "--resume",
         action="store_true",

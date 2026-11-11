@@ -30,6 +30,14 @@ class CitySummary(NamedTuple):
     gini_satisfaction: float
     mean_utilization: float
     population: float
+    total_debt: float
+    mean_debt_ratio: float
+    housing_vacancy_rate: float
+    job_vacancy_rate: float
+    unemployment_rate: float
+    net_migration_rate: float
+    local_goods_coverage: float
+    tax_rate_multiplier: float
     green_share: float
     externality_damage_total: float
     bankrupt_agents: float
@@ -73,6 +81,14 @@ def _run_episode_worker(
         city.gini_satisfaction,
         city.mean_utilization,
         city.population,
+        city.total_debt,
+        city.mean_debt_ratio,
+        city.housing_vacancy_rate,
+        city.job_vacancy_rate,
+        city.unemployment_rate,
+        city.net_migration_rate,
+        city.local_goods_coverage,
+        city.tax_rate_multiplier,
         city.green_share,
         city.externality_damage_total,
         float(city.bankrupt_agents),

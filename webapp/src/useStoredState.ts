@@ -6,16 +6,29 @@ type StoredValue<T> = {
   error?: string;
 };
 
+type StoredStateMigration = {
+  fromKey: string;
+  migrate: (value: unknown) => unknown;
+};
+
 export function useStoredState<T>(
   key: string,
   fallback: T,
   isValid: (value: unknown) => value is T,
   onError: (message: string) => void,
+  migration?: StoredStateMigration,
 ): [T, Dispatch<SetStateAction<T>>] {
   const [stored] = useState<StoredValue<T>>(() => {
     try {
       const raw = window.localStorage.getItem(key);
-      if (raw === null) return { value: fallback };
+      if (raw === null) {
+        const legacyRaw = migration ? window.localStorage.getItem(migration.fromKey) : null;
+        if (legacyRaw === null) return { value: fallback };
+        const legacyValue: unknown = JSON.parse(legacyRaw);
+        const migratedValue = migration?.migrate(legacyValue);
+        if (isValid(migratedValue)) return { value: migratedValue };
+        return { value: fallback, error: "Сохранённые настройки не соответствуют текущей версии; применены значения по умолчанию." };
+      }
       const value: unknown = JSON.parse(raw);
       if (isValid(value)) return { value };
       return { value: fallback, error: "Сохранённые настройки не соответствуют текущей версии; применены значения по умолчанию." };

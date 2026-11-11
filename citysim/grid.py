@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import heapq
+
 import numpy as np
 
 try:  # numba is optional at runtime, but strongly recommended
@@ -55,6 +57,89 @@ def box_mean(values: np.ndarray, radius: int) -> np.ndarray:
         ones = np.ones_like(a)
         _window_sums_cache[key] = np.maximum(1.0, box_sum(ones, radius))
     return box_sum(a, radius) / _window_sums_cache[key]
+
+
+def grid_shortest_paths(
+    cell_costs: np.ndarray, sources: np.ndarray
+) -> np.ndarray:
+    """Return weighted 4-neighbour distances from one or more source cells."""
+    costs = np.asarray(cell_costs, dtype=np.float64)
+    source_mask = np.asarray(sources, dtype=bool)
+    if costs.ndim != 2 or source_mask.shape != costs.shape:
+        raise ValueError("cell costs and sources must have the same 2D shape")
+    if np.isnan(costs).any() or np.any(costs < 0.0):
+        raise ValueError("cell costs must be non-negative and not NaN")
+
+    distances = np.full(costs.shape, np.inf, dtype=np.float64)
+    valid_sources = np.argwhere(source_mask & np.isfinite(costs))
+    queue: list[tuple[float, int, int]] = []
+    for row, col in valid_sources:
+        distances[row, col] = 0.0
+        heapq.heappush(queue, (0.0, int(row), int(col)))
+
+    height, width = costs.shape
+    while queue:
+        distance, row, col = heapq.heappop(queue)
+        if distance != distances[row, col]:
+            continue
+        for next_row, next_col in (
+            (row - 1, col),
+            (row + 1, col),
+            (row, col - 1),
+            (row, col + 1),
+        ):
+            if not (0 <= next_row < height and 0 <= next_col < width):
+                continue
+            next_cost = costs[next_row, next_col]
+            if not np.isfinite(next_cost):
+                continue
+            edge_cost = 0.5 * (costs[row, col] + next_cost)
+            candidate = distance + edge_cost
+            if candidate < distances[next_row, next_col]:
+                distances[next_row, next_col] = candidate
+                heapq.heappush(queue, (candidate, next_row, next_col))
+    return distances
+
+
+def road_network_fields(
+    static_road_access: np.ndarray,
+    static_road_mask: np.ndarray,
+    player_roads: np.ndarray,
+    pending_roads: np.ndarray,
+    connected_weight: float = 1.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return road access, weighted player-road density, and nearby wait rounds."""
+    static_roads = np.asarray(static_road_mask, dtype=bool)
+    active_roads = np.asarray(player_roads, dtype=bool)
+    pending = np.asarray(pending_roads, dtype=bool)
+    if not (
+        static_road_access.shape == static_roads.shape
+        == active_roads.shape
+        == pending.shape
+    ):
+        raise ValueError("all road layers must have the same shape")
+
+    adjacent_roads = np.zeros_like(active_roads)
+    adjacent_roads[1:, :] |= static_roads[:-1, :] | active_roads[:-1, :]
+    adjacent_roads[:-1, :] |= static_roads[1:, :] | active_roads[1:, :]
+    adjacent_roads[:, 1:] |= static_roads[:, :-1] | active_roads[:, :-1]
+    adjacent_roads[:, :-1] |= static_roads[:, 1:] | active_roads[:, 1:]
+    connected_roads = active_roads & (
+        adjacent_roads | static_roads
+    )
+    road_weights = np.where(
+        connected_roads,
+        connected_weight,
+        1.0,
+    ) * active_roads
+    density = np.clip(box_mean(road_weights, 1), 0.0, 1.0)
+    access = np.clip(
+        static_road_access + 0.5 * np.minimum(1.0, density),
+        0.0,
+        1.0,
+    )
+    wait_rounds = np.minimum(1.0, box_sum(pending, 1))
+    return access, density, wait_rounds
 
 
 def smooth(values: np.ndarray, radius: int = 1) -> np.ndarray:
@@ -148,6 +233,7 @@ def make_static_layers(rng: np.random.Generator, height: int, width: int) -> dic
         "dist_center": dist_center,
         "soil": soil,
         "water": np.clip(water, 0.0, 1.0),
+        "water_blocked": (water >= water_threshold),
         "road": road,
         "relief": relief,
         "land_price": land_price,

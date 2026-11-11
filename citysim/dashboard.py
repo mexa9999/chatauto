@@ -25,7 +25,7 @@ import numpy as np
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.background import BackgroundTask
 from starlette.staticfiles import StaticFiles
 
@@ -36,7 +36,7 @@ from .experiment_store import (
     ImportConflict,
 )
 from .analytics import load_analytics
-from .config import EvolutionConfig
+from .config import ACTION_TYPE_NAMES, EvolutionConfig
 from .evolution import layout_from_config
 from .live_demo import (
     read_control_file,
@@ -47,6 +47,7 @@ from .live_demo import (
 from .plotting import plot_city
 from .checkpoint_io import read_checkpoint_metadata
 from .training_history import TrainingHistoryStore
+from .strategy_catalog import branch_graph, branch_training_runs, run_checkpoints
 
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 _EXPERIMENTS = tuple([f"e{i}" for i in range(1, 13)] + ["all"])
@@ -60,12 +61,13 @@ class StartJobRequest(BaseModel):
     policy: Literal["random", "greedy", "manual", "neural"] = "manual"
     genome_ref: str | None = None
     grid: str = "12x12"
+    actions_per_round: int = Field(default=2, ge=1, le=4)
     shock: Literal["industry_removal", "population_boom", "earthquake"] | None = None
     projection: Literal["isometric", "top-down"] = "isometric"
     quick: bool = False
     rounds: int | None = Field(default=None, ge=1, le=10_000)
-    generations: int = Field(default=100, ge=1, le=100_000)
-    episodes: int = Field(default=10, ge=1, le=100_000)
+    generations: int = Field(default=125, ge=1, le=100_000)
+    episodes: int = Field(default=16, ge=1, le=100_000)
     population: int = Field(default=32, ge=8, le=10_000)
     workers: int | None = Field(default=None, ge=1, le=1024)
     n_agents: int = Field(default=10, ge=1, le=1000)
@@ -74,6 +76,17 @@ class StartJobRequest(BaseModel):
     checkpoint_every: int = Field(default=10, ge=1, le=100_000)
     seeds: str = Field(default="0-2", min_length=1, max_length=512)
     eval_seeds: int = Field(default=5, ge=1, le=10_000)
+
+    @field_validator("grid")
+    @classmethod
+    def validate_grid(cls, value: str) -> str:
+        match = re.fullmatch(r"\s*(\d+)\s*[xх×]\s*(\d+)\s*", value, re.IGNORECASE)
+        if match is None:
+            raise ValueError("grid must use height×width format, for example 12x12")
+        height, width = map(int, match.groups())
+        if not 3 <= height <= 64 or not 3 <= width <= 64:
+            raise ValueError("grid sides must be between 3 and 64")
+        return f"{height}x{width}"
 
 
 class CompareRequest(BaseModel):
@@ -87,6 +100,7 @@ class CompareRequest(BaseModel):
 class BranchRequest(BaseModel):
     name: str
     from_ref: str | None = None
+    empty: bool = False
 
 
 class BranchRenameRequest(BaseModel):
@@ -455,6 +469,7 @@ class JobManager:
                 command.extend(("--shock", job["shock"]))
             if job["rounds"] is not None:
                 command.extend(("--actions", str(job["rounds"])))
+            command.extend(("--actions-per-round", str(job["actions_per_round"])))
             return command
         if job["kind"] == "train":
             branch = job["branch"]
@@ -479,6 +494,8 @@ class JobManager:
                 str(self.history_dir),
                 "--branch",
                 branch,
+                "--run-id",
+                job_dir.name,
                 "--tag",
                 f"dashboard_{job_dir.name}",
             ]
@@ -498,6 +515,7 @@ class JobManager:
 
         if job["quick"]:
             command.append("--quick")
+        command.extend(("--grid", job["grid"]))
         for name, value in (
             ("--generations", job["generations"]),
             ("--episodes", job["episodes"]),
@@ -506,6 +524,7 @@ class JobManager:
             ("--seed", job["seed"]),
             ("--checkpoint-every", job["checkpoint_every"]),
             ("--eval-seeds", job["eval_seeds"]),
+            ("--actions-per-round", job["actions_per_round"]),
         ):
             command.extend((name, str(value)))
         if job["rounds"] is not None:
@@ -794,6 +813,34 @@ def create_app(history_dir: str | Path, output_dir: str | Path, port: int = 8765
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
 
+    @app.get("/api/history/graph")
+    def history_graph():
+        return branch_graph(current_history_store())
+
+    @app.get("/api/branches/{name}/strategy-runs")
+    def strategy_runs(name: str):
+        try:
+            return {"runs": branch_training_runs(current_history_store(), name)}
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/branches/{name}/strategy-runs/{run_key}/checkpoints")
+    def strategy_checkpoints(name: str, run_key: str):
+        try:
+            return {"checkpoints": run_checkpoints(current_history_store(), name, run_key)}
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/history/commits/{commit_id}/genome-groups")
+    def checkpoint_genome_groups(commit_id: str):
+        store = current_history_store()
+        if not store.is_commit_reachable(commit_id):
+            raise HTTPException(404, "Unknown history commit")
+        try:
+            return {"groups": store.checkpoint_genome_groups(commit_id)}
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
     @app.get("/api/verify")
     def verify():
         return current_history_store().verify()
@@ -815,9 +862,11 @@ def create_app(history_dir: str | Path, output_dir: str | Path, port: int = 8765
 
     @app.post("/api/branches")
     def create_branch(request: BranchRequest):
+        if request.empty and request.from_ref is not None:
+            raise HTTPException(422, "An empty branch cannot have a source reference")
         try:
             parent = current_history_store().create_branch(
-                request.name, request.from_ref
+                request.name, request.from_ref, empty=request.empty
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -874,13 +923,42 @@ def create_app(history_dir: str | Path, output_dir: str | Path, port: int = 8765
     @app.get("/api/genomes")
     def genomes(
         branch: str | None = None,
+        commit_id: str | None = None,
+        member_kind: str | None = None,
         query: str = Query(default="", max_length=200),
         include_deleted: bool = False,
+        limit: int = Query(default=100, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
     ):
         try:
-            return {"genomes": current_history_store().list_genomes(
-                branch=branch, query=query, include_deleted=include_deleted
-            )}
+            store = current_history_store()
+            if commit_id is not None:
+                if not store.is_commit_reachable(commit_id):
+                    raise HTTPException(404, "Unknown history commit")
+                if member_kind not in {"best", "population", "hall_of_fame", "map_elites"}:
+                    raise HTTPException(422, "A valid member_kind is required")
+                genomes = store.list_checkpoint_genomes(
+                    commit_id, member_kind, limit=limit + 1, offset=offset
+                )
+                return {
+                    "genomes": genomes[:limit],
+                    "has_more": len(genomes) > limit,
+                    "limit": limit,
+                    "offset": offset,
+                }
+            genomes = store.list_genomes(
+                branch=branch,
+                query=query,
+                include_deleted=include_deleted,
+                limit=limit + 1,
+                offset=offset,
+            )
+            return {
+                "genomes": genomes[:limit],
+                "has_more": len(genomes) > limit,
+                "limit": limit,
+                "offset": offset,
+            }
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -1115,6 +1193,20 @@ def create_app(history_dir: str | Path, output_dir: str | Path, port: int = 8765
                         ),
                         dtype=np.int8,
                     ),
+                    player_road_grid=np.asarray(
+                        frame.get(
+                            "player_road_grid",
+                            np.zeros((frame["height"], frame["width"]), dtype=bool),
+                        ),
+                        dtype=bool,
+                    ),
+                    pending_road_grid=np.asarray(
+                        frame.get(
+                            "pending_road_grid",
+                            np.zeros((frame["height"], frame["width"]), dtype=bool),
+                        ),
+                        dtype=bool,
+                    ),
                     w=frame["width"],
                     h=frame["height"],
                 ),
@@ -1225,6 +1317,33 @@ def create_app(history_dir: str | Path, output_dir: str | Path, port: int = 8765
             raise HTTPException(409, str(exc)) from exc
         return {"status": "purged", "count": count}
 
+    @app.post("/api/data/purge-all")
+    def purge_all_data():
+        items = data_trash()["items"]
+        ids_by_type = {
+            "run": [item["id"] for item in items if item["entity_type"] == "run"],
+            "dataset": [item["id"] for item in items if item["entity_type"] == "dataset"],
+            "branch": [item["name"] for item in items if item["entity_type"] == "branch"],
+            "genome": [item["genome_id"] for item in items if item["entity_type"] == "genome"],
+        }
+        history = current_history_store()
+        purged = 0
+        try:
+            for entity_type, ids in ids_by_type.items():
+                for start in range(0, len(ids), 500):
+                    batch = ids[start : start + 500]
+                    if not batch:
+                        continue
+                    if entity_type in {"run", "dataset"}:
+                        purged += experiment_store.purge_entities(entity_type, batch)
+                    elif entity_type == "branch":
+                        purged += history.purge_branches(batch)
+                    else:
+                        purged += history.purge_genomes(batch)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"status": "purged", "count": purged}
+
     @app.get("/api/analytics")
     def analytics_catalog():
         return {"sources": experiment_store.analytics_sources()}
@@ -1264,7 +1383,13 @@ def create_app(history_dir: str | Path, output_dir: str | Path, port: int = 8765
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(500, f"Could not read analytics: {exc}") from exc
-        return {"source": source, **detail}
+        return {
+            "source": source,
+            "action_type_names": {
+                str(index): name for index, name in enumerate(ACTION_TYPE_NAMES)
+            },
+            **detail,
+        }
 
     @app.get("/api/analytics/{source_type}/{source_id}/export")
     def export_analytics(

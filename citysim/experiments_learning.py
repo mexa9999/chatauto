@@ -89,6 +89,11 @@ def e1_learning_curve(
             "morans_i", "local_entropy", "cluster_count", "snapshot_satisfaction",
             "eval_city_quality", "eval_satisfaction", "eval_rich_satisfaction",
             "eval_poor_satisfaction", "eval_utilization", "eval_population",
+            "eval_housing_vacancy_rate", "eval_job_vacancy_rate",
+            "eval_unemployment_rate", "eval_net_migration_rate",
+            "eval_local_goods_coverage",
+            "eval_tax_rate_multiplier",
+            "eval_total_debt", "eval_mean_debt_ratio",
             "eval_damage", "eval_bankrupt_agents",
         ],
     )

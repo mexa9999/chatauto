@@ -18,15 +18,30 @@ import numpy as np
 
 TYPE_NAMES = ("empty", "housing", "commercial", "mixed", "industry", "green")
 TYPE_IDS = {name: idx for idx, name in enumerate(TYPE_NAMES)}
-ACTION_TYPE_NAMES = TYPE_NAMES[1:]  # 5 buildable types, policy indices 0..4
+ACTION_TYPE_NAMES = TYPE_NAMES[1:] + ("road",)
+ROAD_ACTION_ID = len(ACTION_TYPE_NAMES) - 1
 QUALITY_NAMES = ("low", "medium", "high")
 MAX_FLOORS_BY_ACTION = (12, 20, 12, 8, 3)
 N_ROOF_QUALITIES = 4
+ROAD_COST_BASE = 8.0
+ROAD_COST_LAND_MULTIPLIER = 12.0
+ROAD_ACTIVATION_DELAY = 1
+ROAD_MAINTENANCE_RATE = 0.02
+ROAD_DEMOLISH_REFUND = 0.50
+ROAD_CONNECTED_WEIGHT = 1.5
+ROAD_TRAVEL_COST = 1.0
+WALK_TRAVEL_COST = 3.0
+BUILDING_TRAVEL_COST = 5.0
+CONGESTION_ALPHA = 2.0
+ROAD_RELIEF_MAX = 0.5
+ROAD_SUPPLY_FULL = 3.0
 
 # Arrays are indexed by world type id (0 = empty).
 BUILD_COST = np.array([0.0, 80.0, 110.0, 100.0, 85.0, 25.0], dtype=np.float64)
 INCOME_BASE = np.array([0.0, 30.0, 48.0, 36.0, 33.0, 7.5], dtype=np.float64)
-OPTIMAL_DISTANCE = np.array([0.0, 0.40, 0.10, 0.30, 0.75, 0.50], dtype=np.float64)
+OPTIMAL_DISTANCE = np.array(
+    [0.0, 0.40, 0.10, 0.30, 0.50, 0.50], dtype=np.float64
+)
 QUALITY_COST_MULT = np.array([0.70, 1.00, 1.40], dtype=np.float64)
 QUALITY_INCOME_MULT = np.array([0.65, 1.00, 1.35], dtype=np.float64)
 MAINTENANCE_RATE = 0.02
@@ -51,10 +66,13 @@ COMMERCIAL_JOBS = 8.0
 INDUSTRY_JOBS = 10.0
 MIXED_JOBS = 4.0
 COMMERCIAL_CUSTOMERS = 30.0
-COMMERCIAL_GOODS_DEMAND = 15.0
+COMMERCIAL_GOODS_DEMAND = 25.0
 INDUSTRY_GOODS_SUPPLY = 5.0
-POPULATION_INERTIA = 0.35
+INDUSTRY_INCOME_MULTIPLIER = 0.80
+GOODS_IMPORT_MARKUP = 0.25
+MIGRATION_RATE = 0.10
 CITIZEN_GOODS_DEMAND = 0.5
+DEBT_INTEREST_RATE = 0.02
 
 # ---------------------------------------------------------------------------
 # Land value, pollution and noise (economy level 3)
@@ -64,17 +82,18 @@ LAND_VALUE_MIN = 0.20
 LAND_VALUE_MAX = 1.00
 POLLUTION_RADIUS = 2
 NOISE_RADIUS = 1
-BANKRUPTCY_THRESHOLD = 0.0
-BANKRUPTCY_STREAK = 3
-BANKRUPTCY_FITNESS_PENALTY = 0.35
-
 # ---------------------------------------------------------------------------
 # Regulation: taxes and subsidies are city parameters, not agents
 # ---------------------------------------------------------------------------
 
-PROPERTY_TAX_RATE = 0.02
-INDUSTRY_TAX_RATE = 0.03
+TYPE_TAX_RATES = (0.02, 0.04, 0.03, 0.05, 0.0)
+QUALITY_TAX_MULTIPLIERS = (0.8, 1.0, 1.2)
+TAX_RECESSION_UNEMPLOYMENT = 0.15
+TAX_BOOM_UNEMPLOYMENT = 0.05
+TAX_PHASE_MULTIPLIERS = (0.75, 1.0, 1.25)
 GREEN_SUBSIDY = 4.0
+AFFORDABLE_HOUSING_SUBSIDY_PER_FLOOR = 4.0
+EMPLOYMENT_SUBSIDY_PER_JOB = 0.5
 AFFORDABLE_HOUSING_QUOTA = 0.20
 
 # ---------------------------------------------------------------------------
@@ -122,6 +141,11 @@ FEATURE_NAMES = (
     "district_type",           # 21 dominant type in the 3x3 district / 5
     "district_util",           # 22 mean utilisation in the district
     "district_synergy",        # 23 lagged neighbourhood complementarity
+    "road_access",             # 24 static and player-road accessibility
+    "player_road_density",     # 25 weighted active player-road density, radius 1
+    "infra_wait_rounds",       # 26 rounds until a nearby pending road activates
+    "travel_time_center",      # 27 normalised road-network time from city centre
+    "travel_time_jobs",        # 28 normalised road-network time to jobs
 )
 
 GLOBAL_FEATURE_NAMES = (
@@ -135,12 +159,18 @@ GLOBAL_FEATURE_NAMES = (
     "jobs_ratio",              # jobs / max(1, population), clipped
     "goods_balance",           # (supply - demand) / max(1, supply + demand)
     "util_mean",               # mean utilisation of built sectors
+    "housing_vacancy_rate",    # vacant housing / housing capacity
+    "job_vacancy_rate",        # vacant jobs / job capacity
+    "unemployment_rate",       # unemployed residents / population
+    "net_migration_rate",      # net migration / base population
+    "debt_ratio",              # debt / initial budget, clipped to 3
+    "local_goods_coverage",    # local supply / total goods demand
 )
 
 N_CELL_FEATURES = len(FEATURE_NAMES)
 N_GLOBAL_FEATURES = len(GLOBAL_FEATURE_NAMES)
-assert N_CELL_FEATURES == 24
-assert N_GLOBAL_FEATURES == 10
+assert N_CELL_FEATURES == 29
+assert N_GLOBAL_FEATURES == 16
 
 # Behaviour descriptor length used by diversity and MAP-Elites.
 BEHAVIOR_DIM = 4
@@ -156,16 +186,16 @@ class FitnessWeights:
     """Fitness weights fixed before experiments (week 2 of the plan).
 
     ``city_quality`` is kept separate from the shared city-welfare bonus.
-    Bankruptcy is a separate, smooth penalty.
+    Debt is penalized smoothly using each agent's debt-to-initial-budget ratio.
     """
 
     profit: float = 0.50
-    city_quality: float = 0.00
+    city_quality: float = 0.20
     build_count: float = 0.10
     violations: float = 0.10
     externality_damage: float = 0.10
     skip_penalty: float = 0.05
-    bankruptcy: float = 0.15
+    debt: float = 0.15
     shared_reward: float = 0.15
 
     def as_dict(self) -> dict[str, float]:
@@ -176,7 +206,7 @@ class FitnessWeights:
             "w_violations": self.violations,
             "w_externality_damage": self.externality_damage,
             "w_skip_penalty": self.skip_penalty,
-            "w_bankruptcy": self.bankruptcy,
+            "w_debt": self.debt,
             "w_shared_reward": self.shared_reward,
         }
 
@@ -186,27 +216,62 @@ class Regulation:
     """City-level taxes and subsidies.  Agents never control these."""
 
     name: str = "default"
-    property_tax_rate: float = PROPERTY_TAX_RATE
-    industry_tax_rate: float = INDUSTRY_TAX_RATE
+    type_tax_rates: tuple[float, ...] = TYPE_TAX_RATES
+    quality_tax_multipliers: tuple[float, ...] = QUALITY_TAX_MULTIPLIERS
+    recession_unemployment_threshold: float = TAX_RECESSION_UNEMPLOYMENT
+    boom_unemployment_threshold: float = TAX_BOOM_UNEMPLOYMENT
+    tax_phase_multipliers: tuple[float, ...] = TAX_PHASE_MULTIPLIERS
     green_subsidy: float = GREEN_SUBSIDY
+    affordable_housing_subsidy_per_floor: float = AFFORDABLE_HOUSING_SUBSIDY_PER_FLOOR
+    employment_subsidy_per_job: float = EMPLOYMENT_SUBSIDY_PER_JOB
     affordable_housing_quota: float = AFFORDABLE_HOUSING_QUOTA
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.property_tax_rate <= 1.0:
-            raise ValueError("property_tax_rate must be in [0, 1]")
-        if not 0.0 <= self.industry_tax_rate <= 1.0:
-            raise ValueError("industry_tax_rate must be in [0, 1]")
+        if len(self.type_tax_rates) != 5 or any(
+            not 0.0 <= rate <= 1.0 for rate in self.type_tax_rates
+        ):
+            raise ValueError("type_tax_rates must contain five rates in [0, 1]")
+        if len(self.quality_tax_multipliers) != 3 or any(
+            multiplier < 0.0 for multiplier in self.quality_tax_multipliers
+        ):
+            raise ValueError(
+                "quality_tax_multipliers must contain three non-negative values"
+            )
+        if not (
+            0.0
+            <= self.boom_unemployment_threshold
+            < self.recession_unemployment_threshold
+            <= 1.0
+        ):
+            raise ValueError(
+                "unemployment thresholds must satisfy 0 <= boom < recession <= 1"
+            )
+        if len(self.tax_phase_multipliers) != 3 or any(
+            multiplier < 0.0 for multiplier in self.tax_phase_multipliers
+        ):
+            raise ValueError(
+                "tax_phase_multipliers must contain three non-negative values"
+            )
         if self.green_subsidy < 0.0:
             raise ValueError("green_subsidy must be >= 0")
+        if self.affordable_housing_subsidy_per_floor < 0.0:
+            raise ValueError("affordable_housing_subsidy_per_floor must be >= 0")
+        if self.employment_subsidy_per_job < 0.0:
+            raise ValueError("employment_subsidy_per_job must be >= 0")
         if not 0.0 <= self.affordable_housing_quota <= 1.0:
             raise ValueError("affordable_housing_quota must be in [0, 1]")
 
-    def as_dict(self) -> dict[str, float | str]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "name": self.name,
-            "property_tax_rate": self.property_tax_rate,
-            "industry_tax_rate": self.industry_tax_rate,
+            "type_tax_rates": self.type_tax_rates,
+            "quality_tax_multipliers": self.quality_tax_multipliers,
+            "recession_unemployment_threshold": self.recession_unemployment_threshold,
+            "boom_unemployment_threshold": self.boom_unemployment_threshold,
+            "tax_phase_multipliers": self.tax_phase_multipliers,
             "green_subsidy": self.green_subsidy,
+            "affordable_housing_subsidy_per_floor": self.affordable_housing_subsidy_per_floor,
+            "employment_subsidy_per_job": self.employment_subsidy_per_job,
             "affordable_housing_quota": self.affordable_housing_quota,
         }
 
@@ -215,13 +280,20 @@ REGULATION_SCENARIOS: dict[str, Regulation] = {
     "default": Regulation(),
     "no_tax": Regulation(
         name="no_tax",
-        property_tax_rate=0.0,
-        industry_tax_rate=0.0,
+        type_tax_rates=(0.0, 0.0, 0.0, 0.0, 0.0),
         green_subsidy=0.0,
+        affordable_housing_subsidy_per_floor=0.0,
+        employment_subsidy_per_job=0.0,
         affordable_housing_quota=0.0,
     ),
-    "property_tax_5": Regulation(name="property_tax_5", property_tax_rate=0.05),
-    "industry_tax_10": Regulation(name="industry_tax_10", industry_tax_rate=0.10),
+    "property_tax_5": Regulation(
+        name="property_tax_5",
+        type_tax_rates=(0.05, 0.05, 0.05, 0.05, 0.05),
+    ),
+    "industry_tax_10": Regulation(
+        name="industry_tax_10",
+        type_tax_rates=(0.0, 0.0, 0.0, 0.10, 0.0),
+    ),
     "green_subsidy": Regulation(name="green_subsidy", green_subsidy=20.0),
     "affordable_quota": Regulation(
         name="affordable_quota", affordable_housing_quota=0.20
@@ -236,7 +308,7 @@ class Requirements:
     name: str = "medium"
     green_min: float = 0.15
     density_cap: float = 0.85
-    industry_buffer: int = 1
+    industry_buffer: int = 1  # Retained for loading legacy configs; no longer enforced.
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.green_min <= 1.0:
@@ -280,14 +352,17 @@ class CityConfig:
     requirements: Requirements = field(default_factory=lambda: REQUIREMENT_PROFILES["medium"])
     regulation: Regulation = field(default_factory=Regulation)
     fitness: FitnessWeights = field(default_factory=FitnessWeights)
+    actions_per_round: int = 2
 
     def __post_init__(self) -> None:
-        if self.height < 3 or self.width < 3:
-            raise ValueError("grid must be at least 3x3")
+        if not 3 <= self.height <= 64 or not 3 <= self.width <= 64:
+            raise ValueError("grid sides must be between 3 and 64")
         if self.n_agents < 1:
             raise ValueError("n_agents must be >= 1")
         if self.actions_per_agent < 1:
             raise ValueError("actions_per_agent must be >= 1")
+        if not 1 <= self.actions_per_round <= 4:
+            raise ValueError("actions_per_round must be between 1 and 4")
         if self.buildings_per_action < 1:
             raise ValueError("buildings_per_action must be >= 1")
         if self.bids_per_agent < 1:
@@ -305,6 +380,7 @@ class CityConfig:
             "width": self.width,
             "n_agents": self.n_agents,
             "actions_per_agent": self.actions_per_agent,
+            "actions_per_round": self.actions_per_round,
             "initial_budget": self.initial_budget,
             "buildings_per_action": self.buildings_per_action,
             "enable_externalities": self.enable_externalities,
@@ -323,10 +399,10 @@ class EvolutionConfig:
     """Neuroevolution protocol.  Population size is fixed per experiment."""
 
     population_size: int = 32
-    generations: int = 200
-    episodes_per_generation: int = 10
+    generations: int = 125
+    episodes_per_generation: int = 16
     elites: int = 4
-    tournament_size: int = 3
+    tournament_size: int = 5
     mutation_sigma: float = 0.05
     sigma_decay: float = 0.99
     min_sigma: float = 0.005
@@ -337,7 +413,7 @@ class EvolutionConfig:
     use_islands: bool = True
     use_fitness_sharing: bool = True
     sharing_lambda: float = 0.03
-    sharing_radius: float = 0.25
+    sharing_radius: float = 0.40
     hidden_size: int = 48
     attention_dim: int = 8
     district_hidden: int = 12
