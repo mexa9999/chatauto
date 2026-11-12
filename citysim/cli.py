@@ -27,7 +27,11 @@ from .config import (
 )
 from .analytics import AnalyticsRecorder, write_training_analytics
 from .episode import run_episode, run_round, score_breakdown, score_episode
-from .evolution import layout_from_config
+from .evolution import (
+    focal_agents_per_episode,
+    layout_from_config,
+    minimum_episodes_for_population,
+)
 from .experiments import (
     e1_learning_curve,
     e2_baselines,
@@ -118,6 +122,12 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quick", action="store_true", help="small smoke-test configuration")
     parser.add_argument("--generations", type=int, default=None)
     parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument(
+        "--league-fraction",
+        type=float,
+        default=None,
+        help="share of episode slots assigned to evolving genomes (default: 0.8)",
+    )
     parser.add_argument("--population", type=int, default=None)
     parser.add_argument(
         "--workers",
@@ -226,6 +236,8 @@ def build_configs(
         evo = replace(evo, generations=args.generations)
     if args.episodes is not None:
         evo = replace(evo, episodes_per_generation=args.episodes)
+    if getattr(args, "league_fraction", None) is not None:
+        evo = replace(evo, league_fraction=args.league_fraction)
     if args.population is not None:
         evo = replace(evo, population_size=args.population)
     if args.workers is not None:
@@ -249,6 +261,18 @@ def build_configs(
         evo = replace(evo, use_map_elites=True)
     if getattr(args, "seed", None) is not None and args.seeds is None:
         evo = replace(evo, seed=args.seed)
+    focal_agents = focal_agents_per_episode(city.n_agents, evo.league_fraction)
+    minimum_episodes = minimum_episodes_for_population(
+        evo.population_size, focal_agents
+    )
+    if evo.episodes_per_generation < minimum_episodes:
+        if getattr(args, "episodes", None) is not None:
+            raise ValueError(
+                f"--episodes must be at least {minimum_episodes} for "
+                f"n_agents={city.n_agents}, population={evo.population_size} "
+                f"and league_fraction={evo.league_fraction:g}"
+            )
+        evo = replace(evo, episodes_per_generation=minimum_episodes)
     evo = replace(evo, verbose=not args.quiet)
     if eval_seeds is not None and args.eval_seeds is None:
         args.eval_seeds = eval_seeds

@@ -22,6 +22,29 @@ class TestExperiments(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "training seed"):
             experiments._require_training_seeds([], "E1")
 
+    def test_e5_feasibility_uses_focal_agents(self) -> None:
+        from citysim.experiment_support import _ensure_evolution_feasible
+        from citysim.evolution import (
+            focal_agents_per_episode,
+            minimum_episodes_for_population,
+        )
+
+        config = EvolutionConfig(
+            population_size=32,
+            episodes_per_generation=16,
+            league_fraction=0.8,
+            use_parallel=False,
+        )
+        self.assertEqual(focal_agents_per_episode(2, 0.8), 1)
+        adjusted = _ensure_evolution_feasible(config, 2)
+        self.assertEqual(adjusted.population_size, 32)
+        self.assertEqual(adjusted.episodes_per_generation, 32)
+        self.assertEqual(
+            adjusted.episodes_per_generation,
+            minimum_episodes_for_population(adjusted.population_size, 1),
+        )
+        self.assertIs(_ensure_evolution_feasible(config, 10), config)
+
     def test_worker_count_uses_all_available_cpus_up_to_task_count(self) -> None:
         from unittest.mock import patch
 

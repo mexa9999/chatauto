@@ -1431,6 +1431,7 @@ class TestEvolution(unittest.TestCase):
             population_size=8,
             generations=2,
             episodes_per_generation=3,
+            league_fraction=1.0,
             elites=2,
             islands=2,
             fresh_blood_count=1,

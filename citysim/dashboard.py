@@ -37,7 +37,11 @@ from .experiment_store import (
 )
 from .analytics import load_analytics
 from .config import ACTION_TYPE_NAMES, EvolutionConfig
-from .evolution import layout_from_config
+from .evolution import (
+    focal_agents_per_episode,
+    layout_from_config,
+    minimum_episodes_for_population,
+)
 from .live_demo import (
     read_control_file,
     read_live_frame,
@@ -402,9 +406,20 @@ class JobManager:
                 raise HTTPException(
                     422, "Population must be divisible by the default four islands"
                 )
-            if job["episodes"] * job["n_agents"] < job["population"]:
+            league_fraction = EvolutionConfig().league_fraction
+            focal_agents = focal_agents_per_episode(
+                job["n_agents"], league_fraction
+            )
+            minimum_episodes = minimum_episodes_for_population(
+                job["population"], focal_agents
+            )
+            if job["episodes"] < minimum_episodes:
                 raise HTTPException(
-                    422, "Episodes times city agents must cover the whole population"
+                    422,
+                    f"At least {minimum_episodes} episodes are required: "
+                    f"{focal_agents} of {job['n_agents']} agents evolve per "
+                    f"episode at league fraction {league_fraction:g} and must "
+                    "cover the whole population",
                 )
         common = [
             sys.executable,

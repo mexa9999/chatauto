@@ -164,6 +164,15 @@ function gridValidationError(value: string) {
   return "";
 }
 
+// Keep in sync with EvolutionConfig.league_fraction in citysim/config.py.
+const DEFAULT_LEAGUE_FRACTION = 0.8;
+
+function focalAgentsPerEpisode(nAgents: number, leagueFraction = DEFAULT_LEAGUE_FRACTION) {
+  if (nAgents <= 1 || leagueFraction === 1) return Math.max(1, nAgents);
+  const requested = Math.floor(nAgents * leagueFraction + 0.5);
+  return Math.min(nAgents - 1, Math.max(1, requested));
+}
+
 function App() {
   return (
     <FeedbackProvider>
@@ -815,10 +824,12 @@ function LaunchPage({
   const [checkpoints, setCheckpoints] = useState<DemoCheckpoint[]>([]);
   const [resume, setResume] = useStoredState("citysim.launch.v1.resume", false, (value): value is boolean => typeof value === "boolean", onError);
   const [busy, setBusy] = useState(false);
+  const leagueFocalAgents = focalAgentsPerEpisode(agents);
+  const minimumEpisodes = Math.ceil(population / leagueFocalAgents);
   const populationValid =
     population >= agents &&
     population % 4 === 0 &&
-    episodes * agents >= population;
+    episodes >= minimumEpisodes;
   const seedsValid = /^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(seeds.trim());
   const gridError = gridValidationError(grid);
   const workersValid = workers === "" || isIntegerBetween(Number(workers), 1, 1024);
@@ -1076,7 +1087,8 @@ function LaunchPage({
               {gridError && <p className="field-error" id="grid-error" role="alert">{gridError}</p>}
               <p className={`hint ${!populationValid || (kind === "experiment" && !seedsValid) ? "hint-error" : ""}`}>
                 Быстрый режим использует 6 раундов, обычный — 20, если число не задано.
-                Популяция должна делиться на 4, быть не меньше числа агентов, а эпизодов × агентов — покрывать популяцию.
+                Популяция должна делиться на 4 и быть не меньше числа агентов.
+                Доля лиги {DEFAULT_LEAGUE_FRACTION} даёт {leagueFocalAgents} обучаемых мест из {agents}; нужно минимум {minimumEpisodes} эпизодов на поколение.
                 {kind === "experiment" && " Сиды задаются числами, диапазонами и их списками, например 0-5,8."}
               </p>
             </div>

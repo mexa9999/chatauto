@@ -8,10 +8,17 @@ from unittest.mock import patch
 
 import numpy as np
 
-from citysim.config import EvolutionConfig, quick_city_config, quick_evolution_config
+from citysim.config import (
+    BEHAVIOR_DIM,
+    EvolutionConfig,
+    quick_city_config,
+    quick_evolution_config,
+)
 from citysim.evolution import (
     EvolutionEngine,
     Individual,
+    HALL_OF_FAME_REFRESH_INTERVAL,
+    HALL_OF_FAME_SIZE,
     LARGE_MUTATION_PROBABILITY,
     LARGE_MUTATION_RATE,
     LARGE_MUTATION_SIGMA_MULTIPLIER,
@@ -21,25 +28,245 @@ from citysim.evolution import (
     _TRAINING_PROTOCOL_VERSION,
     _configuration_digest,
     evaluate_population,
+    focal_agents_per_episode,
     layout_from_config,
+    minimum_episodes_for_population,
 )
-from citysim.execution import EpisodeExecutor, EpisodeTask
+from citysim.execution import (
+    CitySummary,
+    EpisodeExecutor,
+    EpisodeSummary,
+    EpisodeTask,
+    OpponentSpec,
+    _run_episode_worker,
+)
 from citysim.experiment_support import _run_evolution, train_evolution, training_cache
-from citysim.policy import mutate_genome, random_genome
+from citysim.policy import GenomeLayout, mutate_genome, random_genome
 from citysim.training_history import TrainingHistoryStore
 
 
 class TestEpisodeExecution(unittest.TestCase):
     def test_evolution_protocol_defaults_and_quick_preset(self) -> None:
-        self.assertEqual(_TRAINING_PROTOCOL_VERSION, 11)
+        self.assertEqual(_TRAINING_PROTOCOL_VERSION, 12)
         config = EvolutionConfig()
         self.assertEqual(config.generations, 125)
         self.assertEqual(config.episodes_per_generation, 16)
+        self.assertEqual(config.league_fraction, 0.8)
         self.assertEqual(config.tournament_size, 5)
         self.assertEqual(config.sharing_radius, 0.40)
         quick = quick_evolution_config()
         self.assertEqual(quick.generations, 20)
         self.assertEqual(quick.episodes_per_generation, 4)
+
+    def test_league_fraction_config_and_focal_slot_rounding(self) -> None:
+        self.assertEqual(focal_agents_per_episode(10, 0.8), 8)
+        self.assertEqual(focal_agents_per_episode(3, 0.8), 2)
+        self.assertEqual(focal_agents_per_episode(1, 0.8), 1)
+        self.assertEqual(focal_agents_per_episode(3, 1.0), 3)
+        for value in (0.0, -0.1, 1.1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                EvolutionConfig(league_fraction=value)
+
+        from citysim.cli import build_configs, build_parser
+
+        args = build_parser().parse_args(
+            ["train", "--quick", "--league-fraction", "0.65"]
+        )
+        _, config, _ = build_configs(args)
+        self.assertEqual(config.league_fraction, 0.65)
+
+        args = build_parser().parse_args(
+            ["train", "--quick", "--n-agents", "4"]
+        )
+        _, config, _ = build_configs(args)
+        self.assertEqual(config.episodes_per_generation, 6)
+
+        args = build_parser().parse_args(["train", "--n-agents", "2"])
+        _, config, _ = build_configs(args)
+        self.assertEqual(config.episodes_per_generation, 32)
+
+        args = build_parser().parse_args(
+            ["train", "--n-agents", "2", "--episodes", "16"]
+        )
+        with self.assertRaisesRegex(ValueError, "at least 32"):
+            build_configs(args)
+
+    def test_minimum_episode_coverage_uses_focal_agents(self) -> None:
+        self.assertEqual(minimum_episodes_for_population(32, 1), 32)
+        self.assertEqual(minimum_episodes_for_population(32, 8), 4)
+        self.assertEqual(minimum_episodes_for_population(8, 5), 2)
+        with self.assertRaises(ValueError):
+            minimum_episodes_for_population(0, 1)
+        with self.assertRaises(ValueError):
+            minimum_episodes_for_population(8, 0)
+
+        city = quick_city_config(n_agents=2, actions_per_agent=1)
+        with self.assertRaisesRegex(ValueError, "at least 32 episodes"):
+            EvolutionEngine(
+                EvolutionConfig(
+                    population_size=32,
+                    episodes_per_generation=16,
+                    league_fraction=0.8,
+                    use_parallel=False,
+                ),
+                city,
+            )
+        engine = EvolutionEngine(
+            EvolutionConfig(
+                population_size=32,
+                episodes_per_generation=32,
+                league_fraction=0.8,
+                use_parallel=False,
+            ),
+            city,
+        )
+        self.assertEqual(engine.focal_agent_count, 1)
+
+        with self.assertRaisesRegex(ValueError, "cannot exceed population_size"):
+            EvolutionEngine(
+                EvolutionConfig(
+                    population_size=4,
+                    episodes_per_generation=1,
+                    league_fraction=1.0,
+                    elites=1,
+                    use_parallel=False,
+                ),
+                quick_city_config(n_agents=5, actions_per_agent=1),
+            )
+
+    def test_heterogeneous_episode_worker_builds_focal_and_opponent_policies(self) -> None:
+        city = quick_city_config(n_agents=4, actions_per_agent=2)
+        layout = GenomeLayout(hidden_size=8)
+        focal_genomes = [
+            random_genome(np.random.default_rng(seed), layout)
+            for seed in (2, 3)
+        ]
+        opponent_genome = random_genome(np.random.default_rng(4), layout)
+        task = EpisodeTask(
+            focal_genomes,
+            seed=51,
+            focal_slots=(1, 3),
+            opponents=(
+                OpponentSpec("greedy"),
+                OpponentSpec("neural", opponent_genome),
+            ),
+        )
+
+        summary = _run_episode_worker(
+            task.genomes,
+            task.seed,
+            city,
+            layout,
+            task.focal_slots,
+            task.opponents,
+        )
+
+        self.assertEqual(summary.scores.shape, (city.n_agents,))
+        self.assertEqual(len(summary.behaviors), city.n_agents)
+
+    def test_generation_updates_fitness_only_for_focal_genomes(self) -> None:
+        city = quick_city_config(n_agents=3, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=1,
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+        )
+        engine = EvolutionEngine(config, city)
+        genome_ids = {
+            id(individual.genome): index
+            for index, individual in enumerate(engine.population)
+        }
+
+        def fake_map(tasks):
+            summaries = []
+            for task in tasks:
+                scores = np.full(city.n_agents, 10000.0)
+                behaviors = [
+                    np.full(BEHAVIOR_DIM, 100.0)
+                    for _ in range(city.n_agents)
+                ]
+                for slot, genome in zip(task.focal_slots, task.genomes):
+                    individual_index = genome_ids[id(genome)]
+                    scores[slot] = float(individual_index + 1)
+                    behaviors[slot] = np.full(
+                        BEHAVIOR_DIM, float(individual_index)
+                    )
+                summaries.append(
+                    EpisodeSummary(
+                        scores,
+                        behaviors,
+                        CitySummary(*([0.0] * 18)),
+                    )
+                )
+            return summaries
+
+        with patch.object(engine.episode_executor, "map", side_effect=fake_map):
+            engine._evaluate_generation(0)
+
+        for index, individual in enumerate(engine.population):
+            self.assertEqual(individual.episodes, 1)
+            self.assertEqual(individual.fitness, float(index + 1))
+            np.testing.assert_array_equal(
+                individual.behavior, np.full(BEHAVIOR_DIM, float(index))
+            )
+        self.assertEqual(len(engine.hall_of_fame), 1)
+        np.testing.assert_array_equal(
+            engine.hall_of_fame[0][2], engine.population[3].genome
+        )
+
+    def test_hall_of_fame_refreshes_periodically_and_keeps_unique_top_ten(self) -> None:
+        city = quick_city_config(n_agents=3, actions_per_agent=1)
+        config = EvolutionConfig(
+            population_size=4,
+            generations=HALL_OF_FAME_REFRESH_INTERVAL * (HALL_OF_FAME_SIZE + 1),
+            episodes_per_generation=2,
+            elites=1,
+            islands=1,
+            use_islands=False,
+            hidden_size=8,
+            use_parallel=False,
+        )
+        engine = EvolutionEngine(config, city)
+        genome = np.zeros(engine.layout.parameter_count)
+        individual = Individual(genome=genome, fitness=0.5)
+
+        for generation in range(HALL_OF_FAME_REFRESH_INTERVAL - 1):
+            engine._update_hall_of_fame(generation, individual)
+        self.assertEqual(engine.hall_of_fame, [])
+
+        for update in range(HALL_OF_FAME_SIZE + 1):
+            individual = Individual(
+                genome=np.full(engine.layout.parameter_count, float(update)),
+                fitness=float(update),
+            )
+            generation = (
+                (update + 1) * HALL_OF_FAME_REFRESH_INTERVAL - 1
+            )
+            engine._update_hall_of_fame(generation, individual)
+
+        self.assertEqual(len(engine.hall_of_fame), HALL_OF_FAME_SIZE)
+        self.assertEqual(
+            [entry[1] for entry in engine.hall_of_fame],
+            list(map(float, range(HALL_OF_FAME_SIZE, 0, -1))),
+        )
+        unique_genomes = {entry[2].tobytes() for entry in engine.hall_of_fame}
+        self.assertEqual(len(unique_genomes), HALL_OF_FAME_SIZE)
+        engine.hall_of_fame = [(0, 1.0, np.zeros(engine.layout.parameter_count))]
+        early_opponents = engine._league_opponents(0, 0, 2)
+        late_opponents = engine._league_opponents(
+            config.generations - 1, 0, 2
+        )
+        self.assertEqual(
+            sum(opponent.kind == "neural" for opponent in early_opponents), 0
+        )
+        self.assertEqual(
+            sum(opponent.kind == "neural" for opponent in late_opponents), 1
+        )
 
     def test_final_evaluation_aggregates_five_seed_metrics(self) -> None:
         from citysim.cli import _aggregate_evaluation_rows
@@ -62,6 +289,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=2,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             use_islands=False,
             hidden_size=8,
@@ -105,6 +333,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=2,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             use_islands=False,
             hidden_size=8,
@@ -135,6 +364,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=4,
             episodes_per_generation=4,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -194,6 +424,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=1,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             use_islands=False,
             hidden_size=8,
@@ -219,6 +450,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=1,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             use_islands=False,
             hidden_size=8,
@@ -247,6 +479,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=5,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -277,6 +510,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=3,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -315,6 +549,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=2,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -354,6 +589,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=3,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -410,6 +646,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=3,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -440,6 +677,8 @@ class TestEpisodeExecution(unittest.TestCase):
             branch_config = replace(
                 config,
                 generations=4,
+                episodes_per_generation=4,
+                league_fraction=0.5,
                 mutation_sigma=0.08,
                 seed=config.seed + 1,
             )
@@ -479,6 +718,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=1,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -512,6 +752,7 @@ class TestEpisodeExecution(unittest.TestCase):
             population_size=4,
             generations=2,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,

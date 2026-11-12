@@ -19,6 +19,7 @@ class TestFactorialActionExperiment(unittest.TestCase):
             population_size=4,
             generations=1,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=2,
             use_parallel=False,

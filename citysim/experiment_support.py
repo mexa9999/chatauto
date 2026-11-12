@@ -18,6 +18,8 @@ from .evolution import (
     EvolutionEngine,
     EvolutionResult,
     _configuration_digest,
+    focal_agents_per_episode,
+    minimum_episodes_for_population,
 )
 from .io import ensure_dir, save_genome, write_csv, write_json
 from .plotting import plot_learning_curve
@@ -171,15 +173,17 @@ def _run_config(base: EvolutionConfig, run_seed: int) -> EvolutionConfig:
 def _ensure_evolution_feasible(
     config: EvolutionConfig, n_agents: int
 ) -> EvolutionConfig:
-    """Bump population/episodes so every agent can host a distinct genome."""
+    """Bump population/episodes so every focal agent can host a distinct genome."""
     population = max(config.population_size, int(n_agents))
     if config.use_islands and config.islands > 1:
         population = int(
             np.ceil(population / config.islands) * config.islands
         )
-    episodes = int(config.episodes_per_generation)
-    while episodes * int(n_agents) < population:
-        episodes += 1
+    focal_agents = focal_agents_per_episode(int(n_agents), config.league_fraction)
+    episodes = max(
+        int(config.episodes_per_generation),
+        minimum_episodes_for_population(population, focal_agents),
+    )
     if population == config.population_size and episodes == config.episodes_per_generation:
         return config
     return replace(

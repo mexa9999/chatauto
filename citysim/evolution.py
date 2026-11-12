@@ -18,6 +18,7 @@ from .execution import (
     CitySummary,
     EpisodeExecutor,
     EpisodeTask,
+    OpponentSpec,
     _run_episode_worker,
     _worker_init,
 )
@@ -37,7 +38,9 @@ from .policy import (
 
 _CHECKPOINT_SCHEMA = 3
 # Bump when training semantics change so old cache entries are not reused.
-_TRAINING_PROTOCOL_VERSION = 11
+_TRAINING_PROTOCOL_VERSION = 12
+HALL_OF_FAME_REFRESH_INTERVAL = 5
+HALL_OF_FAME_SIZE = 10
 SIGMA_STAGNATION_GENERATIONS = 8
 SIGMA_SIGNIFICANCE_Z = 2.0
 SIGMA_BOOST_FACTOR = 1.5
@@ -104,23 +107,50 @@ class EvolutionResult:
 
 
 def balanced_episode_indices(
-    rng: np.random.Generator, population_size: int, n_agents: int, episodes: int
+    rng: np.random.Generator,
+    population_size: int,
+    agents_per_episode: int,
+    episodes: int,
 ) -> list[np.ndarray]:
     """Assign genomes to episodes with balanced coverage.
 
     Each episode contains distinct genomes.  Every genome is guaranteed to be
-    evaluated at least once when ``episodes * n_agents >= population_size``.
+    evaluated at least once when
+    ``episodes * agents_per_episode >= population_size``.
     """
-    if n_agents > population_size:
-        raise ValueError("n_agents cannot exceed population_size")
+    if agents_per_episode > population_size:
+        raise ValueError("agents_per_episode cannot exceed population_size")
     counts = np.zeros(population_size, dtype=np.int64)
     out: list[np.ndarray] = []
     for _ in range(episodes):
         keys = counts + rng.random(population_size) * 0.49
-        chosen = np.argsort(keys, kind="stable")[:n_agents]
+        chosen = np.argsort(keys, kind="stable")[:agents_per_episode]
         out.append(chosen.astype(np.int64))
         counts[chosen] += 1
     return out
+
+
+def focal_agents_per_episode(n_agents: int, league_fraction: float) -> int:
+    """Return a feasible rounded count of evolving agents in each episode."""
+    if n_agents < 1:
+        raise ValueError("n_agents must be at least one")
+    if not 0.0 < league_fraction <= 1.0:
+        raise ValueError("league_fraction must be in (0, 1]")
+    if n_agents == 1 or league_fraction == 1.0:
+        return n_agents
+    requested = int(np.floor(n_agents * league_fraction + 0.5))
+    return min(n_agents - 1, max(1, requested))
+
+
+def minimum_episodes_for_population(
+    population_size: int, focal_agent_count: int
+) -> int:
+    """Return the fewest episodes that can evaluate every genome once."""
+    if population_size < 1:
+        raise ValueError("population_size must be at least one")
+    if focal_agent_count < 1:
+        raise ValueError("focal_agent_count must be at least one")
+    return (population_size + focal_agent_count - 1) // focal_agent_count
 
 
 def mean_pairwise_distance(points: np.ndarray) -> float:
@@ -145,10 +175,22 @@ class EvolutionEngine:
         city_config: CityConfig,
         executor: ProcessPoolExecutor | None = None,
     ):
-        if config.episodes_per_generation * city_config.n_agents < config.population_size:
+        self.focal_agent_count = focal_agents_per_episode(
+            city_config.n_agents, config.league_fraction
+        )
+        if self.focal_agent_count > config.population_size:
             raise ValueError(
-                "episodes_per_generation * n_agents must be >= population_size "
-                "so that every genome is evaluated"
+                "focal_agents_per_episode cannot exceed population_size; "
+                "increase population_size or lower league_fraction"
+            )
+        minimum_episodes = minimum_episodes_for_population(
+            config.population_size, self.focal_agent_count
+        )
+        if config.episodes_per_generation < minimum_episodes:
+            raise ValueError(
+                "episodes_per_generation * focal_agents_per_episode must be >= "
+                "population_size so that every genome is evaluated; "
+                f"use at least {minimum_episodes} episodes per generation"
             )
         self.config = config
         self.city_config = city_config
@@ -177,6 +219,7 @@ class EvolutionEngine:
         self.best_ever_behavior: np.ndarray = np.zeros(BEHAVIOR_DIM)
         self.best_ever_generation = -1
         self.hall_of_fame: list[tuple[int, float, np.ndarray]] = []
+        self._last_hof_opponent_slots = 0.0
 
         self.episode_executor = EpisodeExecutor(
             city_config,
@@ -553,6 +596,8 @@ class EvolutionEngine:
 
         mutable = {
             "generations",
+            "episodes_per_generation",
+            "league_fraction",
             "mutation_sigma",
             "sigma_decay",
             "min_sigma",
@@ -611,7 +656,7 @@ class EvolutionEngine:
         episodes = balanced_episode_indices(
             self.rng,
             cfg.population_size,
-            self.city_config.n_agents,
+            self.focal_agent_count,
             cfg.episodes_per_generation,
         )
         fitness_sum = np.zeros(cfg.population_size, dtype=np.float64)
@@ -642,17 +687,43 @@ class EvolutionEngine:
         city_episodes = 0
 
         tasks = []
+        hof_opponent_slots = 0
         for episode_idx, devs in enumerate(episodes):
             seed = cfg.train_seed_base + gen * cfg.episodes_per_generation + episode_idx
             genomes = [self.population[int(idx)].genome for idx in devs]
-            tasks.append(EpisodeTask(genomes, seed))
+            focal_slots = np.sort(
+                self.rng.choice(
+                    self.city_config.n_agents,
+                    size=len(devs),
+                    replace=False,
+                )
+            )
+            opponents = self._league_opponents(
+                gen, episode_idx, self.city_config.n_agents - len(devs)
+            )
+            hof_opponent_slots += sum(
+                opponent.kind == "neural" for opponent in opponents
+            )
+            tasks.append(
+                EpisodeTask(
+                    genomes,
+                    seed,
+                    focal_slots=focal_slots,
+                    opponents=opponents,
+                )
+            )
+        self._last_hof_opponent_slots = (
+            hof_opponent_slots / len(tasks) if tasks else 0.0
+        )
         results = self.episode_executor.map(tasks)
 
-        for result, devs in zip(results, episodes):
+        for result, devs, task in zip(results, episodes, tasks):
             city_episodes += 1
             for key, value in zip(city_keys, result.city):
                 city_sum[key] += value
-            for slot, idx in enumerate(devs):
+            if task.focal_slots is None:
+                raise RuntimeError("league episode is missing focal player slots")
+            for slot, idx in zip(task.focal_slots, devs):
                 idx = int(idx)
                 score = float(result.scores[slot])
                 fitness_sum[idx] += score
@@ -709,9 +780,70 @@ class EvolutionEngine:
             self.best_ever_genome = best.genome.copy()
             self.best_ever_behavior = best.behavior.copy()
             self.best_ever_generation = gen
-        self.hall_of_fame.append((gen, float(best.fitness), best.genome.copy()))
+        self._update_hall_of_fame(gen, best)
+
+    def _league_opponents(
+        self, generation: int, episode_index: int, opponent_count: int
+    ) -> list[OpponentSpec]:
+        if opponent_count == 0:
+            return []
+
+        hof_probability = 0.5 * generation / max(
+            1, self.config.generations - 1
+        )
+        expected_hof_count = opponent_count * hof_probability
+        hof_count = int(np.floor(expected_hof_count))
+        if self.rng.random() < expected_hof_count - hof_count:
+            hof_count += 1
+        hof_count = min(hof_count, len(self.hall_of_fame))
+
+        hof_positions = set(
+            int(position)
+            for position in self.rng.choice(
+                opponent_count, size=hof_count, replace=False
+            )
+        )
+        if hof_count:
+            hof_indices = self.rng.choice(
+                len(self.hall_of_fame),
+                size=hof_count,
+                replace=hof_count > len(self.hall_of_fame),
+            )
+        else:
+            hof_indices = np.empty(0, dtype=np.int64)
+        opponents: list[OpponentSpec] = []
+        hof_index = 0
+        baseline_kinds = ("random", "greedy", "manual")
+        for position in range(opponent_count):
+            if position in hof_positions:
+                genome = self.hall_of_fame[int(hof_indices[hof_index])][2]
+                opponents.append(OpponentSpec("neural", genome.copy()))
+                hof_index += 1
+            else:
+                baseline_index = (
+                    episode_index + position + generation
+                ) % len(baseline_kinds)
+                opponents.append(OpponentSpec(baseline_kinds[baseline_index]))
+        return opponents
+
+    def _update_hall_of_fame(self, generation: int, best: Individual) -> None:
+        final_generation = generation == self.config.generations - 1
+        if (
+            (generation + 1) % HALL_OF_FAME_REFRESH_INTERVAL != 0
+            and not final_generation
+        ):
+            return
+
+        candidate = (generation, float(best.fitness), best.genome.copy())
+        for index, (_, fitness, genome) in enumerate(self.hall_of_fame):
+            if np.array_equal(genome, candidate[2]):
+                if candidate[1] > fitness:
+                    self.hall_of_fame[index] = candidate
+                break
+        else:
+            self.hall_of_fame.append(candidate)
         self.hall_of_fame.sort(key=lambda item: item[1], reverse=True)
-        self.hall_of_fame = self.hall_of_fame[:10]
+        del self.hall_of_fame[HALL_OF_FAME_SIZE:]
 
     def _update_sigma_stagnation(
         self, fitness: float, fitness_se: float | None
@@ -951,6 +1083,10 @@ class EvolutionEngine:
             "best_ever": float(self.best_ever),
             "best_green_share": float(behaviors[:, 3].max()),
             "archive_coverage": float(len(self.archive)),
+            "league_fraction": float(self.config.league_fraction),
+            "league_focal_agents": self.focal_agent_count,
+            "league_hof_size": len(self.hall_of_fame),
+            "league_hof_opponent_slots": self._last_hof_opponent_slots,
         }
         city = self._last_city_metrics
         row.update(

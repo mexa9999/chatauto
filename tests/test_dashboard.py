@@ -57,6 +57,7 @@ class TestDashboard(unittest.TestCase):
             population_size=4,
             generations=2,
             episodes_per_generation=2,
+            league_fraction=1.0,
             elites=1,
             islands=1,
             use_islands=False,
@@ -134,6 +135,39 @@ class TestDashboard(unittest.TestCase):
         request = StartJobRequest()
         self.assertEqual(request.generations, 125)
         self.assertEqual(request.episodes, 16)
+
+    def test_training_job_requires_focal_agents_to_cover_population(self) -> None:
+        with tempfile.TemporaryDirectory() as output:
+            root = Path(output)
+            manager = JobManager(root / "history", root / "out")
+            job_dir = root / "job"
+            with self.assertRaises(HTTPException) as raised:
+                manager._command(
+                    StartJobRequest(
+                        kind="train",
+                        population=32,
+                        n_agents=2,
+                        episodes=16,
+                    ).model_dump(),
+                    job_dir,
+                    job_dir / "progress.json",
+                    job_dir / "stop.request",
+                )
+            self.assertEqual(raised.exception.status_code, 422)
+            self.assertIn("At least 32 episodes", raised.exception.detail)
+
+            command = manager._command(
+                StartJobRequest(
+                    kind="train",
+                    population=32,
+                    n_agents=2,
+                    episodes=32,
+                ).model_dump(),
+                job_dir,
+                job_dir / "progress.json",
+                job_dir / "stop.request",
+            )
+            self.assertEqual(command[command.index("--episodes") + 1], "32")
 
     def test_verify_gc_preview_and_apply_preserve_reachable_history(self) -> None:
         with tempfile.TemporaryDirectory() as output:
@@ -725,7 +759,7 @@ class TestDashboard(unittest.TestCase):
                 kind="train",
                 quick=True,
                 generations=100,
-                episodes=4,
+                episodes=8,
                 population=8,
                 n_agents=2,
                 workers=1,

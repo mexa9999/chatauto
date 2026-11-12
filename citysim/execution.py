@@ -4,22 +4,37 @@ from __future__ import annotations
 
 from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, Sequence
+from typing import Callable, Literal, NamedTuple, Sequence
 
 import numpy as np
 
 from .config import CityConfig
 from .episode import run_episode, score_episode
-from .policy import GenomeLayout, NeuralPolicy
+from .policy import (
+    GenomeLayout,
+    GreedyPolicy,
+    ManualPolicy,
+    NeuralPolicy,
+    Policy,
+    RandomPolicy,
+)
 
 _WORKER_LAYOUT: GenomeLayout | None = None
 _WORKER_CITY_CONFIG: CityConfig | None = None
 
 
 @dataclass(frozen=True)
+class OpponentSpec:
+    kind: Literal["random", "greedy", "manual", "neural"]
+    genome: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
 class EpisodeTask:
     genomes: Sequence[np.ndarray]
     seed: int
+    focal_slots: Sequence[int] | None = None
+    opponents: Sequence[OpponentSpec] = ()
 
 
 class CitySummary(NamedTuple):
@@ -60,6 +75,8 @@ def _run_episode_worker(
     seed: int,
     city_config: CityConfig | None = None,
     layout: GenomeLayout | None = None,
+    focal_slots: Sequence[int] | None = None,
+    opponents: Sequence[OpponentSpec] = (),
 ) -> EpisodeSummary:
     if city_config is None:
         city_config = _WORKER_CITY_CONFIG
@@ -68,8 +85,44 @@ def _run_episode_worker(
     if city_config is None or layout is None:
         raise RuntimeError("episode worker was not initialized with its configuration")
 
-    policies = [NeuralPolicy(genome, layout) for genome in genomes]
-    result = run_episode(city_config, policies, seed)
+    if focal_slots is None:
+        if opponents or len(genomes) != city_config.n_agents:
+            raise ValueError("a standard episode needs one neural genome per agent")
+        policies: list[Policy | None] = [
+            NeuralPolicy(genome, layout) for genome in genomes
+        ]
+    else:
+        slots = [int(slot) for slot in focal_slots]
+        if len(slots) != len(genomes) or len(set(slots)) != len(slots):
+            raise ValueError("focal slots must uniquely match the supplied genomes")
+        if any(slot < 0 or slot >= city_config.n_agents for slot in slots):
+            raise ValueError("focal slot is outside the configured agent range")
+        opponent_slots = [
+            slot for slot in range(city_config.n_agents) if slot not in slots
+        ]
+        if len(opponents) != len(opponent_slots):
+            raise ValueError("opponent specs must fill every non-focal slot")
+        policies = [None] * city_config.n_agents
+        for slot, genome in zip(slots, genomes):
+            policies[slot] = NeuralPolicy(genome, layout)
+        for slot, opponent in zip(opponent_slots, opponents):
+            if opponent.kind == "random":
+                policy: Policy = RandomPolicy()
+            elif opponent.kind == "greedy":
+                policy = GreedyPolicy()
+            elif opponent.kind == "manual":
+                policy = ManualPolicy()
+            elif opponent.kind == "neural":
+                if opponent.genome is None:
+                    raise ValueError("neural opponent requires a genome")
+                policy = NeuralPolicy(opponent.genome, layout)
+            else:
+                raise ValueError(f"unknown opponent kind: {opponent.kind}")
+            policies[slot] = policy
+        if any(policy is None for policy in policies):
+            raise ValueError("league episode has unassigned agent slots")
+    resolved_policies = [policy for policy in policies if policy is not None]
+    result = run_episode(city_config, resolved_policies, seed)
     scores = score_episode(result, city_config.fitness)
     behaviors = [agent.behavior for agent in result.agents]
     city = result.city
@@ -97,7 +150,7 @@ def _run_episode_worker(
 
 
 class EpisodeExecutor:
-    """Run independent neural-policy episodes serially or in worker processes."""
+    """Run independent episodes serially or in worker processes."""
 
     def __init__(
         self,
@@ -139,14 +192,25 @@ class EpisodeExecutor:
         if self.executor is None:
             return [
                 _run_episode_worker(
-                    task.genomes, task.seed, self.city_config, self.layout
+                    task.genomes,
+                    task.seed,
+                    self.city_config,
+                    self.layout,
+                    task.focal_slots,
+                    task.opponents,
                 )
                 for task in tasks
             ]
 
         if self._uses_worker_context:
             futures = [
-                self.executor.submit(_run_episode_worker, task.genomes, task.seed)
+                self.executor.submit(
+                    _run_episode_worker,
+                    task.genomes,
+                    task.seed,
+                    focal_slots=task.focal_slots,
+                    opponents=task.opponents,
+                )
                 for task in tasks
             ]
         else:
@@ -157,6 +221,8 @@ class EpisodeExecutor:
                     task.seed,
                     self.city_config,
                     self.layout,
+                    task.focal_slots,
+                    task.opponents,
                 )
                 for task in tasks
             ]

@@ -407,6 +407,7 @@ class EvolutionConfig:
     population_size: int = 32
     generations: int = 125
     episodes_per_generation: int = 16
+    league_fraction: float = 0.80
     elites: int = 4
     tournament_size: int = 5
     mutation_sigma: float = 0.05
@@ -445,6 +446,8 @@ class EvolutionConfig:
             raise ValueError("generations must be >= 1")
         if self.episodes_per_generation < 1:
             raise ValueError("episodes_per_generation must be >= 1")
+        if not 0.0 < self.league_fraction <= 1.0:
+            raise ValueError("league_fraction must be in (0, 1]")
         if self.islands < 1:
             raise ValueError("islands must be >= 1")
         if self.use_islands and self.population_size % self.islands != 0:
@@ -477,6 +480,7 @@ class EvolutionConfig:
             "population_size": self.population_size,
             "generations": self.generations,
             "episodes_per_generation": self.episodes_per_generation,
+            "league_fraction": self.league_fraction,
             "elites": self.elites,
             "tournament_size": self.tournament_size,
             "mutation_sigma": self.mutation_sigma,
