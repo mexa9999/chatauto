@@ -15,6 +15,10 @@ profile.txt
 simulation_stats.csv
 *.npy
 
+# Local diagnostics
+*.log
+*.prof
+
 # Tool caches
 .pytest_cache/
 .mypy_cache/

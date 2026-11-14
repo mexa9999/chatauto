@@ -7,6 +7,7 @@ import csv
 from contextlib import asynccontextmanager
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -55,6 +56,7 @@ from .strategy_catalog import branch_graph, branch_training_runs, run_checkpoint
 
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 _EXPERIMENTS = tuple([f"e{i}" for i in range(1, 13)] + ["all"])
+logger = logging.getLogger(__name__)
 
 
 class StartJobRequest(BaseModel):
@@ -329,6 +331,11 @@ class JobManager:
                 self.external_pid = pid
                 if request.get("kind") in ("train", "experiment"):
                     self.last_request = request
+                logger.info(
+                    "recovered active dashboard job: id=%s pid=%d",
+                    self.job_id,
+                    pid,
+                )
                 return
 
     def start(self, request: StartJobRequest | CompareRequest) -> str:
@@ -377,12 +384,24 @@ class JobManager:
                 )
             except OSError:
                 log_stream.close()
+                logger.exception(
+                    "dashboard job failed to start: id=%s kind=%s",
+                    job_id,
+                    job_data["kind"],
+                )
                 if self.experiment_store is not None:
                     self.experiment_store.update_run(job_id, "failed")
                 raise
             log_stream.close()
             self.job_id = job_id
             self.external_pid = self.process.pid
+            logger.info(
+                "dashboard job started: id=%s kind=%s pid=%d log=%s",
+                job_id,
+                job_data["kind"],
+                self.process.pid,
+                log_path,
+            )
             (job_dir / "pid.txt").write_text(
                 str(self.process.pid), encoding="ascii"
             )
@@ -559,6 +578,7 @@ class JobManager:
             if self.job_id != job_id or not self._active():
                 raise HTTPException(409, "Job is not running")
             (job_dir / "stop.request").touch()
+            logger.info("dashboard job stop requested: id=%s", job_id)
 
     def control_demo(
         self, job_id: str, paused: bool | None, speed_ms: int | None
@@ -1649,6 +1669,12 @@ def run_dashboard(
     import uvicorn
 
     url = f"http://{host}:{port}"
+    logger.info(
+        "dashboard listening at %s (history=%s, out=%s)",
+        url,
+        history_dir,
+        output_dir,
+    )
     if open_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     uvicorn.run(

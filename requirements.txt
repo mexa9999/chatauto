@@ -3,4 +3,5 @@ numpy>=2.5
 matplotlib>=3.11
 numba>=0.68
 pygame>=2.6
+py-spy>=0.4.3
 uvicorn>=0.32

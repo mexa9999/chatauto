@@ -83,6 +83,16 @@ from .shocks import (
 )
 
 
+_FLOOR_COST_MULTIPLIERS = np.array(
+    [1.0 + 0.10 * (floors - 1) ** 1.15 for floors in range(1, 21)],
+    dtype=np.float64,
+)
+_ROOF_COST_MULTIPLIERS = np.array(
+    [1.0 + 0.06 * quality**1.5 for quality in range(N_ROOF_QUALITIES)],
+    dtype=np.float64,
+)
+
+
 @dataclass(frozen=True)
 class Action:
     """A build or demolition action.
@@ -347,11 +357,13 @@ class CityEnvironment:
         self.citizens = CitizenPool(seed=self.seed + 7919)
         self._cached_compat = None
         self._income_cache = None
+        self._cost_table_cache = None
         self._current_income = None
         self.travel_time_center = np.full((self.h, self.w), np.inf)
         self.travel_time_jobs = np.full((self.h, self.w), np.inf)
         self.travel_time_center_norm = np.ones((self.h, self.w), dtype=np.float64)
         self.travel_time_jobs_norm = np.ones((self.h, self.w), dtype=np.float64)
+        self._access_fit_cache: dict[int, np.ndarray] = {}
         self._travel_time_dirty = True
         self._refresh_layers(advance_population=False)
         self._refresh_travel_time_maps()
@@ -362,6 +374,8 @@ class CityEnvironment:
 
     def cost_table(self) -> np.ndarray:
         """Build costs for every (cell, action type, quality)."""
+        if self._cost_table_cache is not None:
+            return self._cost_table_cache
         land_mult = (0.4 + 1.6 * self.land_value).ravel()
         soil_mult = (0.9 + 0.2 * self.static["soil"]).ravel()
         cell_mult = (land_mult * soil_mult)[:, None, None]
@@ -371,10 +385,11 @@ class CityEnvironment:
             * cell_mult
         )
         road_costs = self.road_cost_grid_for_cells()
-        return np.concatenate(
+        self._cost_table_cache = np.concatenate(
             (building_costs, np.repeat(road_costs[:, None, None], 3, axis=2)),
             axis=1,
         )
+        return self._cost_table_cache
 
     def road_cost_grid_for_cells(self) -> np.ndarray:
         return (
@@ -383,8 +398,11 @@ class CityEnvironment:
         )
 
     def road_cost_of(self, cell: int) -> float:
-        c = int(np.clip(cell, 0, self.n_cells - 1))
-        return float(self.road_cost_grid_for_cells()[c])
+        c = min(max(int(cell), 0), self.n_cells - 1)
+        return float(
+            ROAD_COST_BASE
+            + ROAD_COST_LAND_MULTIPLIER * self.land_value.ravel()[c]
+        )
 
     def cost_of(
         self,
@@ -398,7 +416,7 @@ class CityEnvironment:
             raise ValueError("type_id must be in [0, 4]")
         if not 0 <= quality < len(QUALITY_COST_MULT):
             raise ValueError("quality is outside the configured range")
-        c = int(np.clip(cell, 0, self.n_cells - 1))
+        c = min(max(int(cell), 0), self.n_cells - 1)
         land = float(self.land_value.ravel()[c])
         soil = float(self.static["soil"].ravel()[c])
         floors = int(floors) if self.config.enable_extended_actions else 1
@@ -407,16 +425,10 @@ class CityEnvironment:
             raise ValueError("floors exceed the selected building type's limit")
         if not 0 <= roof_quality < N_ROOF_QUALITIES:
             raise ValueError("roof_quality is outside the configured range")
-        floor_multiplier = 1.0 + 0.10 * (floors - 1) ** 1.15
-        roof_multiplier = 1.0 + 0.06 * roof_quality**1.5
-        return float(
-            BUILD_COST[type_id + 1]
-            * QUALITY_COST_MULT[quality]
-            * (0.4 + 1.6 * land)
-            * (0.9 + 0.2 * soil)
-            * floor_multiplier
-            * roof_multiplier
-        )
+        floor_multiplier = _FLOOR_COST_MULTIPLIERS[floors - 1]
+        roof_multiplier = _ROOF_COST_MULTIPLIERS[roof_quality]
+        base_cost = self.cost_table()[c, type_id, quality]
+        return float(base_cost * floor_multiplier * roof_multiplier)
 
     def observe(self, agent_id: int) -> Observation:
         self._ensure_travel_time_maps()
@@ -625,7 +637,10 @@ class CityEnvironment:
                 self.cost_grid[row, col] = 0.0
             agent.budget += refund
             agent.refund_received += refund
-            self._refresh_layers(advance_population=False)
+            if is_owned_road:
+                self._refresh_road_layers()
+            else:
+                self._refresh_layers(advance_population=False)
             self.actions.append(
                 ActionRecord(
                     round=self.round,
@@ -708,7 +723,10 @@ class CityEnvironment:
         agent.bid_paid += bid
         agent.build_count += 1
 
-        self._refresh_layers(advance_population=False)
+        if is_road_action:
+            self._refresh_road_layers()
+        else:
+            self._refresh_layers(advance_population=False)
         post_income = self._income_grid()
         self._current_income = post_income  # <--- СОХРАНЯЕМ ДЛЯ СЛЕДУЮЩЕГО ДЕЙСТВИЯ
         loss = np.maximum(0.0, pre_income - post_income)
@@ -798,7 +816,7 @@ class CityEnvironment:
             self.pending_road_grid[pending] -= 1
             activated = pending & (self.pending_road_grid == 0)
             self.player_road_grid[activated] = True
-            self._refresh_layers(advance_population=False)
+            self._refresh_road_layers()
         self._travel_time_dirty = True
 
         if self.record_history:
@@ -846,9 +864,34 @@ class CityEnvironment:
     # Dynamic layers
     # ------------------------------------------------------------------
 
+    def _refresh_road_layers(self) -> None:
+        """Refresh only state affected by player-owned road changes.
+
+        Roads do not alter building-derived layers such as density, district
+        composition, pollution, or demand.  They do alter access and travel
+        paths, so invalidate those caches without rebuilding every local
+        building field after each road action.
+        """
+        (
+            self.road_access,
+            self.player_road_density,
+            self.infra_wait_rounds,
+        ) = road_network_fields(
+            self.static["road"],
+            self.static["road_mask"],
+            self.player_road_grid,
+            self.pending_road_grid,
+            connected_weight=ROAD_CONNECTED_WEIGHT,
+        )
+        self._income_cache = None
+        self._cost_table_cache = None
+        self._current_income = None
+        self._travel_time_dirty = True
+
     def _refresh_layers(self, advance_population: bool = False) -> None:
         self._cached_compat = None  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
         self._income_cache = None   # <--- ДОБАВИТЬ ЭТУ СТРОКУ
+        self._cost_table_cache = None
         (
             self.road_access,
             self.player_road_density,
@@ -1312,6 +1355,7 @@ class CityEnvironment:
         )
         self.travel_time_center_norm[~np.isfinite(self.travel_time_center)] = 1.0
         self.travel_time_jobs_norm[~np.isfinite(self.travel_time_jobs)] = 1.0
+        self._access_fit_cache.clear()
         self._income_cache = None
         self._travel_time_dirty = False
 
@@ -1321,6 +1365,9 @@ class CityEnvironment:
 
     def _access_fit_map(self, world_type: int) -> np.ndarray:
         self._ensure_travel_time_maps()
+        cached = self._access_fit_cache.get(world_type)
+        if cached is not None:
+            return cached
         if world_type == 5:
             distance = self.static["dist_center"]
             reachable = np.ones((self.h, self.w), dtype=bool)
@@ -1331,7 +1378,9 @@ class CityEnvironment:
             distance = self.travel_time_center_norm
             reachable = np.isfinite(self.travel_time_center)
         fit = 1.0 - np.abs(distance - OPTIMAL_DISTANCE[world_type])
-        return np.where(reachable, fit, 0.0)
+        result = np.where(reachable, fit, 0.0)
+        self._access_fit_cache[world_type] = result
+        return result
 
     def _income_grid(self) -> np.ndarray:
         self._ensure_travel_time_maps()

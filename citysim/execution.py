@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import dataclass
+import logging
 from typing import Callable, Literal, NamedTuple, Sequence
 
 import numpy as np
@@ -18,6 +19,9 @@ from .policy import (
     Policy,
     RandomPolicy,
 )
+from .profiling import profile_worker_task, start_worker_profiling
+
+logger = logging.getLogger(__name__)
 
 _WORKER_LAYOUT: GenomeLayout | None = None
 _WORKER_CITY_CONFIG: CityConfig | None = None
@@ -68,9 +72,29 @@ def _worker_init(layout: GenomeLayout, city_config: CityConfig) -> None:
     global _WORKER_LAYOUT, _WORKER_CITY_CONFIG
     _WORKER_LAYOUT = layout
     _WORKER_CITY_CONFIG = city_config
+    start_worker_profiling()
 
 
 def _run_episode_worker(
+    genomes: Sequence[np.ndarray],
+    seed: int,
+    city_config: CityConfig | None = None,
+    layout: GenomeLayout | None = None,
+    focal_slots: Sequence[int] | None = None,
+    opponents: Sequence[OpponentSpec] = (),
+) -> EpisodeSummary:
+    with profile_worker_task():
+        return _run_episode_worker_impl(
+            genomes,
+            seed,
+            city_config,
+            layout,
+            focal_slots,
+            opponents,
+        )
+
+
+def _run_episode_worker_impl(
     genomes: Sequence[np.ndarray],
     seed: int,
     city_config: CityConfig | None = None,
@@ -179,6 +203,9 @@ class EpisodeExecutor:
             )
             self._owns_executor = True
             self._uses_worker_context = True
+            logger.info("episode executor: process pool workers=%d", max_workers)
+        elif self.executor is None:
+            logger.debug("episode executor: serial")
 
     @property
     def owns_executor(self) -> bool:
@@ -190,17 +217,21 @@ class EpisodeExecutor:
         if not tasks:
             return []
         if self.executor is None:
-            return [
-                _run_episode_worker(
-                    task.genomes,
-                    task.seed,
-                    self.city_config,
-                    self.layout,
-                    task.focal_slots,
-                    task.opponents,
-                )
-                for task in tasks
-            ]
+            try:
+                return [
+                    _run_episode_worker(
+                        task.genomes,
+                        task.seed,
+                        self.city_config,
+                        self.layout,
+                        task.focal_slots,
+                        task.opponents,
+                    )
+                    for task in tasks
+                ]
+            except Exception:
+                logger.exception("serial episode batch failed")
+                raise
 
         if self._uses_worker_context:
             futures = [
@@ -226,7 +257,11 @@ class EpisodeExecutor:
                 )
                 for task in tasks
             ]
-        return [future.result() for future in futures]
+        try:
+            return [future.result() for future in futures]
+        except Exception:
+            logger.exception("parallel episode batch failed")
+            raise
 
     def shutdown(self) -> None:
         if self._owns_executor and self.executor is not None:

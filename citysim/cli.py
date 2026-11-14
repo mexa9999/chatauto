@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import replace
+import logging
 from pathlib import Path
 import os
-from typing import Any
+import sys
+import time
+from typing import Any, Callable
 import uuid
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -49,7 +52,14 @@ from .experiments import (
 )
 from .experiment_support import training_cache
 from .io import ensure_dir, write_csv, write_json
+from .logging_setup import configure_logging
 from .plotting import plot_city, plot_compare_grids
+from .profiling import (
+    PROFILE_CHILD_ENV,
+    ProfileSession,
+    default_profile_path,
+    run_with_pyspy,
+)
 from .progress import TrainingProgress, TrainingStopped
 from .policy import (
     GenomeLayout,
@@ -61,6 +71,9 @@ from .policy import (
 )
 from .world import CityEnvironment
 from .training_history import DEFAULT_HISTORY_DIR, TrainingHistoryStore
+
+
+logger = logging.getLogger(__name__)
 
 
 FINAL_EVALUATION_SEED_COUNT = 5
@@ -80,6 +93,7 @@ def _aggregate_evaluation_rows(
     return {
         "schema_version": 1,
         "kind": "training-final-evaluation",
+        "evaluation_protocol": "league",
         "seed_count": len(rows),
         "seeds": rows,
         "aggregate": aggregate,
@@ -116,6 +130,51 @@ def parse_grid(text: str) -> tuple[int, int]:
             "grid dimensions must be between 3 and 64, e.g. 12x12"
         )
     return height, width
+
+
+def add_observability(
+    parser: argparse.ArgumentParser, *, profile: bool = False
+) -> None:
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        default=None,
+        help=(
+            "logging verbosity (default: INFO, or WARNING with --quiet; "
+            "env CITYSIM_LOG_LEVEL)"
+        ),
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="also write logs to this file (env CITYSIM_LOG_FILE)",
+    )
+    if profile:
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="profile this command and its worker processes",
+        )
+        parser.add_argument(
+            "--profile-engine",
+            choices=("cprofile", "py-spy"),
+            default="cprofile",
+            help=(
+                "profiling engine: cprofile merges main and worker stats; "
+                "py-spy records a process-tree flamegraph (default: cprofile)"
+            ),
+        )
+        parser.add_argument(
+            "--profile-output",
+            type=str,
+            default=None,
+            help=(
+                "profile path (default: <out>/profile.prof for cprofile, "
+                "<out>/profile.svg for py-spy)"
+            ),
+        )
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -190,6 +249,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         default="isometric",
         help="map projection for PNG and live visualizations",
     )
+    add_observability(parser, profile=True)
 
 
 def build_configs(
@@ -615,6 +675,16 @@ def command_train(args) -> None:
     branch = args.branch or history.active_branch()
     base_config = history.config_for_branch(branch) if args.resume else None
     city, evo, _ = build_configs(args, base_config=base_config)
+    logger.info(
+        "training: branch=%s generations=%d population=%d agents=%d "
+        "episodes=%d workers=%s",
+        branch,
+        evo.generations,
+        evo.population_size,
+        city.n_agents,
+        evo.episodes_per_generation,
+        evo.max_workers or "auto",
+    )
     layout = _layout(evo)
     training_metadata = {
         "branch": branch,
@@ -652,13 +722,32 @@ def command_train(args) -> None:
         stop_requested=progress.stop_requested if progress else None,
     )
     write_training_analytics(out, result.history, training_metadata)
+    evaluation_started = time.perf_counter()
     evaluation_rows = []
+    # Final evaluation uses the same league protocol as training rather than a
+    # homogeneous city of clones.  A monoculture makes every agent's profit
+    # rank exactly 0.5 and hides the genome's absolute quality.
+    opponent_factories: list[Callable[[], object]] = [
+        ManualPolicy,
+        GreedyPolicy,
+        RandomPolicy,
+    ]
+    for _, _, hof_genome in result.hall_of_fame:
+        opponent_factories.append(
+            lambda genome=hof_genome.copy(): NeuralPolicy(genome, layout)
+        )
     for evaluation_index in range(FINAL_EVALUATION_SEED_COUNT):
         evaluation_seed = evo.validation_seed_base + 777 + evaluation_index
+        focal_slot = evaluation_index % city.n_agents
         evaluation_policies = [
-            NeuralPolicy(result.best_genome, layout)
-            for _ in range(city.n_agents)
+            opponent_factories[
+                (evaluation_index + position) % len(opponent_factories)
+            ]()
+            for position in range(city.n_agents)
         ]
+        evaluation_policies[focal_slot] = NeuralPolicy(
+            result.best_genome.copy(), layout
+        )
         evaluation_dir = out / "final_evaluation"
         if evaluation_index:
             evaluation_dir /= f"seed-{evaluation_seed}"
@@ -685,13 +774,24 @@ def command_train(args) -> None:
             evaluation_scores,
             evaluation_breakdown,
         )
+        focal = evaluation_result.agents[focal_slot]
         evaluation_rows.append(
             {
                 "seed": evaluation_seed,
+                "protocol": "league",
+                "focal_slot": focal_slot,
                 "metrics": {
-                    "fitness_mean": float(evaluation_scores.mean()),
-                    "profit_mean": float(
-                        np.mean([agent.profit for agent in evaluation_result.agents])
+                    # Focal metrics answer "how good is the trained genome?";
+                    # field means describe the mixed episode for context.
+                    "fitness_mean": float(evaluation_scores[focal_slot]),
+                    "fitness_focal": float(evaluation_scores[focal_slot]),
+                    "fitness_field_mean": float(evaluation_scores.mean()),
+                    "profit_mean": float(focal.profit),
+                    "profit_focal": float(focal.profit),
+                    "profit_field_mean": float(
+                        np.mean(
+                            [agent.profit for agent in evaluation_result.agents]
+                        )
                     ),
                     "city_quality": float(evaluation_result.city.city_quality),
                     "mean_satisfaction": float(
@@ -700,6 +800,9 @@ def command_train(args) -> None:
                     "green_share": float(evaluation_result.city.green_share),
                     "accessibility": float(evaluation_result.city.accessibility),
                     "total_debt": float(evaluation_result.city.total_debt),
+                    "violations_focal": float(focal.violations),
+                    "damage_focal": float(focal.damage_caused),
+                    "bankrupt_focal": float(focal.bankrupt),
                 },
                 "scores": evaluation_scores.tolist(),
                 "score_breakdown": evaluation_breakdown,
@@ -709,6 +812,11 @@ def command_train(args) -> None:
     write_json(
         out / "evaluation_summary.json",
         _aggregate_evaluation_rows(evaluation_rows),
+    )
+    logger.info(
+        "final evaluation finished: seeds=%d elapsed=%.2fs",
+        len(evaluation_rows),
+        time.perf_counter() - evaluation_started,
     )
     training_progress_path = out / "training_progress.ndjson"
     if training_progress_path.is_file():
@@ -724,6 +832,7 @@ def command_train(args) -> None:
     if result.archive:
         print(f"MAP-Elites archive: {len(result.archive)} niches")
     print(f"artifacts: {out}")
+    logger.info("training artifacts: %s", out)
 
 
 def command_experiment(args) -> None:
@@ -735,6 +844,7 @@ def command_experiment(args) -> None:
         if args.progress_file and args.stop_file
         else None
     )
+    experiment_started = time.perf_counter()
     try:
         with training_cache(
             cache_dir,
@@ -769,9 +879,19 @@ def command_experiment(args) -> None:
                         "city_config": city.as_dict(),
                     },
                 )
+            logger.info(
+                "experiment %s finished: elapsed=%.2fs",
+                args.name,
+                time.perf_counter() - experiment_started,
+            )
             if progress is not None:
                 progress.finish("completed")
     except TrainingStopped:
+        logger.info(
+            "experiment %s stopped after checkpoint: elapsed=%.2fs",
+            args.name,
+            time.perf_counter() - experiment_started,
+        )
         print("training stopped after saving a generation checkpoint")
         if progress is not None:
             progress.finish("stopped")
@@ -1026,6 +1146,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--host", choices=("127.0.0.1",), default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--no-browser", action="store_true")
+    add_observability(dashboard)
     dashboard.set_defaults(func=command_dashboard)
 
     compare_worker = sub.add_parser(
@@ -1046,6 +1167,7 @@ def build_parser() -> argparse.ArgumentParser:
     history_log = history_commands.add_parser("log", help="show snapshot ancestry")
     history_log.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
     history_log.add_argument("--branch", type=str, default=None)
+    add_observability(history_log)
     history_log.set_defaults(func=command_history)
 
     history_branches = history_commands.add_parser(
@@ -1053,6 +1175,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="list branches and their heads",
     )
     history_branches.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    add_observability(history_branches)
     history_branches.set_defaults(func=command_history)
 
     history_create = history_commands.add_parser(
@@ -1062,6 +1185,7 @@ def build_parser() -> argparse.ArgumentParser:
     history_create.add_argument("name")
     history_create.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
     history_create.add_argument("--from", dest="from_ref", default=None)
+    add_observability(history_create)
     history_create.set_defaults(func=command_history)
 
     history_checkout = history_commands.add_parser(
@@ -1070,6 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     history_checkout.add_argument("name")
     history_checkout.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    add_observability(history_checkout)
     history_checkout.set_defaults(func=command_history)
 
     history_reset = history_commands.add_parser(
@@ -1079,19 +1204,67 @@ def build_parser() -> argparse.ArgumentParser:
     history_reset.add_argument("name")
     history_reset.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
     history_reset.add_argument("--to", dest="to_ref", required=True)
+    add_observability(history_reset)
     history_reset.set_defaults(func=command_history)
     return parser
 
 
 def main(argv=None) -> None:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    command = getattr(args, "command", "unknown")
+    configure_logging(
+        getattr(args, "log_level", None),
+        getattr(args, "log_file", None),
+        quiet=getattr(args, "quiet", False),
+    )
+    logger.info("command started: %s", command)
+    started = time.perf_counter()
     try:
-        args.func(args)
+        profile_engine = getattr(args, "profile_engine", "cprofile")
+        if getattr(args, "profile", False) and profile_engine == "cprofile":
+            path = default_profile_path(
+                command,
+                getattr(args, "profile_output", None),
+                out_dir=getattr(args, "out", None),
+                name=getattr(args, "name", None),
+                engine="cprofile",
+            )
+            logger.info("profiling with cProfile: %s", path)
+            with ProfileSession(path):
+                args.func(args)
+        elif getattr(args, "profile", False) and not os.environ.get(
+            PROFILE_CHILD_ENV
+        ):
+            path = default_profile_path(
+                command,
+                getattr(args, "profile_output", None),
+                out_dir=getattr(args, "out", None),
+                name=getattr(args, "name", None),
+                engine="py-spy",
+            )
+            logger.info("profiling with py-spy: %s", path)
+            returncode = run_with_pyspy(raw_argv, path)
+            if returncode != 0:
+                logger.error("py-spy exited with status %d", returncode)
+                raise SystemExit(returncode)
+            logger.info("profile saved: %s", path)
+        else:
+            args.func(args)
+    except Exception as exc:
+        logger.error("command failed: %s: %s", type(exc).__name__, exc)
+        raise
     finally:
+        logger.info(
+            "command finished: %s elapsed=%.3fs",
+            command,
+            time.perf_counter() - started,
+        )
         # Close any executor that survived the experiment runner.
         # wait=False avoids the multi-second join on Windows spawn.
         from . import experiments
+
         if getattr(experiments, "_GLOBAL_EXECUTOR", None) is not None:
             experiments._GLOBAL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
             experiments._GLOBAL_EXECUTOR = None

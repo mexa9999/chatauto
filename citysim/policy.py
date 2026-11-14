@@ -14,7 +14,10 @@ import numpy as np
 
 from .config import (
     ACTION_TYPE_NAMES,
+    BID_FLOOR_FRACTION,
+    BID_FLOOR_MIN,
     BID_MAX,
+    BID_MAX_COST_FRACTION,
     BID_MIN,
     MAX_FLOORS_BY_ACTION,
     N_ROOF_QUALITIES,
@@ -280,6 +283,55 @@ def cap_bid(bid: float, budget: float) -> float:
     return min(max(value, BID_MIN), bid_cap(budget))
 
 
+def minimum_bid(cost: float, budget: float) -> float:
+    """Minimum sealed bid for a plot, expressed through its build cost.
+
+    The floor keeps the auction economically meaningful: without it a policy
+    can win every plot with a zero bid and the mechanism degenerates into a
+    priority lottery.  The floor is capped by the same budget limit as any
+    other bid.
+    """
+    cap = bid_cap(budget)
+    if cost is None or float(cost) <= 0.0:
+        return 0.0
+    return min(cap, max(BID_FLOOR_MIN, BID_FLOOR_FRACTION * float(cost)))
+
+
+def cap_bid_for_action(
+    bid: float,
+    budget: float,
+    cost: float | None = None,
+) -> float:
+    """Clamp a bid by both the budget cap and the plot's build cost.
+
+    A bid is a one-off payment for the plot.  Allowing it to grow with the
+    accumulated budget would let late-game agents overpay hundreds of times
+    the construction cost, so bids are also bounded by a fixed share of cost.
+    """
+    cap = bid_cap(budget)
+    if cost is not None and float(cost) > 0.0:
+        cap = min(cap, max(BID_FLOOR_MIN, BID_MAX_COST_FRACTION * float(cost)))
+    floor = minimum_bid(float(cost or 0.0), budget)
+    value = max(float(bid), floor)
+    if not np.isfinite(value):
+        raise ValueError("bid must be finite")
+    return min(max(value, BID_MIN), cap)
+
+
+def auction_reserve(action: Action) -> float:
+    """Reserve price for one auction proposal.
+
+    Demolitions and non-plot actions have no reserve; builds must clear a
+    small cost-proportional floor to win a cell.
+    """
+    if action.demolish or action.cell is None:
+        return 0.0
+    cost = float(action.cost or 0.0)
+    if cost <= 0.0:
+        return 0.0
+    return max(BID_FLOOR_MIN, BID_FLOOR_FRACTION * cost)
+
+
 def genome_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean(np.abs(a - b)))
 
@@ -340,7 +392,20 @@ class NeuralPolicy:
 
     @staticmethod
     def _sigmoid(values: np.ndarray) -> np.ndarray:
-        return 1.0 / (1.0 + np.exp(-np.clip(values, -60.0, 60.0)))
+        """Return a sigmoid without overflow for extreme logits.
+
+        Computing ``exp(-abs(x))`` keeps both branches in the finite range
+        while preserving the useful tail of the sigmoid instead of clipping
+        logits at an arbitrary value.
+        """
+        values = np.asarray(values, dtype=np.float64)
+        exp_abs = np.exp(-np.abs(values))
+        denominator = 1.0 + exp_abs
+        return np.where(
+            values >= 0.0,
+            1.0 / denominator,
+            exp_abs / denominator,
+        )
 
     def _update_recurrent_state(
         self, cell_hidden: np.ndarray, height: int, width: int
@@ -504,7 +569,9 @@ class NeuralPolicy:
         roof_logits = (h2 @ self.W_roof + self.b_roof).reshape(
             h, w, layout.n_roof_qualities
         )
-        bid_fraction = 1.0 / (1.0 + np.exp(-(h2 @ self.w_bid + float(self.b_bid[0]))))
+        bid_fraction = BID_MAX * self._sigmoid(
+            (h2 @ self.w_bid + float(self.b_bid[0])).reshape(h, w)
+        )
         demolish_logits = h2 @ self.w_demolish + float(self.b_demolish[0])
 
         # --- ПРЕДВЫЧИСЛЕНИЕ JOINT LOGITS ---
@@ -547,16 +614,24 @@ class NeuralPolicy:
         forward: dict[str, np.ndarray],
         cell: int,
         priority: int = 0,
+        joint_choice: int | None = None,
     ) -> Action | None:
-        joint = self._joint_logits(forward, cell, obs.action_mask)
-        if not np.isfinite(joint).any():
-            return None
-        flat = int(np.argmax(joint))
+        if joint_choice is None:
+            joint = self._joint_logits(forward, cell, obs.action_mask)
+            if not np.isfinite(joint).any():
+                return None
+            flat = int(np.argmax(joint))
+        else:
+            flat = int(joint_choice)
         type_id, quality = divmod(flat, self.layout.n_qualities)
         h, w = (int(x) for x in forward["shape"])
         row, col = divmod(int(cell), w)
         budget = max(0.0, float(obs.budget))
-        bid = cap_bid(forward["bid_fraction"][row, col] * budget, budget)
+        bid_target = cap_bid_for_action(
+            float(forward["bid_fraction"][row, col]) * budget,
+            budget,
+            None,
+        )
         floors = 1
         roof_quality = 0
         if env.config.enable_extended_actions and type_id != ROAD_ACTION_ID:
@@ -565,23 +640,24 @@ class NeuralPolicy:
                 np.argmax(forward["floor_logits"][row, col, :floor_limit]) + 1
             )
             roof_quality = int(np.argmax(forward["roof_logits"][row, col]))
-        cost = (
-            env.road_cost_of(cell)
-            if type_id == ROAD_ACTION_ID
-            else env.cost_of(cell, type_id, quality, floors, roof_quality)
-        )
-        while cost + bid > budget + 1e-9 and (roof_quality > 0 or floors > 1):
-            if roof_quality > 0:
-                roof_quality -= 1
-            else:
-                floors -= 1
+        while True:
             cost = (
                 env.road_cost_of(cell)
                 if type_id == ROAD_ACTION_ID
                 else env.cost_of(cell, type_id, quality, floors, roof_quality)
             )
-        if cost + bid > budget + 1e-9:
-            return None
+            bid = cap_bid_for_action(bid_target, budget, cost)
+            if cost + bid <= budget + 1e-9:
+                break
+            if env.config.enable_extended_actions and type_id != ROAD_ACTION_ID:
+                if roof_quality > 0:
+                    roof_quality -= 1
+                elif floors > 1:
+                    floors -= 1
+                else:
+                    return None
+            else:
+                return None
         return Action(
             cell=int(cell),
             type_id=int(type_id),
@@ -638,17 +714,59 @@ class NeuralPolicy:
             for cell in exclude_cells:
                 if 0 <= int(cell) < scores.size:
                     scores[int(cell)] = -np.inf
-        candidates: list[tuple[float, Action]] = []
-        valid_cells = np.flatnonzero(np.isfinite(scores))
-        for cell in valid_cells:
-            cell = int(cell)
-            joint = self._joint_logits(forward, cell, obs.action_mask)
-            if np.isfinite(joint).any():
-                action = self._action_at(env, obs, forward, cell)
+
+        h, w = (int(x) for x in forward["shape"])
+        mask_grid = obs.action_mask.reshape(
+            h, w, self.layout.n_types, self.layout.n_qualities
+        )
+        masked_joint = np.where(
+            mask_grid,
+            forward["joint_all"],
+            -np.inf,
+        )
+        joint_flat = masked_joint.reshape(scores.size, -1)
+        best_joint = joint_flat.max(axis=1)
+        best_joint_choice = np.argmax(joint_flat, axis=1)
+        combined = scores.ravel() + best_joint
+        finite_cells = np.flatnonzero(np.isfinite(combined))
+        if finite_cells.size:
+            # Stable sorting keeps the former flat-cell order for exact ties.
+            ordered_cells = finite_cells[
+                np.argsort(-combined[finite_cells], kind="stable")
+            ]
+        else:
+            ordered_cells = np.empty(0, dtype=np.int64)
+
+        # ``_action_at`` is comparatively expensive because it resolves the
+        # factorized action and checks the budget.  Evaluate only the most
+        # promising cells, expanding the pool when expensive actions do not
+        # fit the remaining budget.  The bounded pool is deliberately larger
+        # than the requested portfolio because demolition candidates are
+        # merged with builds below.
+        build_candidates: list[tuple[float, Action]] = []
+        evaluated = 0
+        candidate_limit = min(ordered_cells.size, max(count * 4, 8))
+        while evaluated < candidate_limit:
+            for flat in ordered_cells[evaluated:candidate_limit]:
+                cell = int(flat)
+                action = self._action_at(
+                    env,
+                    obs,
+                    forward,
+                    cell,
+                    joint_choice=int(best_joint_choice[cell]),
+                )
                 if action is not None:
-                    candidates.append(
-                        (float(scores[cell] + np.max(joint)), action)
-                    )
+                    build_candidates.append((float(combined[cell]), action))
+            evaluated = candidate_limit
+            if len(build_candidates) >= count or evaluated >= ordered_cells.size:
+                break
+            candidate_limit = min(
+                ordered_cells.size,
+                max(evaluated * 2, evaluated + count, 1),
+            )
+
+        candidates: list[tuple[float, Action]] = build_candidates
 
         demolition_mask = obs.demolish_mask
         if demolition_mask is not None:

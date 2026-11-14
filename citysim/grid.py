@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - exercised only without numba
         return decorator
 
 _window_sums_cache = {}
+_window_means_cache = {}
 
 @njit(cache=True)
 def _box_sum_numba(a, radius):
@@ -47,16 +48,20 @@ def _box_sum_numba(a, radius):
 
 def box_sum(values: np.ndarray, radius: int) -> np.ndarray:
     """Sum over a (2r+1)x(2r+1) square, clipped at the boundary."""
-    a = np.ascontiguousarray(values, dtype=np.float64)
+    a = np.asarray(values)
+    if a.dtype != np.float64 or not a.flags.c_contiguous:
+        a = np.ascontiguousarray(a, dtype=np.float64)
     return _box_sum_numba(a, int(radius))
 
 def box_mean(values: np.ndarray, radius: int) -> np.ndarray:
-    a = np.ascontiguousarray(values, dtype=np.float64)
-    key = (a.shape, radius)
-    if key not in _window_sums_cache:
+    a = np.asarray(values)
+    if a.dtype != np.float64 or not a.flags.c_contiguous:
+        a = np.ascontiguousarray(a, dtype=np.float64)
+    key = (a.shape, int(radius))
+    if key not in _window_means_cache:
         ones = np.ones_like(a)
-        _window_sums_cache[key] = np.maximum(1.0, box_sum(ones, radius))
-    return box_sum(a, radius) / _window_sums_cache[key]
+        _window_means_cache[key] = np.maximum(1.0, box_sum(ones, radius))
+    return box_sum(a, radius) / _window_means_cache[key]
 
 
 def grid_shortest_paths(

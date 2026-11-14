@@ -14,7 +14,10 @@ import numpy as np
 from citysim.citizens import CitizenPool
 from citysim.config import (
     ACTION_TYPE_NAMES,
+    BID_FLOOR_FRACTION,
+    BID_FLOOR_MIN,
     BID_MAX,
+    BID_MAX_COST_FRACTION,
     CITIZEN_GOODS_DEMAND,
     COMMERCIAL_GOODS_DEMAND,
     EvolutionConfig,
@@ -59,8 +62,11 @@ from citysim.policy import (
     ManualPolicy,
     NeuralPolicy,
     RandomPolicy,
+    auction_reserve,
     bid_cap,
     cap_bid,
+    cap_bid_for_action,
+    minimum_bid,
     random_genome,
     strategic_bid,
 )
@@ -150,6 +156,111 @@ class TestGenome(unittest.TestCase):
         for action in actions:
             self.assertLessEqual(action.bid, BID_MAX * city.initial_budget + 1e-9)
             self.assertLessEqual(action.bid, city.initial_budget / 10.0 + 1e-9)
+            if not action.demolish:
+                self.assertGreater(action.bid, 0.0)
+                self.assertGreaterEqual(
+                    action.bid, auction_reserve(action) - 1e-12
+                )
+                self.assertLessEqual(
+                    action.bid,
+                    min(
+                        bid_cap(city.initial_budget),
+                        max(BID_FLOOR_MIN, BID_MAX_COST_FRACTION * action.cost),
+                    )
+                    + 1e-9,
+                )
+
+    def test_sigmoid_is_stable_for_extreme_bid_logits(self) -> None:
+        with np.errstate(over="raise", invalid="raise"):
+            values = NeuralPolicy._sigmoid(
+                np.array([-1e9, -60.0, 0.0, 60.0, 1e9])
+            )
+        self.assertTrue(np.isfinite(values).all())
+        self.assertGreaterEqual(float(values[0]), 0.0)
+        self.assertLess(float(values[0]), 1e-20)
+        self.assertAlmostEqual(float(values[2]), 0.5)
+        self.assertLess(1.0 - float(values[4]), 1e-20)
+
+    def test_auction_floor_reserve_and_cost_cap(self) -> None:
+        budget = 500.0
+        cost = 400.0
+        floor = max(BID_FLOOR_MIN, BID_FLOOR_FRACTION * cost)
+        self.assertAlmostEqual(minimum_bid(cost, budget), floor)
+        self.assertEqual(minimum_bid(0.0, budget), 0.0)
+
+        self.assertAlmostEqual(cap_bid_for_action(0.0, budget, cost), floor)
+        cost_cap = min(
+            bid_cap(budget),
+            max(BID_FLOOR_MIN, BID_MAX_COST_FRACTION * cost),
+        )
+        self.assertAlmostEqual(cap_bid_for_action(1e9, budget, cost), cost_cap)
+
+        build = Action(cell=0, type_id=0, quality=0, cost=cost)
+        self.assertAlmostEqual(auction_reserve(build), floor)
+        self.assertEqual(
+            auction_reserve(Action(cell=0, demolish=True)), 0.0
+        )
+        self.assertEqual(auction_reserve(Action.pass_action()), 0.0)
+
+    def test_auction_resolver_rejects_bids_below_reserve(self) -> None:
+        from citysim.episode import _resolve_bids
+
+        rng = np.random.default_rng(0)
+        proposal = Action(cell=0, type_id=0, quality=0, cost=1_000.0, bid=0.0)
+        self.assertEqual(_resolve_bids({0: [proposal]}, rng), {})
+
+        reserve = auction_reserve(proposal)
+        winners = _resolve_bids({0: [replace(proposal, bid=reserve)]}, rng)
+        self.assertEqual(len(winners[0]), 1)
+        self.assertAlmostEqual(winners[0][0][0], reserve)
+
+    def test_auction_ignores_non_finite_and_invalid_bids(self) -> None:
+        from citysim.episode import _cap_proposed_bids
+
+        city = quick_city_config(n_agents=1, actions_per_agent=1)
+        env = CityEnvironment(city, seed=7)
+        cell = first_buildable(env)
+        capped = _cap_proposed_bids(
+            env,
+            0,
+            [
+                Action(cell=cell, type_id=0, quality=1, bid=float("nan")),
+                Action(cell=cell, type_id=99, quality=1, bid=1.0),
+            ],
+        )
+        self.assertEqual(len(capped), 1)
+        self.assertEqual(capped[0].type_id, 99)
+        self.assertEqual(capped[0].cost, 0.0)
+        self.assertAlmostEqual(capped[0].bid, 1.0)
+
+    def test_auction_vendor_fills_missing_cost_and_floor(self) -> None:
+        city = quick_city_config(
+            n_agents=1,
+            actions_per_agent=1,
+            initial_budget=5000.0,
+        )
+
+        class ZeroBidPolicy:
+            name = "zero-bid"
+
+            def act(self, env, agent_id, rng):
+                del env, agent_id, rng
+                return Action.pass_action()
+
+            def propose_bids(
+                self, env, agent_id, rng, count, exclude_cells=None
+            ):
+                del agent_id, rng, count, exclude_cells
+                return [Action(cell=first_buildable(env), type_id=0, quality=1)]
+
+        result = run_episode(city, [ZeroBidPolicy()], seed=41)
+        accepted = [action for action in result.actions if action.accepted]
+        self.assertTrue(accepted)
+        self.assertGreater(accepted[0].cost, 0.0)
+        self.assertGreaterEqual(
+            accepted[0].bid, auction_reserve(accepted[0]) - 1e-12
+        )
+        self.assertGreater(accepted[0].bid, 0.0)
 
     def test_neural_heads_choose_factorized_dimensions(self) -> None:
         city = quick_city_config(
@@ -343,6 +454,38 @@ class TestRoadInfrastructure(unittest.TestCase):
         env._refresh_layers(advance_population=False)
         self.assertTrue(
             env.apply_action(0, Action(cell=cell, type_id=0, quality=1))
+        )
+
+    def test_road_only_refresh_matches_full_layer_refresh(self) -> None:
+        city = replace(
+            quick_city_config(
+                n_agents=1, actions_per_agent=2, initial_budget=5000
+            ),
+            use_auction=False,
+        )
+        optimized = CityEnvironment(city, seed=207)
+        reference = CityEnvironment(city, seed=207)
+        cell = first_buildable(optimized)
+        action = Action(cell=cell, type_id=ROAD_ACTION_ID)
+
+        self.assertTrue(optimized.apply_action(0, action))
+        self.assertTrue(reference.apply_action(0, action))
+        reference._refresh_layers(advance_population=False)
+
+        for name in (
+            "road_access",
+            "player_road_density",
+            "infra_wait_rounds",
+        ):
+            np.testing.assert_allclose(
+                getattr(optimized, name), getattr(reference, name)
+            )
+        np.testing.assert_allclose(
+            optimized._income_grid(), reference._income_grid()
+        )
+        np.testing.assert_allclose(
+            optimized.observe(0).cell_features,
+            reference.observe(0).cell_features,
         )
 
     def test_neural_policy_can_select_road_with_extended_actions(self) -> None:
@@ -1065,8 +1208,8 @@ class TestCitizensAndMetrics(unittest.TestCase):
         self.assertIn("city_quality", breakdown)
         self.assertIn("satisfaction", breakdown)
 
-        def agent(debt_ratio: float, profit: float = 50.0):
-            return SimpleNamespace(
+        def agent(debt_ratio: float, profit: float = 50.0, **overrides):
+            values = dict(
                 profit=profit,
                 debt_ratio=debt_ratio,
                 builds=2,
@@ -1074,7 +1217,11 @@ class TestCitizensAndMetrics(unittest.TestCase):
                 violations=0.0,
                 damage_caused=0.0,
                 bankrupt=False,
+                green_share=0.0,
+                incompatible_neighbors=0.0,
             )
+            values.update(overrides)
+            return SimpleNamespace(**values)
 
         fake = SimpleNamespace(
             agents=[agent(0.0), agent(1.0)],
@@ -1086,6 +1233,10 @@ class TestCitizensAndMetrics(unittest.TestCase):
             float(scores[0] - scores[1]), city.fitness.debt / 2.0, places=6
         )
         self.assertAlmostEqual(score_breakdown(fake)["debt_penalty"][1], 0.5)
+        np.testing.assert_allclose(
+            score_breakdown(fake)["build_norm"],
+            np.full(2, 2.0 / (3 * 2 * 1)),
+        )
         ranked = SimpleNamespace(
             city=fake.city,
             config=fake.config,
@@ -1098,13 +1249,35 @@ class TestCitizensAndMetrics(unittest.TestCase):
         np.testing.assert_allclose(
             score_breakdown(ranked)["profit_norm"], [0.25, 0.25, 1.0]
         )
+        absolute = score_breakdown(ranked)["profit_absolute"]
+        self.assertTrue(np.all(absolute >= 0.0) and np.all(absolute <= 1.0))
+        self.assertLess(absolute[0], absolute[2])
         single = SimpleNamespace(
             agents=[agent(0.0, profit=5.0)],
             city=fake.city,
             config=fake.config,
         )
         np.testing.assert_allclose(score_breakdown(single)["profit_norm"], [0.5])
-        self.assertAlmostEqual(city.fitness.city_quality, 0.20)
+
+        penalized = SimpleNamespace(
+            city=fake.city,
+            config=fake.config,
+            agents=[
+                agent(0.0),
+                agent(
+                    0.0,
+                    violations=1_000.0,
+                    damage_caused=20_000.0,
+                    bankrupt=True,
+                ),
+            ],
+        )
+        breakdown = score_breakdown(penalized)
+        self.assertLess(breakdown["score"][1], breakdown["score"][0])
+        self.assertLess(float(breakdown["violation_norm"][1]), 1.0)
+        self.assertLess(float(breakdown["damage_norm"][1]), 1.0)
+        self.assertAlmostEqual(float(breakdown["bankruptcy"][1]), 1.0)
+        self.assertAlmostEqual(city.fitness.city_quality, 0.10)
 
     def test_industry_income_discount_and_district_action_prior(self) -> None:
         self.assertTrue(

@@ -47,7 +47,7 @@ from citysim.training_history import TrainingHistoryStore
 
 class TestEpisodeExecution(unittest.TestCase):
     def test_evolution_protocol_defaults_and_quick_preset(self) -> None:
-        self.assertEqual(_TRAINING_PROTOCOL_VERSION, 12)
+        self.assertEqual(_TRAINING_PROTOCOL_VERSION, 13)
         config = EvolutionConfig()
         self.assertEqual(config.generations, 125)
         self.assertEqual(config.episodes_per_generation, 16)
@@ -283,7 +283,7 @@ class TestEpisodeExecution(unittest.TestCase):
             np.std(np.arange(5), ddof=1),
         )
 
-    def test_sigma_controller_uses_uncertainty_and_caps_boost(self) -> None:
+    def test_sigma_controller_uses_best_ever_and_caps_boost(self) -> None:
         city = quick_city_config(n_agents=2, actions_per_agent=1)
         config = EvolutionConfig(
             population_size=4,
@@ -296,16 +296,17 @@ class TestEpisodeExecution(unittest.TestCase):
             use_parallel=False,
         )
         engine = EvolutionEngine(config, city)
+        engine.best_ever = 1.0
         engine.sigma_reference_fitness = 1.0
         engine.sigma_reference_se = 0.1
 
-        engine._update_sigma_stagnation(1.2, 0.1)
+        engine._update_sigma_stagnation(1.05, 0.1)
         self.assertEqual(engine.sigma_stagnation_count, 1)
         engine._update_sigma_stagnation(1.0, None)
         self.assertEqual(engine.sigma_stagnation_count, 1)
 
         with patch("citysim.evolution.SIGMA_STAGNATION_GENERATIONS", 2):
-            engine._update_sigma_stagnation(1.0, 0.1)
+            engine._update_sigma_stagnation(1.05, 0.1)
             self.assertEqual(engine._adapt_sigma(), "boost")
         self.assertEqual(engine.sigma_stagnation_count, 0)
         self.assertAlmostEqual(

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import time
 from typing import Callable
 
 import numpy as np
@@ -38,16 +40,19 @@ from .policy import (
 
 _CHECKPOINT_SCHEMA = 3
 # Bump when training semantics change so old cache entries are not reused.
-_TRAINING_PROTOCOL_VERSION = 12
+_TRAINING_PROTOCOL_VERSION = 13
 HALL_OF_FAME_REFRESH_INTERVAL = 5
 HALL_OF_FAME_SIZE = 10
-SIGMA_STAGNATION_GENERATIONS = 8
-SIGMA_SIGNIFICANCE_Z = 2.0
-SIGMA_BOOST_FACTOR = 1.5
-SIGMA_MAX_INITIAL_MULTIPLE = 4.0
+SIGMA_STAGNATION_GENERATIONS = 12
+SIGMA_SIGNIFICANCE_Z = 1.0
+SIGMA_BOOST_FACTOR = 1.1
+SIGMA_MAX_INITIAL_MULTIPLE = 1.5
 LARGE_MUTATION_PROBABILITY = 0.02
 LARGE_MUTATION_RATE = 0.01
 LARGE_MUTATION_SIGMA_MULTIPLIER = 4.0
+
+
+logger = logging.getLogger(__name__)
 
 
 def _configuration_digest(config: EvolutionConfig, city_config: CityConfig) -> str:
@@ -246,6 +251,7 @@ class EvolutionEngine:
         stop_requested: StopRequested | None = None,
     ) -> EvolutionResult:
         checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
+        started = time.perf_counter()
         try:
             if checkpoint_every < 1:
                 raise ValueError("checkpoint_every must be at least one")
@@ -268,6 +274,9 @@ class EvolutionEngine:
                     or self.config.generations
                     <= int(metadata["next_generation"])
                 ):
+                    logger.info(
+                        "training checkpoint is already complete: %s", checkpoint
+                    )
                     return self._result()
                 start_generation = int(metadata["next_generation"])
                 if start_generation >= self.config.generations:
@@ -276,8 +285,19 @@ class EvolutionEngine:
                         "configured generation count"
                     )
 
+            logger.info(
+                "training started: generations=%d start_generation=%d "
+                "population=%d agents=%d episodes=%d workers=%s",
+                self.config.generations,
+                start_generation,
+                self.config.population_size,
+                self.city_config.n_agents,
+                self.config.episodes_per_generation,
+                self.config.max_workers or "auto",
+            )
             for gen in range(start_generation, self.config.generations):
                 self.generation = gen
+                generation_started = time.perf_counter()
                 sigma_used = self.sigma
                 self._evaluate_generation(gen)
                 sigma_adjustment = (
@@ -291,6 +311,16 @@ class EvolutionEngine:
                     sigma_adjustment=sigma_adjustment,
                 )
                 self.history.append(row)
+                logger.debug(
+                    "generation %d finished: elapsed=%.3fs best=%.4f "
+                    "mean=%.4f diversity=%.4f sigma=%.4f",
+                    gen,
+                    time.perf_counter() - generation_started,
+                    row["best"],
+                    row["mean"],
+                    row["diversity"],
+                    row["sigma"],
+                )
                 if progress_callback is not None:
                     progress_callback(gen, row, self.config.generations)
                 if self.config.verbose and (
@@ -344,7 +374,16 @@ class EvolutionEngine:
                 self.best_ever_genome = best.genome.copy()
                 self.best_ever_behavior = best.behavior.copy()
                 self.best_ever_generation = self.generation
-            return self._result()
+            result = self._result()
+            logger.info(
+                "training finished: through_generation=%d elapsed=%.2fs "
+                "best=%.4f best_generation=%d",
+                self.generation + 1,
+                time.perf_counter() - started,
+                result.best_fitness,
+                result.best_generation,
+            )
+            return result
         finally:
             self.episode_executor.shutdown()
             if self.episode_executor.owns_executor:
@@ -374,6 +413,7 @@ class EvolutionEngine:
     ) -> None:
         from .checkpoint_io import write_checkpoint
 
+        started = time.perf_counter()
         archive_items = sorted(self.archive.items())
         archive_genomes = (
             np.stack([item.genome for _, item in archive_items])
@@ -455,6 +495,14 @@ class EvolutionEngine:
             ),
         }
         write_checkpoint(path, metadata, arrays)
+        logger.debug(
+            "checkpoint written: path=%s next_generation=%d complete=%s "
+            "elapsed=%.3fs",
+            path,
+            next_generation,
+            complete,
+            time.perf_counter() - started,
+        )
 
     def _restore_checkpoint(
         self,
@@ -715,7 +763,14 @@ class EvolutionEngine:
         self._last_hof_opponent_slots = (
             hof_opponent_slots / len(tasks) if tasks else 0.0
         )
+        evaluation_started = time.perf_counter()
         results = self.episode_executor.map(tasks)
+        logger.debug(
+            "episode batch finished: generation=%d episodes=%d elapsed=%.3fs",
+            gen,
+            len(tasks),
+            time.perf_counter() - evaluation_started,
+        )
 
         for result, devs, task in zip(results, episodes, tasks):
             city_episodes += 1
@@ -775,12 +830,13 @@ class EvolutionEngine:
             else None
         )
         self._update_sigma_stagnation(best.fitness, self._generation_best_se)
-        if best.fitness > self.best_ever:
+        is_new_best = best.fitness > self.best_ever
+        if is_new_best:
             self.best_ever = float(best.fitness)
             self.best_ever_genome = best.genome.copy()
             self.best_ever_behavior = best.behavior.copy()
             self.best_ever_generation = gen
-        self._update_hall_of_fame(gen, best)
+        self._update_hall_of_fame(gen, best, force=is_new_best)
 
     def _league_opponents(
         self, generation: int, episode_index: int, opponent_count: int
@@ -826,10 +882,16 @@ class EvolutionEngine:
                 opponents.append(OpponentSpec(baseline_kinds[baseline_index]))
         return opponents
 
-    def _update_hall_of_fame(self, generation: int, best: Individual) -> None:
+    def _update_hall_of_fame(
+        self,
+        generation: int,
+        best: Individual,
+        force: bool = False,
+    ) -> None:
         final_generation = generation == self.config.generations - 1
         if (
-            (generation + 1) % HALL_OF_FAME_REFRESH_INTERVAL != 0
+            not force
+            and (generation + 1) % HALL_OF_FAME_REFRESH_INTERVAL != 0
             and not final_generation
         ):
             return
@@ -848,20 +910,22 @@ class EvolutionEngine:
     def _update_sigma_stagnation(
         self, fitness: float, fitness_se: float | None
     ) -> None:
+        """Track generations since the last improvement of ``best_ever``.
+
+        Using the all-time best instead of the current generation's best is
+        important: the current best fluctuates with episode noise, while a
+        mutation controller should respond to genuine progress.  With no
+        repeated-episode standard error we still reset on a clear new record,
+        but we do not count the generation as stagnation evidence.
+        """
         if fitness_se is None:
+            if fitness > self.best_ever:
+                self.sigma_stagnation_count = 0
+                self.sigma_reference_fitness = float(fitness)
+                self.sigma_reference_se = None
             return
-        if (
-            self.sigma_reference_fitness is None
-            or self.sigma_reference_se is None
-        ):
-            self.sigma_reference_fitness = float(fitness)
-            self.sigma_reference_se = float(fitness_se)
-            self.sigma_stagnation_count = 0
-            return
-        significance_margin = SIGMA_SIGNIFICANCE_Z * float(
-            np.hypot(fitness_se, self.sigma_reference_se)
-        )
-        if fitness > self.sigma_reference_fitness + significance_margin:
+        significance_margin = SIGMA_SIGNIFICANCE_Z * float(fitness_se)
+        if fitness > self.best_ever + significance_margin:
             self.sigma_reference_fitness = float(fitness)
             self.sigma_reference_se = float(fitness_se)
             self.sigma_stagnation_count = 0

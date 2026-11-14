@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -25,6 +26,9 @@ from .io import ensure_dir, save_genome, write_csv, write_json
 from .plotting import plot_learning_curve
 from .progress import ProgressCallback, StopRequested, TrainingStopped
 from .training_history import TrainingHistoryStore
+
+
+logger = logging.getLogger(__name__)
 
 
 _TRAINING_CACHE: ContextVar[
@@ -118,6 +122,7 @@ def _run_evolution(
     if cache_entry is not None:
         if cache_entry["complete"]:
             print(f"  [cache] Reusing completed training {configuration_digest[:12]}.")
+            logger.debug("reusing completed training %s", configuration_digest)
             return EvolutionEngine.load_completed(
                 checkpoint, evolution_config, city_config
             )
@@ -127,6 +132,7 @@ def _run_evolution(
                 "rerun with --resume"
             )
         print(f"  [resume] Continuing training {configuration_digest[:12]}.")
+        logger.debug("resuming training %s", configuration_digest)
 
     def save_checkpoint(path: Path, generation: int, complete: bool) -> None:
         history_store.record_experiment_checkpoint(configuration_digest, path)

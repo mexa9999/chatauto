@@ -20,7 +20,7 @@ except ImportError as exc:
         "environment and install torch-directml and numpy; see docs/GPU_BENCHMARK.md."
     ) from exc
 
-from citysim.config import quick_city_config
+from citysim.config import BID_MAX, quick_city_config
 from citysim.policy import DISTRICT_ALLOWED, NeuralPolicy, random_genome
 from citysim.world import Action, CityEnvironment, Observation
 
@@ -236,7 +236,7 @@ class _DirectMLBatchPolicy:
         quality_logits = (
             hidden2 @ weights["W_quality"] + weights["b_quality"]
         ).reshape(batch_size, height, width, self.layout.n_qualities)
-        bid_fraction = torch.sigmoid(
+        bid_fraction = BID_MAX * torch.sigmoid(
             hidden2 @ weights["w_bid"] + weights["b_bid"]
         ).reshape(batch_size, height, width)
 

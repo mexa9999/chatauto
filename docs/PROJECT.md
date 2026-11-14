@@ -134,6 +134,7 @@ flowchart LR
 | Визуализация результатов | Matplotlib, ECharts |
 | Веб-клиент | React 19, TypeScript, Vite |
 | Демо на рабочем столе | Pygame (опциональный интерактивный режим CLI) |
+| Диагностика | `logging`, `cProfile`/`pstats`, опционально `py-spy` |
 | Тесты | `unittest`-совместимые тесты в `tests/` |
 
 Зависимости Python перечислены в `requirements.txt` и `pyproject.toml`.
@@ -153,10 +154,12 @@ citysim/
   evolution.py               популяционная эволюция и оценка стратегий
   experiment_store.py        каталог запусков, импорт/экспорт ZIP
   experiments*.py            эксперименты E1–E12
-  live_demo.py                запись/декодирование состояния карты
-  metrics.py                  метрики карты и пространственного распределения
-  policy.py                   нейросетевая и базовые политики
-  training_history.py         ветки и снимки обучения в SQLite
+  live_demo.py               запись/декодирование состояния карты
+  logging_setup.py           единая настройка журналов CLI и панели
+  metrics.py                 метрики карты и пространственного распределения
+  policy.py                  нейросетевая и базовые политики
+  profiling.py               cProfile-агрегация main/worker и опциональный py-spy
+  training_history.py        ветки и снимки обучения в SQLite
   visualizer.py, plotting.py   Pygame и статическая визуализация
   web/                        HTML и собранный веб-интерфейс
 webapp/
@@ -179,6 +182,7 @@ runs/                         локальные артефакты, база и
 | Обучение и checkpoints | `citysim/evolution.py`, `citysim/training_history.py`, `citysim/checkpoint_io.py` |
 | CLI и сценарии | `citysim/cli.py`, `citysim/experiments_learning.py`, `citysim/experiments_sweeps.py`, `citysim/experiments_robustness.py`, `citysim/experiments_actions.py` |
 | Веб API и очередь задач | `citysim/dashboard.py`, `citysim/dashboard_worker.py` |
+| Диагностика | `citysim/logging_setup.py`, `citysim/profiling.py` |
 | Аналитика и обмен файлами | `citysim/analytics.py`, `citysim/experiment_store.py` |
 | Клиентский интерфейс | `webapp/src/App.tsx`, `webapp/src/AnalyticsPage.tsx`, `webapp/src/styles.css`, `webapp/src/theme.css` |
 | Общие UI-состояния | `webapp/src/api.ts`, `webapp/src/Feedback.tsx`, `webapp/src/useStoredState.ts` |
@@ -216,9 +220,10 @@ runs/                         локальные артефакты, база и
 - этажность, озеленение крыш, стоимость строительства, ставки и ущерб;
 - метрики поколений обучения и профиль качества города.
 
-Fitness — составная целевая оценка, включающая нормализованную прибыль,
-строительную активность, городское благополучие, штрафы за нарушения,
-экстерналии, пропуски и банкротство. Точные веса находятся в `config.py` и
+Fitness — составная целевая оценка: ранговая и абсолютная прибыль,
+строительная активность, качество города, зелёная доля и совместимость
+соседства, а также де-сатурированные штрафы за нарушения, экстерналии,
+пропуски, долг и банкротство. Точные веса находятся в `config.py` и
 формально описаны в `MODEL.md`.
 
 ### Форматы и расположение
@@ -233,6 +238,16 @@ Fitness — составная целевая оценка, включающая
 | `training_metrics.json` | Динамика и сводки обучения |
 | `frames.jsonl` | Состояния живой карты, сжатые отдельно по слоям |
 | `training.log` | Консольный вывод задачи (рядом с `artifacts`, в папке job) |
+
+Артефакты диагностики создаются только по запросу:
+
+| Файл | Содержимое |
+|---|---|
+| `profile.prof` | Объединённая статистика `cProfile` главного и worker-процессов; создаётся при `--profile` с движком `cprofile` |
+| `profile.txt` | Для `cProfile` — текстовый отчёт с топом по `tottime` и секцией `cumtime`; для `py-spy` с суффиксом `.txt` — collapsed stacks |
+| `profile.workers/worker-<pid>.prof` | Профиль отдельного worker-процесса при движке `cprofile` |
+| `profile.svg`, `profile.raw`, `profile.json` | Артефакты `--profile-engine py-spy`: flamegraph, collapsed stacks, speedscope |
+| `*.log` | Журнал из `--log-file`; в панели консольный вывод задачи уже пишется в `training.log` |
 
 Расположение меняется параметром `--out`. История по умолчанию хранится в
 `runs/.citysim-history`; каталог импортированных наборов и каталог запусков
@@ -307,6 +322,41 @@ pip install -r requirements.txt
 оценивания на поколение. `--league-fraction` задаёт долю мест эпизода для
 геномов текущей популяции (по умолчанию 0.8); остальные места занимают
 оппоненты, а число эпизодов должно покрывать популяцию с учётом фокусных мест.
+Итоговая оценка обученного генома также использует league-протокол: фокусный
+геном играет против Manual, Greedy, Random и Hall of Fame, а
+`evaluation_summary.json` публикует метрики фокуса и средние по полю.
+
+### Логирование и профилирование
+
+CLI пишет результат в stdout, а диагностику — в stderr через `logging`.
+Уровень по умолчанию `INFO`; `--quiet` понижает его до `WARNING`, а
+`--log-level` принимает `DEBUG`, `INFO`, `WARNING`, `ERROR` и `CRITICAL`.
+Флаг `--log-file` добавляет файловый обработчик. Переменные
+`CITYSIM_LOG_LEVEL` и `CITYSIM_LOG_FILE` задают те же значения без флагов.
+Флаги журналирования доступны всем командам, включая `dashboard` и `history`.
+В панели stderr и stdout задачи объединяются в `training.log`.
+
+Флаг `--profile` включает профилирование для `demo`, `compare`, `train` и
+`experiment`. По умолчанию используется `cProfile`: он работает в главном
+процессе и в каждом worker-процессе пула, а результаты объединяются через
+`pstats`. В каталоге `--out` (`runs/train`, `runs/<имя>`, `runs/demo`,
+`runs/compare`) создаются `profile.prof`, `profile.txt` и
+`profile.workers/worker-<pid>.prof`. `--profile-output` переопределяет путь.
+Отчёт содержит топ функций по `tottime` и отдельную секцию по `cumtime`, где
+видны корневые функции worker-задач.
+
+`--profile-engine py-spy` переключает движок на
+`py-spy record --subprocesses` и создаёт flamegraph по всему дереву процессов.
+Формат определяется суффиксом `--profile-output`: `.svg` — flamegraph,
+`.raw`/`.txt` — collapsed stacks, `.json` — speedscope. `py-spy` входит в
+зависимости проекта; для уже запущенной панели профиль снимается отдельно через
+`py-spy record --subprocesses -p <PID>`.
+
+```powershell
+.\.venv\Scripts\python.exe -m citysim train --quick --workers 2 --profile --log-level DEBUG --log-file runs/train.log
+.\.venv\Scripts\python.exe -m citysim experiment e5 --quick --profile --profile-output runs/profiles/e5.prof
+.\.venv\Scripts\python.exe -m citysim train --quick --profile --profile-engine py-spy --profile-output runs/profiles/e5.raw
+```
 
 ### Продолжение обучения и ветки
 

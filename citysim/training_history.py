@@ -470,7 +470,7 @@ class TrainingHistoryStore:
             regulation_values.setdefault("affordable_housing_subsidy_per_floor", 0.0)
             regulation_values.setdefault("employment_subsidy_per_job", 0.0)
         city_values["regulation"] = Regulation(**regulation_values)
-        city_values["fitness"] = FitnessWeights(**city_values["fitness"])
+        city_values["fitness"] = FitnessWeights.from_dict(city_values["fitness"])
         return CityConfig(**city_values), evolution
 
     def create_branch(

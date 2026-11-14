@@ -178,6 +178,60 @@ Random, Greedy, Manual и нейросети Hall of Fame. Hall of Fame обно
 Состояния задачи: **выполняется**, **остановка**, **завершена**, **остановлена**,
 **ошибка**. Если задача завершилась ошибкой, откройте журнал в панели задачи.
 
+### Диагностика: журналы и профилирование
+
+Кратко: журнал объясняет, что происходит внутри запуска, а профиль показывает,
+на что тратится время.
+
+CLI печатает итоговый результат в обычный вывод, а диагностические сообщения —
+в отдельный поток ошибок. По умолчанию журнал ведётся на уровне `INFO`. Флаг
+`--quiet` оставляет только предупреждения и ошибки, а `--log-level DEBUG`
+добавляет подробные тайминги поколений, эпизодов и сохранения checkpoint. Флаг
+`--log-file` дублирует журнал в файл. Те же настройки можно задать переменными
+`CITYSIM_LOG_LEVEL` и `CITYSIM_LOG_FILE`.
+
+```powershell
+.\.venv\Scripts\python.exe -m citysim train --quick --log-level DEBUG --log-file runs/train.log
+```
+
+В панели журнал каждой задачи по-прежнему пишется в `training.log`, а последние
+строки можно посмотреть кнопкой **«Показать журнал ошибки»**. Для самой панели и
+команд истории доступны `--log-level` и `--log-file`.
+
+Для поиска узких мест в демо, сравнении, обучении или эксперименте добавьте
+`--profile`. По умолчанию используется `cProfile`: профилирование включается в
+главном процессе и в каждом worker-процессе пула, после чего статистика
+объединяется через `pstats`. В каталоге результатов появляются `profile.prof`
+(бинарная статистика для `pstats` или `snakeviz`), `profile.txt` (топ по
+`tottime` и отдельная секция по `cumtime`) и `profile.workers/worker-<pid>.prof`
+для каждого worker-процесса. Каталог по умолчанию — `runs/train/`,
+`runs/<имя>/`, `runs/demo/` или `runs/compare/`; путь меняется флагом
+`--profile-output`.
+
+```powershell
+.\.venv\Scripts\python.exe -m citysim train --quick --workers 2 --profile
+.\.venv\Scripts\python.exe -m citysim experiment e5 --quick --profile --profile-output runs/profiles/e5.prof
+```
+
+Для flamegraph по всему дереву процессов укажите `--profile-engine py-spy`:
+команда запускается через `py-spy record --subprocesses`, а формат определяется
+суффиксом — `.svg` (flamegraph), `.raw` или `.txt` (collapsed stacks), `.json`
+(speedscope).
+
+```powershell
+.\.venv\Scripts\python.exe -m citysim train --quick --profile --profile-engine py-spy
+.\.venv\Scripts\python.exe -m citysim train --quick --profile --profile-engine py-spy --profile-output runs/profiles/train.raw
+```
+
+Flamegraph открывается в браузере: ширина блока показывает долю времени, а
+вложенность — стек вызовов. Профилирование добавляет накладные расходы, поэтому
+включайте его для диагностики, а не для сравнения скорости. Для уже запущенной
+панели профиль снимается отдельно по PID процесса:
+
+```powershell
+py-spy record --subprocesses -p <PID> -o runs/dashboard.svg
+```
+
 ### Живая симуляция
 
 Кратко: наблюдайте за развитием города в браузере, меняйте темп и сохраняйте

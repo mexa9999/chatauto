@@ -8,7 +8,7 @@ richer economy used by the second version of the project.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 
@@ -110,6 +110,9 @@ CITIZEN_RICH_FRACTION = 0.30
 BIDS_PER_AGENT = 3
 BID_MIN = 0.0
 BID_MAX = 0.05          # maximal fraction of the current budget
+BID_FLOOR_MIN = 0.5     # absolute minimum sealed bid for a build action
+BID_FLOOR_FRACTION = 0.005  # minimum bid as a share of construction cost
+BID_MAX_COST_FRACTION = 0.25  # bids above this share of cost are clipped
 DISTRICT_SIZE = 3
 
 # ---------------------------------------------------------------------------
@@ -189,32 +192,72 @@ BEHAVIOR_DIM = 4
 
 @dataclass(frozen=True)
 class FitnessWeights:
-    """Fitness weights fixed before experiments (week 2 of the plan).
+    """Fitness weights and saturation scales fixed before experiments.
 
-    ``city_quality`` is kept separate from the shared city-welfare bonus.
-    Debt is penalized smoothly using each agent's debt-to-initial-budget ratio.
+    Positive components (``profit`` .. ``compatibility``) sum to 1.0, so a
+    perfectly behaved, perfectly profitable agent can reach a score of 1.0.
+    Penalties subtract from that score.  ``profit`` is a within-episode rank,
+    while ``profit_absolute`` rewards absolute profit on a saturating scale;
+    the combination removes the blindness of a purely relative rank.
+
+    ``shared_reward`` is kept for loading older configurations and analytics,
+    but defaults to zero: city-wide welfare is already represented by
+    ``city_quality`` and should not dominate individual selection.
     """
 
-    profit: float = 0.50
-    city_quality: float = 0.20
+    profit: float = 0.35
+    profit_absolute: float = 0.25
+    city_quality: float = 0.10
     build_count: float = 0.10
+    green_share: float = 0.10
+    compatibility: float = 0.10
     violations: float = 0.10
     externality_damage: float = 0.10
     skip_penalty: float = 0.05
-    debt: float = 0.15
-    shared_reward: float = 0.15
+    debt: float = 0.05
+    bankruptcy: float = 0.05
+    shared_reward: float = 0.0
+    profit_reference: float = 250_000.0
+    violation_saturation: float = 250.0
+    damage_saturation: float = 5_000.0
+    compatibility_saturation: float = 50.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "profit_reference",
+            "violation_saturation",
+            "damage_saturation",
+            "compatibility_saturation",
+        ):
+            if float(getattr(self, name)) <= 0.0:
+                raise ValueError(f"{name} must be positive")
 
     def as_dict(self) -> dict[str, float]:
         return {
-            "w_profit": self.profit,
-            "w_city_quality": self.city_quality,
-            "w_build_count": self.build_count,
-            "w_violations": self.violations,
-            "w_externality_damage": self.externality_damage,
-            "w_skip_penalty": self.skip_penalty,
-            "w_debt": self.debt,
-            "w_shared_reward": self.shared_reward,
+            item.name: float(getattr(self, item.name))
+            for item in fields(self)
         }
+
+    @classmethod
+    def from_dict(cls, values: dict[str, object]) -> "FitnessWeights":
+        """Load current or legacy ``w_*`` fitness dictionaries."""
+        aliases = {
+            "w_profit": "profit",
+            "w_city_quality": "city_quality",
+            "w_build_count": "build_count",
+            "w_violations": "violations",
+            "w_externality_damage": "externality_damage",
+            "w_skip_penalty": "skip_penalty",
+            "w_debt": "debt",
+            "w_shared_reward": "shared_reward",
+        }
+        known = {item.name for item in fields(cls)}
+        normalized: dict[str, object] = {}
+        for key, value in values.items():
+            name = aliases.get(key, key)
+            if name in known:
+                normalized[name] = value
+        return cls(**normalized)
 
 
 @dataclass(frozen=True)
@@ -344,10 +387,10 @@ REQUIREMENT_PROFILES: dict[str, Requirements] = {
 class CityConfig:
     """One episode of the city simulation."""
 
-    height: int = 16
-    width: int = 16
+    height: int = 25
+    width: int = 25
     n_agents: int = 10
-    actions_per_agent: int = 20
+    actions_per_agent: int = 100
     initial_budget: float = 600.0
     buildings_per_action: int = 1
     enable_externalities: bool = True
